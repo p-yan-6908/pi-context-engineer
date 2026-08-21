@@ -98,6 +98,81 @@ const tests: TestCase[] = [
     program: `const logs = await tools.bash({command:"cat log.txt"}); return logs.split('\\n').filter(l => l.includes("ERROR"));`,
     expectBlock: false,
   },
+  {
+    name: "String() does not reduce raw data",
+    program: `const raw = await pi.read({ path: "massive.log" }); return String(raw);`,
+    expectBlock: true,
+  },
+  {
+    name: "JSON.stringify() does not reduce raw data",
+    program: `const raw = await pi.read({ path: "massive.log" }); return JSON.stringify(raw);`,
+    expectBlock: true,
+  },
+  {
+    name: "encoder followed by scalar length is safe",
+    program: `const raw = await pi.read({ path: "massive.log" }); return JSON.stringify(raw).length;`,
+    expectBlock: false,
+  },
+  {
+    name: "alias chain preserves taint",
+    program: `const raw = await pi.read({ path: "massive.log" }); const alias = raw; return alias;`,
+    expectBlock: true,
+  },
+  {
+    name: "destructured scalar projection is safe",
+    program: `const raw = await pi.read({ path: "massive.log" }); const { length } = raw; return { length };`,
+    expectBlock: false,
+  },
+  {
+    name: "unknown helper receiving raw data is unsafe",
+    program: `const raw = await pi.read({ path: "massive.log" }); const x = normalize(raw); return x;`,
+    expectBlock: true,
+  },
+  {
+    name: "local helper wrapping CE compression is safe",
+    program: `function summarize(x) { return extensions.ctx_summarize({ text: x, maxTokens: 200 }); } const raw = await pi.read({ path: "massive.log" }); return summarize(raw);`,
+    expectBlock: false,
+  },
+  {
+    name: "identity map preserves taint",
+    program: `const rows = await tools.list({}); return rows.map(row => row);`,
+    expectBlock: true,
+  },
+  {
+    name: "property map projects fields",
+    program: `const rows = await tools.list({}); return rows.map(row => row.name);`,
+    expectBlock: false,
+  },
+  {
+    name: "split alone does not reduce text",
+    program: `const raw = await tools.bash({ command: "cat massive.log" }); return raw.split("\\n");`,
+    expectBlock: true,
+  },
+  {
+    name: "split and filter selects matching lines",
+    program: `const raw = await tools.bash({ command: "cat massive.log" }); return raw.split("\\n").filter(line => line.includes("ERROR"));`,
+    expectBlock: false,
+  },
+  {
+    name: "Promise.all raw aggregate is blocked",
+    program: `const values = await Promise.all([pi.read({ path: "a" }), pi.read({ path: "b" })]); return values;`,
+    expectBlock: true,
+  },
+  {
+    name: "Promise.all followed by field projection is safe",
+    program: `const values = await Promise.all([pi.read({ path: "a" }), pi.read({ path: "b" })]); return values.map(value => value.path);`,
+    expectBlock: false,
+  },
+  {
+    name: "bounded Fovea selection is accepted",
+    program: `return extensions.fovea_focus({ query: "authentication", maxTokens: 500 });`,
+    expectBlock: false,
+  },
+  {
+    name: "unbounded Fovea selection remains guarded",
+    program: `return extensions.fovea_focus({ query: "authentication" });`,
+    expectBlock: true,
+  },
 ];
 
 let passed = 0;

@@ -1,11 +1,15 @@
 ---
 name: context-engineer
-description: "Enforces context engineering in Pi Fabric programs: blocks raw tool passthroughs, offloads large results, and provides select/compress/remember/delegate tools."
+description: "Governs what data crosses the Main-model boundary in Pi Fabric: taint analysis, budgeted selection, compression, offload, and isolation."
 ---
 
 # 👁️ context-engineer
 
-`pi-context-engineer` is a Pi extension that keeps large or unprocessed tool results out of the model context.
+`pi-context-engineer` is the context governor above Pi Fabric and optional Pi Fovea.
+
+- **Fabric** executes and orchestrates work inside a typed sandbox.
+- **Fovea** discovers relevant repository regions.
+- **Context Engineer** controls the size and provenance of data crossing into Main.
 
 ## Quick start
 
@@ -13,40 +17,39 @@ description: "Enforces context engineering in Pi Fabric programs: blocks raw too
 pi install /path/to/pi-context-engineer
 ```
 
-The extension requires `pi-fabric` for `fabric_exec` interception. The standalone `ctx_*` tools work in ordinary Pi sessions too.
+The extension requires the Fabric `fabric_exec` tool for static interception, but the standalone `ctx_*` tools also work in ordinary Pi sessions.
 
-## What it enforces
+## Automatic policy
 
-The live `fabric_exec` tool is checked automatically before execution:
+The live `fabric_exec` call is checked before execution using local data-flow analysis. Source values from `pi.*`, `mcp.*`, captured `extensions.*`, and direct Pi tools are tracked through aliases, destructuring, object/array values, callbacks, `Promise.all`, local functions, and arguments.
 
-- **BLOCK:** raw or near-raw tool results are returned directly
-- **BLOCK:** too many unprocessed tool calls
-- **WARN:** oversized literal returns, unless strict mode is enabled
-- **PASS:** projected, filtered, summarized, offloaded, or delegated results
+The analyzer classifies the value returned to Main:
 
-Current Fabric programs use `pi.*` for Pi core tools:
+- **RAW / ENCODED / UNKNOWN:** block; the source payload still crosses the boundary
+- **PROJECTED:** fields, keys, lengths, counts, and scalar values
+- **SELECTED:** filters, slices, matches, and bounded Fovea results
+- **AGGREGATED:** reductions and scalar summaries
+- **COMPRESSED:** `ctx_summarize`
+- **OFFLOADED:** `ctx_offload`
 
-```ts
-const text = await pi.read({ path: "src/index.ts" });
-return { lines: text.split("\n").length };
-```
-
-Older `tools.*` programs and `mcp.*` calls are also recognized.
+Oversized static returns warn by default and block in `strict` mode. The number of internal Fabric calls is not the main budget: many calls are acceptable when the returned context is small and meaningful.
 
 ## The four strategies
 
 | Strategy | Purpose | Tools |
 |---|---|---|
-| **Write** | Store heavy data or durable facts | `ctx_offload`, `ctx_remember` |
-| **Select** | Retrieve only a slice or matching lines | `ctx_read` |
-| **Compress** | Produce a structural or model summary | `ctx_summarize` |
-| **Isolate** | Delegate a separable task to a fresh Pi process | `ctx_delegate` |
+| **Write** | Keep heavy data addressable outside Main | `ctx_offload`, `ctx_remember` |
+| **Select** | Return only a range, match, or relevant code window | `ctx_read`, Fovea |
+| **Compress** | Produce a structural or semantic summary | `ctx_summarize` |
+| **Isolate** | Move separable work to another context | `ctx_delegate`, Fabric `agents.*` |
 
-Inside a Fabric program, call registered extension tools through `extensions.*`:
+## Fabric usage
+
+Registered extension tools are available in Fabric code mode through `extensions.*`:
 
 ```ts
 const result = await pi.grep({ pattern: "TODO", path: "src" });
-return extensions.ctx_summarize({ text: result, mode: "structural" });
+return extensions.ctx_summarize({ text: result, mode: "structural", maxTokens: 300 });
 ```
 
 For manual offloading:
@@ -60,21 +63,37 @@ return extensions.ctx_offload({
 });
 ```
 
-`ce_exec` is an explicit preflight validator. It does not execute the program; the `fabric_exec` hook performs the real enforcement automatically.
+When Fovea is installed, prefer its graph-based Select tools rather than recreating repository retrieval:
+
+```ts
+const focus = await extensions.fovea_focus({
+  query: "authentication",
+  maxTokens: 500,
+});
+return extensions.ctx_summarize({ text: focus, maxTokens: 300 });
+```
+
+A Fovea call with `maxTokens` is recognized as a budgeted selection. Context Engineer does not duplicate Fovea's graph.
+
+`ce_exec` is an explicit preflight validator. It does not execute the program; the `fabric_exec` hook performs enforcement automatically.
 
 ## Standalone tools
 
-- `ctx_read`: read a 0-based byte range or search for a literal substring in a stored handle
-- `ctx_summarize`: structural summarization is local and deterministic; model mode uses an isolated no-tools Pi call
-- `ctx_remember` / `ctx_recall`: persist and retrieve project-scoped facts
-- `ctx_delegate`: run a task in a fresh, isolated Pi process and return its final response
+- `ctx_read`: read a UTF-8 byte range or search literal matches in a stored handle
+- `ctx_summarize`: deterministic structural compression or isolated no-tools model compression
+- `ctx_remember` / `ctx_recall`: durable project facts; recall is bounded by `limit` and `maxTokens`
+- `ctx_delegate`: isolated child-Pi fallback for separable work
 - `ctx_offload`: manually write a payload and return a handle plus preview
 
-## Automatic protections
+For Fabric-native recursive agents and RLM-style decomposition, call Fabric's `agents.*` APIs directly when available.
 
-- Large text tool results (8 KB by default) are written to `<workspace>/.pi/context-store/` and replaced by a handle and preview.
-- Grep patterns containing likely-unescaped code punctuation are changed to `literal: true` before execution.
-- Set `enabled: false` to disable all protections.
+## Runtime protections
+
+- Ordinary large model-boundary text results (about 8 KB by default) are written to `<workspace>/.pi/context-store/` and replaced by a handle plus preview.
+- Ordinary intermediate `pi.*` results consumed inside Fabric are left byte-for-byte intact.
+- Fabric's documented nested provider-result proxy is inspected before QuickJS. Oversized provider values are replaced structurally with a CE handle; already-bounded Fabric artifact results are not offloaded again.
+- Fovea results that honor `maxTokens` are treated as already budgeted and are not redundantly offloaded.
+- Grep patterns that look like invalid literal regex searches are changed to `literal: true`; valid regexes are preserved.
 
 ## Configuration
 
@@ -84,17 +103,36 @@ Create `<repo>/.pi/context-engineer.json`:
 {
   "enabled": true,
   "strict": false,
-  "maxUnprocessedToolCalls": 3,
   "maxReturnTokens": 4000,
-  "readOffloadThreshold": 8192
+  "readOffloadThreshold": 8192,
+  "nestedResultThreshold": 8192,
+  "storeMaxBytes": 50000000,
+  "storeTtlMs": 604800000
 }
 ```
 
-- `strict`: turn warnings into blocks
-- `maxUnprocessedToolCalls`: maximum unprocessed data calls
-- `maxReturnTokens`: estimated literal-return threshold
-- `readOffloadThreshold`: text-result offload threshold in bytes/characters
+- `enabled`: disable enforcement hooks when false
+- `strict`: turn soft warnings into blocks
+- `maxReturnTokens`: estimated static-return threshold
+- `readOffloadThreshold`: ordinary text-result threshold
+- `nestedResultThreshold`: Fabric provider-proxy threshold
+- `storeMaxBytes` / `storeTtlMs`: optional addressable-store limits
 
-## Storage
+`maxUnprocessedToolCalls` remains accepted for older configurations, but data-flow reduction and observed context cost are primary.
 
-Payloads are stored as self-describing JSON files under `<workspace>/.pi/context-store/`. Durable facts use `<workspace>/.pi/agent/context-store/`. Handles are deterministic and survive session restarts.
+## Storage and observability
+
+Payloads are stored as self-describing JSON files under `<workspace>/.pi/context-store/`; durable facts use `<workspace>/.pi/agent/context-store/`. Identical payloads deduplicate by content hash. Handles survive session restarts, subject to TTL or disk-budget cleanup.
+
+Telemetry stores sizes and strategy names, never prompts or payloads, in `.pi/context-store/context-events.jsonl`.
+
+Use:
+
+```text
+/ce status
+/ce status --all
+/ce trace
+/ce explain
+/ce settings
+/ce clear
+```

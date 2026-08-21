@@ -1,7 +1,8 @@
 {
   "name": "pi-context-engineer",
-  "version": "0.1.0",
-  "description": "Context engineering enforcement for Pi Fabric: covers Write/Select/Compress/Isolate and forces agents to actually process data in fabric_exec programs instead of passthrough returns.",
+  "version": "0.2.0",
+  "type": "module",
+  "description": "Context governor for Pi Fabric and Pi Fovea: taint-gates data flow, budgets selection, compresses results, offloads payloads, and records context cost.",
   "author": "pyan",
   "license": "MIT",
   "repository": {
@@ -12,8 +13,18 @@
     "url": "https://github.com/p-yan-6908/pi-context-engineer/issues"
   },
   "homepage": "https://github.com/p-yan-6908/pi-context-engineer#readme",
-  "types": ["extension", "skill"],
+  "scripts": {
+    "typecheck": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck src/*.ts",
+    "build": "rm -rf .tmp/pi-ce-build && tsc --outDir .tmp/pi-ce-build --rootDir src --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck src/*.ts",
+    "verify": "npm run build && node .tmp/pi-ce-build/verify.js && node .tmp/pi-ce-build/verify-hooks.js",
+    "test": "npm run verify"
+  },
+  "types": [
+    "extension",
+    "skill"
+  ],
   "main": "src/index.ts",
+  "files": ["src", "skills", "README.md", "LICENSE"],
   "dependencies": {
     "typescript": "^5.5.0"
   },
@@ -29,8 +40,12 @@
     "node": ">=20"
   },
   "pi": {
-    "extensions": ["./src/index.ts"],
-    "skills": ["./skills"],
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ],
     "providesTools": [
       "ce_exec",
       "ctx_read",

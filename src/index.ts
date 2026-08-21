@@ -13,8 +13,10 @@
  *    `literal: true` or escaping the pattern. Mutate event.input in place.
  *
  * 3. result auto-offload (Fix 4)
- *    Hook `tool_result` for text results. If a result exceeds a threshold,
- *    offload to disk and replace content with a handle + preview.
+ *    Hook `tool_result` for MODEL-BOUNDARY text results. If a result exceeds
+ *    a threshold, offload to disk and replace content with a handle + preview.
+ *    Intermediate values produced inside a running program are left untouched —
+ *    rewriting them would feed the program the placeholder instead of data.
  *
  * Plus the standalone CE tools (ctx_read, ctx_summarize, etc.) for
  * the model to use directly.
@@ -28,13 +30,20 @@ import { ContextStore } from "./store.js";
 import { ceTools, type ToolContext } from "./tools.js";
 import { evaluateProgram, type WrapperOptions } from "./wrapper.js";
 import { runChildPi } from "./child.js";
+import { ContextTelemetry } from "./telemetry.js";
 
 // ---- Config ----
 
 interface CeConfig extends WrapperOptions {
   enabled?: boolean;
-  /** Max bytes before text results are auto-offloaded. Default: 8192. */
+  /** UTF-8 bytes before text results are auto-offloaded. Default: 8192. */
   readOffloadThreshold?: number;
+  /** Nested Fabric provider threshold. Defaults to readOffloadThreshold. */
+  nestedResultThreshold?: number;
+  /** Optional maximum bytes retained by the context store. */
+  storeMaxBytes?: number;
+  /** Optional age limit for stored payloads. */
+  storeTtlMs?: number;
 }
 
 function loadConfig(cwd: string): CeConfig {
@@ -45,6 +54,65 @@ function loadConfig(cwd: string): CeConfig {
   } catch {
     return {};
   }
+}
+
+interface FabricProxyResult {
+  kind: "pi-fabric.tool-result-proxy.v1";
+  ref: string;
+  result: unknown;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" ? value as Record<string, unknown> : undefined;
+}
+
+/** Avoid a hard dependency while still consuming Fabric's documented proxy envelope. */
+function readFabricProxy(toolCallId: string, toolName: string, details: unknown): FabricProxyResult | undefined {
+  if (!toolCallId.startsWith("fabric_")) return undefined;
+  const record = asRecord(details);
+  if (record?.kind !== "pi-fabric.tool-result-proxy.v1" || record.ref !== toolName || !("result" in record)) return undefined;
+  return record as unknown as FabricProxyResult;
+}
+
+function serializeResult(value: unknown): string {
+  if (typeof value === "string") return value;
+  try { return JSON.stringify(value) ?? String(value); }
+  catch { return String(value); }
+}
+
+function isProviderBounded(toolName: string, input: Record<string, unknown>, details: Record<string, unknown>, textLength: number): boolean {
+  if (toolName === "fabric_exec") {
+    const artifactKeys = ["artifact", "artifactPath", "outputArtifact", "fabricTruncated", "omittedChars", "originalChars"];
+    if (artifactKeys.some((key) => key in details)) return true;
+  }
+  if (/^(?:fovea_|extensions\.fovea_)/.test(toolName)) {
+    const maxTokens = typeof input.maxTokens === "number" ? input.maxTokens : undefined;
+    if (maxTokens !== undefined && textLength <= maxTokens * 4) return true;
+  }
+  return false;
+}
+
+function inputHint(input: Record<string, unknown>): string {
+  return String(input.path ?? input.pattern ?? input.command ?? input.code ?? input.query ?? "result");
+}
+
+function strategyForTool(toolName: string): "WRITE" | "SELECT" | "COMPRESS" | "ISOLATE" | "PASS" {
+  if (/offload/.test(toolName)) return "WRITE";
+  if (/read|grep|fovea|select|recall/.test(toolName)) return "SELECT";
+  if (/summar|compress/.test(toolName)) return "COMPRESS";
+  if (/delegat|agent/.test(toolName)) return "ISOLATE";
+  return "PASS";
+}
+
+function formatHandleText(id: string, bytes: number, estimatedTokens: number, text: string, previewBytes: number, warning?: string): string {
+  const raw = Buffer.from(text, "utf8");
+  const preview = raw.subarray(0, previewBytes).toString("utf8");
+  const truncated = raw.length > previewBytes;
+  const handle =
+    `[offloaded to handle "${id}" — ${bytes} bytes, ~${estimatedTokens} tokens]\n` +
+    `Preview (first ${previewBytes} bytes):\n${preview}` +
+    (truncated ? `\n... [${raw.length - previewBytes} more bytes — use ctx_read with id "${id}" to inspect]` : "");
+  return warning ? `${warning}\n\n${handle}` : handle;
 }
 
 // ---- Regex auto-repair (Fix 1) ----
@@ -58,11 +126,21 @@ function loadConfig(cwd: string): CeConfig {
  *   - Unescaped ) at end: loadLocalCart( → loadLocalCart\(
  *   - {} interpreted as quantifier: state.cart = {}; → state\.cart\s*=\s*\{\};
  *
- * Strategy: if the pattern contains regex special chars that are likely
- * meant as literals (parens, braces, etc. in non-regex contexts), set
- * literal: true instead of trying to escape each char. This is safer and
- * matches what the model was trying to do — search for literal text.
+ * Strategy: repair only patterns that cannot compile as regular expressions
+ * (plus the {} edge case, which JS accepts as a literal but rg rejects as a
+ * quantifier). Valid regexes are left untouched: a failed rg parse is loud
+ * feedback the model can act on, while a wrongly literalized search fails
+ * silently with plausible-looking zero-match results.
  */
+export function isLikelyRegexParseError(pattern: string): boolean {
+  try {
+    new RegExp(pattern);
+  } catch {
+    return true;
+  }
+  return /(^|[^\\])\{\}/.test(pattern);
+}
+
 export function repairGrepInput(input: Record<string, unknown>): { repaired: boolean; reason: string } {
   const pattern = input.pattern as string | undefined;
   if (!pattern || typeof pattern !== "string") return { repaired: false, reason: "" };
@@ -70,24 +148,7 @@ export function repairGrepInput(input: Record<string, unknown>): { repaired: boo
   // If literal mode is already set, nothing to do.
   if (input.literal === true) return { repaired: false, reason: "" };
 
-  // Detect patterns that are likely to cause regex parse errors.
-  // These are patterns where the model is searching for code snippets
-  // (function names with parens, object assignments with braces, etc.)
-  // but forgot to escape the regex special chars.
-  const dangerousPatterns = [
-    // Unescaped ( not followed by ?: or a valid group — e.g. "foo(" or "foo(bar"
-    // Also matches ( at end of string or start of string.
-    /(^|[^\\])\((?:[^?]|$)/,
-    // Unescaped ) at end or before | — e.g. "foo)" or "foo)|bar"
-    /(^|[^\\])\)(?:\||$)/,
-    // Unescaped { not part of a quantifier — e.g. "{}" or "= {};"
-    /(^|[^\\])\{[^0-9]/,
-    // Unescaped [ that doesn't start a character class properly
-    /(^|[^\\])\[[^\]\^]/,
-  ];
-
-  const isDangerous = dangerousPatterns.some((p) => p.test(pattern));
-  if (!isDangerous) return { repaired: false, reason: "" };
+  if (!isLikelyRegexParseError(pattern)) return { repaired: false, reason: "" };
 
   // Auto-repair: set literal: true. This tells rg to treat the pattern as
   // a literal string, which is what the model intended when searching for
@@ -95,7 +156,8 @@ export function repairGrepInput(input: Record<string, unknown>): { repaired: boo
   input.literal = true;
   return {
     repaired: true,
-    reason: `Pattern "${pattern.slice(0, 60)}" contains unescaped regex special chars. ` +
+    reason: `Pattern "${pattern.slice(0, 60)}" does not compile as a regular expression ` +
+      "(unescaped special chars or empty {} quantifier braces). " +
       "Set literal=true to search for the literal text instead of a regex. " +
       "If you need regex, escape special chars: \\( \\) \\{ \\} \\[ \\].",
   };
@@ -116,6 +178,19 @@ export default function contextEngineer(pi: ExtensionAPI): void {
 
   // WARN decisions are attached to the corresponding tool result.
   const pendingWarnings = new Map<string, string>();
+
+  // Number of fabric_exec programs currently executing. A tool_result that
+  // arrives while this is > 0 (and is not the fabric_exec result itself) is an
+  // INTERMEDIATE value consumed by program code — never rewritten, because the
+  // program would receive the placeholder/handle text instead of real data.
+  let fabricExecDepth = 0;
+  const telemetry = new ContextTelemetry();
+
+  const storeFor = (cwd: string, cfg: CeConfig): ContextStore => new ContextStore(
+    cwd,
+    ".pi/context-store",
+    { maxBytes: cfg.storeMaxBytes, ttlMs: cfg.storeTtlMs },
+  );
 
   // ================================================================
   // Fix 2: Intercept fabric_exec via tool_call hook
@@ -145,6 +220,13 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     const decision = evaluateProgram(program, cfg);
 
     if (decision.tier === "BLOCK") {
+      telemetry.record(ctx.cwd, {
+        strategy: "BLOCK",
+        tool: "fabric_exec",
+        sourceTokens: decision.analysis.metrics.estimatedSourceTokens ?? 0,
+        visibleTokens: Math.ceil(decision.guidance.length / 4),
+        note: decision.analysis.reasons[0] ?? "static policy block",
+      });
       return {
         block: true,
         reason: decision.guidance,
@@ -155,7 +237,12 @@ export default function contextEngineer(pi: ExtensionAPI): void {
       pendingWarnings.set(event.toolCallId, decision.guidance);
     }
 
-    // PASS and WARN both execute; WARN is annotated in the tool_result hook.
+    // PASS and WARN both execute; track the execution so tool_result can tell
+    // model-boundary results apart from intermediate ones. BLOCK does not
+    // execute, so it must not increment.
+    fabricExecDepth++;
+
+    // WARN is annotated in the tool_result hook.
     return undefined;
   });
 
@@ -197,14 +284,82 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   const PREVIEW_BYTES = 2048;
 
   pi.on("tool_result", async (event, ctx) => {
+    // Classify first: the fabric_exec result itself closes a program execution;
+    // anything else arriving while one is running is an intermediate value.
+    const isFabricExecResult = event.toolName === "fabric_exec";
+    if (isFabricExecResult) fabricExecDepth = Math.max(0, fabricExecDepth - 1);
+    const fabricProxy = readFabricProxy(event.toolCallId, event.toolName, event.details);
+    const isIntermediate = !isFabricExecResult && fabricExecDepth > 0;
+
     const warning = pendingWarnings.get(event.toolCallId);
     if (warning) pendingWarnings.delete(event.toolCallId);
+
+    if (isIntermediate && !fabricProxy) {
+      // Leave ordinary intermediate Pi results byte-for-byte untouched: an
+      // offload placeholder would corrupt the Fabric program's data. The
+      // documented Fabric provider proxy is the exception; it is middleware
+      // specifically intended to be replaced before QuickJS sees it.
+      return undefined;
+    }
 
     const cfg = configFor(ctx.cwd);
     if (cfg.enabled === false) return undefined;
 
     const threshold = cfg.readOffloadThreshold ?? READ_OFFLOAD_THRESHOLD;
     const existingDetails = (event.details ?? {}) as Record<string, unknown>;
+    const input = (event.input ?? {}) as Record<string, unknown>;
+
+    // Fabric exposes provider results through a documented proxy before its
+    // QuickJS nested-result limit. Patch the structured proxy value itself so
+    // the guest receives a handle, not merely a shortened display string.
+    if (fabricProxy) {
+      const serialized = serializeResult(fabricProxy.result);
+      const nestedThreshold = cfg.nestedResultThreshold ?? threshold;
+      const serializedBytes = Buffer.byteLength(serialized, "utf8");
+      const providerBounded = isProviderBounded(event.toolName, input, existingDetails, serializedBytes);
+      if (event.isError || providerBounded || serializedBytes < nestedThreshold) {
+        if (serializedBytes >= 1024) {
+          telemetry.record(ctx.cwd, {
+            strategy: providerBounded ? strategyForTool(event.toolName) : "PASS",
+            tool: event.toolName,
+            sourceBytes: Buffer.byteLength(serialized, "utf8"),
+            visibleBytes: Buffer.byteLength(serialized, "utf8"),
+            provider: event.toolName.split(".")[0],
+            note: providerBounded ? "provider-bounded nested result" : "nested result below CE threshold",
+          });
+        }
+        return undefined;
+      }
+
+      const store = storeFor(ctx.cwd, cfg);
+      const key = `fabric-${event.toolName}-${inputHint(input)}`.replace(/[^a-z0-9-]/gi, "-").slice(0, 64);
+      const offloaded = store.write(key, event.toolName, serialized);
+      const replacement = {
+        contextEngineerTruncated: true,
+        handle: offloaded.id,
+        originalBytes: offloaded.bytes,
+        originalTokens: offloaded.estimatedTokens,
+        preview: Buffer.from(serialized, "utf8").subarray(0, PREVIEW_BYTES).toString("utf8"),
+      };
+      const nestedText = formatHandleText(offloaded.id, offloaded.bytes, offloaded.estimatedTokens, serialized, PREVIEW_BYTES, warning);
+      telemetry.record(ctx.cwd, {
+        strategy: "WRITE",
+        tool: event.toolName,
+        sourceBytes: Buffer.byteLength(serialized, "utf8"),
+        visibleBytes: Buffer.byteLength(nestedText, "utf8"),
+        provider: event.toolName.split(".")[0],
+        handle: offloaded.id,
+        note: "nested Fabric provider result offloaded before QuickJS",
+      });
+      const content = event.content.some((item) => item.type === "text")
+        ? event.content.map((item) => item.type === "text" ? { ...item, text: nestedText } : item)
+        : [...event.content, { type: "text" as const, text: nestedText }];
+      return {
+        content,
+        details: { ...existingDetails, result: replacement, ce_offloaded: true, ce_handle: offloaded.id },
+      };
+    }
+
     const textContent = event.content.find(
       (c): c is { type: "text"; text: string } => c.type === "text" && typeof (c as { text?: string }).text === "string"
     );
@@ -217,10 +372,26 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     const alreadyOffloaded =
       existingDetails.ce_offloaded === true ||
       /^\[offloaded to handle "[^\"]+"/.test(text);
+    const textBytes = Buffer.byteLength(text, "utf8");
+    const providerBounded = isProviderBounded(event.toolName, input, existingDetails, textBytes);
 
-    // Errors, small results, and already-offloaded results are not rewritten;
+    // Errors, small results, already-offloaded results, and provider-bounded
+    // results are not rewritten; CE should not stack a second budget/artifact.
+
     // they may still receive a pending analyzer warning.
-    if (event.isError || alreadyOffloaded || text.length < threshold) {
+    // ctx_read caps its own output below the threshold (see tools.ts); letting
+    // the hook rewrite it would chain handles recursively and make stored
+    // payloads effectively unreachable.
+    if (event.isError || alreadyOffloaded || providerBounded || event.toolName === "ctx_read" || textBytes < threshold) {
+      if (textBytes >= 1024 && (providerBounded || event.toolName === "fabric_exec")) {
+        telemetry.record(ctx.cwd, {
+          strategy: providerBounded ? strategyForTool(event.toolName) : "PASS",
+          tool: event.toolName,
+          sourceBytes: Buffer.byteLength(text, "utf8"),
+          visibleBytes: Buffer.byteLength(text, "utf8"),
+          note: providerBounded ? "provider-bounded final result" : "final result below CE threshold",
+        });
+      }
       if (!warning) return undefined;
       const replacementText = `${warning}\n\n${text}`;
       const content = event.content.map((item) =>
@@ -233,19 +404,19 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     }
 
     // Build a descriptive key from the tool + input.
-    const input = event.input as Record<string, unknown>;
-    const pathHint = (input.path as string) || (input.pattern as string) || (input.command as string) || (input.code as string) || "result";
-    const key = `${event.toolName}-${pathHint}`.replace(/[^a-z0-9-]/gi, "-").slice(0, 48);
+    const key = `${event.toolName}-${inputHint(input)}`.replace(/[^a-z0-9-]/gi, "-").slice(0, 48);
 
-    const store = new ContextStore(ctx.cwd);
+    const store = storeFor(ctx.cwd, cfg);
     const offloaded = store.write(key, event.toolName, text);
-    const preview = text.slice(0, PREVIEW_BYTES);
-    const truncated = text.length > PREVIEW_BYTES;
-    const handleText =
-      `[offloaded to handle "${offloaded.id}" — ${offloaded.bytes} bytes, ~${offloaded.estimatedTokens} tokens]\n` +
-      `Preview (first ${PREVIEW_BYTES} bytes):\n${preview}` +
-      (truncated ? `\n... [${text.length - PREVIEW_BYTES} more bytes — use ctx_read with id "${offloaded.id}" to inspect]` : "");
-    const replacementText = warning ? `${warning}\n\n${handleText}` : handleText;
+    const replacementText = formatHandleText(offloaded.id, offloaded.bytes, offloaded.estimatedTokens, text, PREVIEW_BYTES, warning);
+    telemetry.record(ctx.cwd, {
+      strategy: "WRITE",
+      tool: event.toolName,
+      sourceBytes: Buffer.byteLength(text, "utf8"),
+      visibleBytes: Buffer.byteLength(replacementText, "utf8"),
+      handle: offloaded.id,
+      note: "large final text result offloaded",
+    });
     const content = event.content.map((item) =>
       item.type === "text" ? { ...item, text: item === textContent ? replacementText : item.text } : item
     );
@@ -258,6 +429,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         ce_handle: offloaded.id,
         ce_original_bytes: offloaded.bytes,
         ce_original_tokens: offloaded.estimatedTokens,
+        ce_saved_tokens: Math.max(0, offloaded.estimatedTokens - Math.ceil(replacementText.length / 4)),
       },
     };
   });
@@ -292,9 +464,11 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         const currentModel = execCtx.model
           ? `${execCtx.model.provider}/${execCtx.model.id}`
           : undefined;
+        const toolConfig = configFor(execCtx.cwd);
         const toolCtx: ToolContext = {
-          store: new ContextStore(execCtx.cwd),
+          store: storeFor(execCtx.cwd, toolConfig),
           workspaceRoot: execCtx.cwd,
+          maxReturnBytes: toolConfig.readOffloadThreshold ?? READ_OFFLOAD_THRESHOLD,
           callTool: async () => {
             throw new Error("callTool is only available inside a Fabric program; use pi.* or extensions.* there.");
           },
@@ -303,7 +477,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
             model: opts?.model ?? currentModel,
             timeoutMs: 180_000,
           }),
-          modelCall: (prompt) => runChildPi(prompt, {
+          modelCall: (prompt, _maxTokens) => runChildPi(prompt, {
             cwd: execCtx.cwd,
             model: currentModel,
             noTools: true,
@@ -313,8 +487,19 @@ export default function contextEngineer(pi: ExtensionAPI): void {
 
         try {
           const result = await def.handler(params, toolCtx);
+          const serialized = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+          const resultRecord = result && typeof result === "object" ? result as Record<string, unknown> : undefined;
+          const sourceTokens = [resultRecord?.originalTokens, resultRecord?.totalTokens, resultRecord?.resultTokens]
+            .find((value): value is number => typeof value === "number" && Number.isFinite(value));
+          telemetry.record(execCtx.cwd, {
+            strategy: strategyForTool(def.name),
+            tool: def.name,
+            sourceTokens: sourceTokens ?? Math.ceil(serialized.length / 4),
+            visibleBytes: Buffer.byteLength(serialized, "utf8"),
+            note: "CE helper result",
+          });
           return {
-            content: [{ type: "text" as const, text: typeof result === "string" ? result : JSON.stringify(result, null, 2) }],
+            content: [{ type: "text" as const, text: serialized }],
             details: { tool: def.name, result: typeof result === "string" ? undefined : result },
           };
         } catch (err) {
@@ -344,12 +529,20 @@ export default function contextEngineer(pi: ExtensionAPI): void {
       data: Type.String({ description: "The full payload to offload." }),
     }),
     async execute(_id, params, _signal, _onUpdate, execCtx) {
-      const store = new ContextStore(execCtx.cwd);
+      const store = storeFor(execCtx.cwd, configFor(execCtx.cwd));
       const result = store.write(
         params.key as string,
         params.source as string,
         params.data as string
       );
+      telemetry.record(execCtx.cwd, {
+        strategy: "WRITE",
+        tool: "ctx_offload",
+        sourceBytes: result.bytes,
+        visibleBytes: Buffer.byteLength(result.preview, "utf8"),
+        handle: result.id,
+        note: "manual context offload",
+      });
       return {
         content: [{
           type: "text" as const,
@@ -398,8 +591,12 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           isError: true,
           details: {
             blocked: true,
+            hardBlock: decision.analysis.hardBlock,
             toolCalls: decision.analysis.metrics.toolCalls,
             rawReturn: decision.analysis.metrics.returnIsRawToolResult,
+            returnTaint: decision.analysis.metrics.returnTaint,
+            reductionRatio: decision.analysis.metrics.estimatedReductionRatio,
+            boundedSelectionCalls: decision.analysis.metrics.boundedSelectionCalls,
             hasProcessing: decision.analysis.metrics.hasProcessingBetweenToolAndReturn,
           },
         };
@@ -414,12 +611,69 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         details: {
           blocked: false,
           tier: decision.tier,
+          hardBlock: decision.analysis.hardBlock,
           toolCalls: decision.analysis.metrics.toolCalls,
           rawReturn: decision.analysis.metrics.returnIsRawToolResult,
+          returnTaint: decision.analysis.metrics.returnTaint,
+          reductionRatio: decision.analysis.metrics.estimatedReductionRatio,
+          boundedSelectionCalls: decision.analysis.metrics.boundedSelectionCalls,
           hasProcessing: decision.analysis.metrics.hasProcessingBetweenToolAndReturn,
           estimatedReturnTokens: decision.analysis.metrics.estimatedReturnTokens,
         },
       };
+    },
+  });
+
+  // ================================================================
+  // Observability commands
+  // ================================================================
+
+  pi.registerCommand("ce", {
+    description: "Inspect Context Engineer policy, token savings, and settings",
+    handler: async (args, ctx) => {
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      const command = parts[0] ?? "status";
+      const allSessions = parts.includes("--all");
+      let message: string;
+
+      if (command === "status") {
+        const summary = telemetry.summary(ctx.cwd, allSessions);
+        const reduction = `${(summary.reductionRatio * 100).toFixed(1)}%`;
+        const strategyLines = Object.entries(summary.byStrategy)
+          .sort(([, left], [, right]) => right.savedTokens - left.savedTokens)
+          .map(([name, bucket]) => `  ${name.padEnd(8)} ${bucket.savedTokens.toLocaleString()} saved tokens (${bucket.events} event${bucket.events === 1 ? "" : "s"})`);
+        message = [
+          `Context Engineer${allSessions ? " (all sessions)" : " (current session)"}`,
+          `Observed source: ${summary.sourceTokens.toLocaleString()} tokens`,
+          `Visible to model: ${summary.visibleTokens.toLocaleString()} tokens`,
+          `Main context saved: ${summary.savedTokens.toLocaleString()} tokens (${reduction})`,
+          `Events: ${summary.events}`,
+          ...(strategyLines.length > 0 ? ["", "By strategy:", ...strategyLines] : []),
+          ...(summary.largest ? ["", `Largest saving: ${summary.largest.tool} — ${summary.largest.savedTokens.toLocaleString()} tokens`] : []),
+        ].join("\n");
+      } else if (command === "trace") {
+        const events = telemetry.recent(ctx.cwd, 20, allSessions);
+        message = events.length === 0
+          ? "No Context Engineer events recorded."
+          : events.map((event) => `${event.timestamp.slice(11, 19)} ${event.strategy.padEnd(8)} ${event.tool} source=${event.sourceTokens} visible=${event.visibleTokens} saved=${event.savedTokens}${event.note ? ` — ${event.note}` : ""}`).join("\n");
+      } else if (command === "settings") {
+        message = JSON.stringify(configFor(ctx.cwd), null, 2);
+      } else if (command === "explain") {
+        message = [
+          "Context Engineer is the context governor above Fabric and Fovea.",
+          "Static data-flow analysis blocks raw/encoded tool data at fabric_exec returns.",
+          "Runtime hooks preserve Fabric intermediate values, guard nested provider proxies, and offload oversized boundary results.",
+          "Fovea calls with maxTokens are treated as budgeted SELECT operations.",
+          "Use /ce status, /ce trace, /ce settings, or /ce status --all.",
+        ].join("\n");
+      } else if (command === "clear") {
+        telemetry.clear(ctx.cwd);
+        message = "Context Engineer telemetry cleared for this workspace.";
+      } else {
+        message = "Usage: /ce [status|trace|explain|settings|clear] [--all]";
+      }
+
+      ctx.ui.notify(message, "info");
     },
   });
 
@@ -432,7 +686,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     if (cfg.enabled === false) return;
     if (ctx.hasUI) {
       ctx.ui.notify(
-        "context-engineer: active — fabric_exec interception, grep auto-repair, read auto-offload",
+        "context-engineer: active — taint gate, nested Fabric guard, Fovea-aware budgets, /ce status",
         "info"
       );
     }

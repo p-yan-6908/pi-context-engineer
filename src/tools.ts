@@ -16,9 +16,16 @@ import { ContextStore } from "./store.js";
 
 // ---- Types ----
 
+/** Headroom reserved for the JSON envelope around a CE tool result. */
+const RESULT_ENVELOPE_SLACK_BYTES = 1024;
+/** Default ceiling for one CE tool result; mirrors index.ts's offload threshold. */
+const DEFAULT_MAX_RETURN_BYTES = 8192;
+
 export interface ToolContext {
   store: ContextStore;
   workspaceRoot: string;
+  /** Approximate byte budget for one tool result; ctx_read self-caps under it. */
+  maxReturnBytes?: number;
   /** Call a Pi core tool by name (read, bash, grep, etc.) */
   callTool: (name: string, args: Record<string, unknown>) => Promise<unknown>;
   /** Spawn a child Pi agent with a fresh context window */
@@ -54,14 +61,51 @@ const ctxRead: ToolDef = {
     required: ["id"],
   },
   async handler(args, ctx) {
-    return ctx.store.read(args.id as string, {
+    // Self-cap output so a ctx_read result never reaches the auto-offload
+    // threshold — otherwise reading a handle would produce another handle
+    // (recursive offload), making the stored payload unreachable.
+    const budget = Math.max(
+      512,
+      (ctx.maxReturnBytes ?? DEFAULT_MAX_RETURN_BYTES) - RESULT_ENVELOPE_SLACK_BYTES
+    );
+
+    if (args.query) {
+      const result = await ctx.store.read(args.id as string, {
+        query: args.query as string,
+        contextLines: args.contextLines as number | undefined,
+      });
+      return capContent(result, budget, "narrow the query or reduce contextLines");
+    }
+
+    const requested = args.length as number | undefined;
+    const result = await ctx.store.read(args.id as string, {
       offset: args.offset as number | undefined,
-      length: args.length as number | undefined,
-      query: args.query as string | undefined,
-      contextLines: args.contextLines as number | undefined,
+      length: Math.min(requested ?? budget, budget),
     });
+    return capContent(result, budget, "use offset to page through the rest");
   },
 };
+
+/**
+ * Guarantee a ReadResult fits within the byte budget. Oversized content is
+ * sliced with an explicit note so the model knows to page or narrow instead of
+ * receiving a silent truncation.
+ */
+function capContent<T extends { content: string; truncated: boolean }>(
+  result: T,
+  budget: number,
+  hint: string
+): T {
+  if (Buffer.byteLength(result.content, "utf8") <= budget) return result;
+  const prefix = Buffer.from(result.content, "utf8").subarray(0, budget).toString("utf8");
+  return {
+    ...result,
+    content:
+      prefix +
+      `\n... [ctx_read output capped at ${budget} bytes to stay out of the offload path — ${hint}]`,
+    truncated: true,
+  };
+}
 
 // ---- ctx_summarize: compress data structurally or via model ----
 
@@ -70,7 +114,7 @@ const ctxSummarize: ToolDef = {
   description:
     "Compress a stored payload or inline text into a small structured summary. " +
     "Structural mode (default) is free and deterministic: extracts keys, counts, signatures, first/last N lines. " +
-    "Model mode uses a cheaper model for semantic summarization. " +
+    "Model mode uses an isolated no-tools Pi process (the current model by default) for semantic summarization. " +
     "Always prefer structural mode unless you need semantic understanding.",
   inputSchema: {
     type: "object",
@@ -104,7 +148,7 @@ const ctxSummarize: ToolDef = {
     }
 
     if (mode === "structural") {
-      return structuralSummary(data, source, maxTokens);
+      return capSummary(structuralSummary(data, source, maxTokens), maxTokens);
     }
 
     // Model mode
@@ -112,7 +156,8 @@ const ctxSummarize: ToolDef = {
       `Preserve: key facts, identifiers, errors, decisions, and any data structures. ` +
       `Drop: redundant examples, verbose descriptions, formatting noise.\n\n---\n${data}`;
     const summary = await ctx.modelCall(prompt, maxTokens);
-    return { source, mode: "model", summary, originalTokens: Math.ceil(data.length / 4), summaryTokens: Math.ceil(summary.length / 4) };
+    const boundedSummary = capText(summary, maxTokens * 4);
+    return { source, mode: "model", summary: boundedSummary, originalTokens: Math.ceil(Buffer.byteLength(data, "utf8") / 4), summaryTokens: Math.ceil(Buffer.byteLength(boundedSummary, "utf8") / 4), truncated: boundedSummary.length < summary.length };
   },
 };
 
@@ -151,22 +196,33 @@ const ctxRecall: ToolDef = {
     type: "object",
     properties: {
       query: { type: "string", description: "Optional literal filter — only return facts containing this substring." },
+      limit: { type: "integer", description: "Maximum number of facts to return. Default 20." },
+      maxTokens: { type: "integer", description: "Maximum estimated tokens to return. Default 1000." },
     },
   },
   async handler(args, ctx) {
     const memStore = new ContextStore(ctx.workspaceRoot, ".pi/agent/context-store");
     const entries = memStore.list();
     const facts: string[] = [];
+    const limit = Math.max(1, Math.min((args.limit as number | undefined) ?? 20, 100));
+    const maxTokens = Math.max(64, (args.maxTokens as number | undefined) ?? 1000);
+    let usedTokens = 0;
+    let truncated = false;
 
     for (const entry of entries) {
       if (entry.key !== "memory") continue;
       const full = memStore.read(entry.id, { length: Number.MAX_SAFE_INTEGER });
-      if (!args.query || full.content.includes(args.query as string)) {
-        facts.push(full.content);
+      if (args.query && !full.content.includes(args.query as string)) continue;
+      const factTokens = Math.ceil(Buffer.byteLength(full.content, "utf8") / 4);
+      if (facts.length >= limit || usedTokens + factTokens > maxTokens) {
+        truncated = true;
+        break;
       }
+      facts.push(full.content);
+      usedTokens += factTokens;
     }
 
-    return { count: facts.length, facts };
+    return { count: facts.length, facts, truncated, estimatedTokens: usedTokens };
   },
 };
 
@@ -178,6 +234,7 @@ const ctxDelegate: ToolDef = {
     "Delegate a separable subtask to a child Pi agent with a fresh context window. " +
     "The child does all the heavy reading/searching in its own context; " +
     "only its final summary returns to yours. " +
+    "For Fabric-native recursive orchestration, prefer agents.run directly; use this tool as the standalone Pi fallback. " +
     "Use for: distinct file reviews, independent research questions, parallelizable analysis.",
   inputSchema: {
     type: "object",
@@ -206,6 +263,27 @@ export const ceTools: ToolDef[] = [
 export const ceToolMap = new Map(ceTools.map((t) => [t.name, t]));
 
 // ---- Structural summary implementation ----
+
+function capText(text: string, maxBytes: number): string {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  return Buffer.from(text, "utf8").subarray(0, Math.max(64, maxBytes - 80)).toString("utf8") + "\n... [summary capped]";
+}
+
+function capSummary(summary: unknown, maxTokens: number): unknown {
+  const maxBytes = Math.max(256, maxTokens * 4);
+  const serialized = JSON.stringify(summary);
+  if (Buffer.byteLength(serialized, "utf8") <= maxBytes) return summary;
+  const record = summary && typeof summary === "object" ? summary as Record<string, unknown> : {};
+  const compact: Record<string, unknown> = {};
+  for (const key of ["source", "mode", "kind", "originalTokens", "lines", "keys", "length", "truncated"]) {
+    if (key in record) compact[key] = record[key];
+  }
+  compact.truncated = true;
+  const metadata = JSON.stringify(compact);
+  const remaining = Math.max(64, maxBytes - Buffer.byteLength(metadata, "utf8") - 40);
+  compact.summary = capText(serialized, remaining);
+  return compact;
+}
 
 function structuralSummary(data: string, source: string, maxTokens: number): unknown {
   const trimmed = data.trim();

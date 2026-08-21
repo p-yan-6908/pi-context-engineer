@@ -3,8 +3,11 @@
  * These are the two new code paths added in this round.
  */
 
-import { repairGrepInput } from "./index.js";
+import contextEngineer, { repairGrepInput, isLikelyRegexParseError } from "./index.js";
 import { ContextStore } from "./store.js";
+import { ContextTelemetry } from "./telemetry.js";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import assert from "node:assert/strict";
 
 // ---- Test grep auto-repair ----
@@ -44,6 +47,33 @@ const grepTests: Array<{ name: string; input: Record<string, unknown>; expectRep
     name: "unclosed group with alt: refreshCustomer|clearCustomerSession|logout(",
     input: { pattern: "refreshCustomer|clearCustomerSession|logout(" },
     expectRepaired: true,
+  },
+  // Regression: valid regexes must NEVER be repaired (previously the punctuation
+  // heuristic silently flipped them to literal searches).
+  {
+    name: "valid alternation: (a|b)",
+    input: { pattern: "(a|b)" },
+    expectRepaired: false,
+  },
+  {
+    name: "valid char class: [a-z]+\\.txt",
+    input: { pattern: "[a-z]+\\.txt" },
+    expectRepaired: false,
+  },
+  {
+    name: "valid trailing paren: function\\s+\\w+\\(",
+    input: { pattern: "function\\s+\\w+\\(" },
+    expectRepaired: false,
+  },
+  {
+    name: "valid anchored alternation: ^(GET|POST)$",
+    input: { pattern: "^(GET|POST)$" },
+    expectRepaired: false,
+  },
+  {
+    name: "escaped braces stay regex: state\\.cart\\s*=\\s*\\{\\};",
+    input: { pattern: "state\\.cart\\s*=\\s*\\{\\};" },
+    expectRepaired: false,
   },
 ];
 
@@ -112,13 +142,234 @@ const queryResult = store.read(offloaded.id, { query: "clearCustomerSession" });
 console.log(`✅ ctx_read full preview (first ${readResult.bytesRead} bytes of ${readResult.totalBytes})`);
 console.log(`✅ ctx_read query "clearCustomerSession": ${queryResult.matchedLines?.length ?? 0} matches`);
 
+// ---- Test boundary vs intermediate results (nested offload fix) ----
+
+console.log("\n=== Boundary vs Intermediate Results ===\n");
+
+let hookFailed = 0;
+let hookChecks = 0;
+function checkHook(name: string, cond: boolean, detail = "") {
+  hookChecks++;
+  console.log(`${cond ? "✅" : "❌"} ${name}${detail ? `\n   ${detail}` : ""}`);
+  if (!cond) hookFailed++;
+}
+
+// Minimal ExtensionAPI stub capturing registered hooks and tools.
+type HookFn = (event: any, ctx: any) => Promise<any>;
+const hooks: Record<string, HookFn[]> = {};
+const registeredTools = new Map<string, any>();
+const piStub: any = {
+  on: (name: string, fn: HookFn) => {
+    (hooks[name] ??= []).push(fn);
+  },
+  registerTool: (def: any) => {
+    registeredTools.set(def.name, def);
+  },
+  // The /ce command is a UI affordance; nothing to capture in headless tests.
+  registerCommand: (_name: string, _def: unknown) => {},
+};
+contextEngineer(piStub);
+
+const hookCwd = "/tmp/pi-ce-hooks-" + Date.now();
+mkdirSync(hookCwd, { recursive: true });
+const callHook = async (name: string, event: any) => {
+  let out: any;
+  for (const fn of hooks[name] ?? []) {
+    const result = await fn(event, { cwd: hookCwd });
+    if (result !== undefined) out = result;
+  }
+  return out;
+};
+
+const BIG = "b".repeat(20000);
+const PROGRAM = `const r = await pi.read({ path: "big.txt" }); return r.length;`;
+
+// Control: with no program running, a large top-level result is offloaded.
+const ctrl = await callHook("tool_result", {
+  toolCallId: "ctrl",
+  toolName: "read",
+  input: { path: "big.txt" },
+  content: [{ type: "text", text: BIG }],
+});
+checkHook("top-level large result is offloaded", ctrl?.details?.ce_offloaded === true);
+
+// While a program runs, inner results are intermediate values consumed by
+// program code and must arrive byte-for-byte intact.
+await callHook("tool_call", { toolCallId: "fe1", toolName: "fabric_exec", input: { code: PROGRAM } });
+await callHook("tool_call", { toolCallId: "inner1", toolName: "read", input: { path: "big.txt" } });
+const inner = await callHook("tool_result", {
+  toolCallId: "inner1",
+  toolName: "read",
+  input: { path: "big.txt" },
+  content: [{ type: "text", text: BIG }],
+});
+checkHook("inner read passes through untouched while program runs", inner === undefined);
+
+// Fabric's documented provider proxy is safe to replace even inside an active
+// program because its patched details.result becomes the QuickJS value.
+const nestedProxy = await callHook("tool_result", {
+  toolCallId: "fabric_nested_provider_1",
+  toolName: "mcp.test.search",
+  input: { query: "large" },
+  details: {
+    kind: "pi-fabric.tool-result-proxy.v1",
+    ref: "mcp.test.search",
+    result: { output: BIG },
+  },
+  content: [{ type: "text", text: BIG }],
+});
+checkHook(
+  "nested Fabric provider result is offloaded structurally",
+  nestedProxy?.details?.result?.contextEngineerTruncated === true && typeof nestedProxy?.details?.result?.handle === "string",
+);
+const nestedHandle = nestedProxy?.details?.result?.handle as string | undefined;
+checkHook(
+  "nested provider payload is recoverable from its handle",
+  Boolean(nestedHandle && new ContextStore(hookCwd).read(nestedHandle, { query: "bbbb" }).totalBytes > 0),
+);
+
+const fe1 = await callHook("tool_result", {
+  toolCallId: "fe1",
+  toolName: "fabric_exec",
+  input: { code: PROGRAM },
+  content: [{ type: "text", text: BIG }],
+});
+checkHook("fabric_exec boundary result itself is offloaded", fe1?.details?.ce_offloaded === true);
+
+const resumed = await callHook("tool_result", {
+  toolCallId: "resumed1",
+  toolName: "grep",
+  input: { pattern: "x" },
+  content: [{ type: "text", text: BIG }],
+});
+checkHook("boundary offload resumes after program completes", resumed?.details?.ce_offloaded === true);
+
+// WARN programs also execute (opening the intermediate window), and their
+// warning must land on their own boundary result.
+await callHook("tool_call", {
+  toolCallId: "fe2",
+  toolName: "fabric_exec",
+  input: { code: `return { data: "${"x".repeat(20000)}" };` },
+});
+const fe2 = await callHook("tool_result", {
+  toolCallId: "fe2",
+  toolName: "fabric_exec",
+  input: { code: "return { data: 'small' };" },
+  content: [{ type: "text", text: "small result" }],
+});
+checkHook(
+  "WARN annotated on its own boundary result",
+  typeof fe2?.content?.[0]?.text === "string" && fe2.content[0].text.startsWith("⚠️")
+);
+const afterWarn = await callHook("tool_result", {
+  toolCallId: "afterwarn1",
+  toolName: "read",
+  input: { path: "w.txt" },
+  content: [{ type: "text", text: BIG }],
+});
+checkHook("intermediate window closed after WARN program", afterWarn?.details?.ce_offloaded === true);
+
+// BLOCK does not execute, so it must not open the intermediate window.
+const blocked = await callHook("tool_call", {
+  toolCallId: "fe3",
+  toolName: "fabric_exec",
+  input: { code: `const r = await pi.read({ path: "f" }); return r;` },
+});
+checkHook("raw passthrough program is blocked", blocked?.block === true);
+const postBlock = await callHook("tool_result", {
+  toolCallId: "postblock1",
+  toolName: "bash",
+  input: { cmd: "cat big" },
+  content: [{ type: "text", text: BIG }],
+});
+checkHook("blocked program did not suppress boundary offload", postBlock?.details?.ce_offloaded === true);
+
+// ---- Test ctx_read self-cap (recursive offload fix) ----
+
+console.log("\n=== ctx_read Self-Cap ===\n");
+
+let ctlFailed = 0;
+let ctlChecks = 0;
+function checkCtl(name: string, cond: boolean, detail = "") {
+  ctlChecks++;
+  console.log(`${cond ? "✅" : "❌"} ${name}${detail ? `\n   ${detail}` : ""}`);
+  if (!cond) ctlFailed++;
+}
+
+const capCwd = "/tmp/pi-ce-cap-" + Date.now();
+mkdirSync(capCwd, { recursive: true });
+const capStore = new ContextStore(capCwd);
+const payload = "needle line\n".repeat(4000); // ~44KB, 4000 matches
+const capEntry = capStore.write("cap-test", "read", payload);
+
+const ctxReadDef = registeredTools.get("ctx_read");
+checkHook("ctx_read tool is registered", Boolean(ctxReadDef));
+
+if (ctxReadDef) {
+  const out1 = await ctxReadDef.execute("t1", { id: capEntry.id }, undefined, undefined, { cwd: capCwd });
+  const p1 = JSON.parse(out1.content[0].text);
+  checkCtl(
+    "default ranged read stays under the 8KB threshold",
+    p1.bytesRead < 8192 && p1.truncated === true && p1.totalBytes === Buffer.byteLength(payload),
+    `bytesRead=${p1.bytesRead}, totalBytes=${p1.totalBytes}`
+  );
+
+  const out2 = await ctxReadDef.execute("t2", { id: capEntry.id, query: "needle" }, undefined, undefined, { cwd: capCwd });
+  const p2 = JSON.parse(out2.content[0].text);
+  checkCtl(
+    "query-mode output stays under the threshold",
+    p2.content.length < 8192 && p2.truncated === true,
+    `contentChars=${p2.content.length}, matches=${p2.matchedLines?.length}`
+  );
+}
+
+// Project config lowers the threshold; the self-cap must follow it.
+const tightCwd = "/tmp/pi-ce-tight-" + Date.now();
+mkdirSync(join(tightCwd, ".pi"), { recursive: true });
+writeFileSync(join(tightCwd, ".pi", "context-engineer.json"), JSON.stringify({ readOffloadThreshold: 4096 }));
+const tightEntry = new ContextStore(tightCwd).write("tight-test", "read", "y".repeat(20000));
+if (ctxReadDef) {
+  const out3 = await ctxReadDef.execute("t3", { id: tightEntry.id }, undefined, undefined, { cwd: tightCwd });
+  const p3 = JSON.parse(out3.content[0].text);
+  checkCtl("configured readOffloadThreshold respected", p3.bytesRead <= 4096, `bytesRead=${p3.bytesRead}`);
+}
+
+// Defense in depth: even a large ctx_read-shaped result is exempt from the
+// offload hook, so handle chains cannot form regardless of sizing bugs.
+const crBig = await callHook("tool_result", {
+  toolCallId: "crbig1",
+  toolName: "ctx_read",
+  input: { id: "some-handle" },
+  content: [{ type: "text", text: "h".repeat(9000) }],
+});
+checkCtl("hook never re-offloads ctx_read results", crBig === undefined || crBig?.details?.ce_offloaded !== true);
+
+// ---- Addressable store regressions ----
+
+console.log("\n=== Addressable Store Regressions ===\n");
+const duplicate = store.write("same-payload-different-key", "grep", largeText);
+checkCtl("identical payloads deduplicate by content hash", duplicate.id === offloaded.id);
+const unicode = store.write("unicode", "read", "λ🙂\nsecond line");
+const unicodePrefix = store.read(unicode.id, { offset: 0, length: Buffer.byteLength("λ🙂", "utf8") });
+checkCtl("UTF-8 byte ranges do not split a code point", unicodePrefix.content === "λ🙂" || unicodePrefix.content.startsWith("λ🙂"));
+const budgetStore = new ContextStore("/tmp/pi-ce-budget-" + Date.now(), ".pi/context-store", { maxBytes: 10 });
+const retained = budgetStore.write("retained", "bash", "payload larger than budget");
+checkCtl("newest handle remains valid under a tiny disk budget", budgetStore.has(retained.id));
+const telemetryCwd = "/tmp/pi-ce-telemetry-" + Date.now();
+const telemetry = new ContextTelemetry();
+telemetry.record(telemetryCwd, { strategy: "WRITE", tool: "read", sourceBytes: 40000, visibleBytes: 2200, note: "payload sizes only" });
+const telemetrySummary = telemetry.summary(telemetryCwd);
+checkCtl("telemetry reports saved tokens", telemetrySummary.savedTokens > 0 && telemetrySummary.byStrategy.WRITE?.events === 1);
+
 // ---- Summary ----
 
 console.log("\n=== Summary ===");
 console.log(`Grep auto-repair: ${grepPassed} passed, ${grepFailed} failed`);
 console.log(`Read auto-offload: ${offloadPassed} passed, ${offloadFailed} failed`);
+console.log(`Boundary vs intermediate: ${hookChecks - hookFailed} passed, ${hookFailed} failed`);
+console.log(`ctx_read self-cap: ${ctlChecks - ctlFailed} passed, ${ctlFailed} failed`);
 
-const totalFailed = grepFailed + offloadFailed;
+const totalFailed = grepFailed + offloadFailed + hookFailed + ctlFailed;
 if (totalFailed > 0) {
   console.log(`\n❌ ${totalFailed} test(s) failed`);
   process.exit(1);
