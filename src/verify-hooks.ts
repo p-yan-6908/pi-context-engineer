@@ -4,7 +4,7 @@
  */
 
 import contextEngineer, { repairGrepInput, isLikelyRegexParseError } from "./index.js";
-import { ContextStore } from "./store.js";
+import { ContextStore, DEFAULT_CONTEXT_STORE_TTL_MS, MAX_CONTEXT_STORE_BYTES } from "./store.js";
 import { ContextTelemetry } from "./telemetry.js";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -172,6 +172,13 @@ contextEngineer(piStub);
 
 const hookCwd = "/tmp/pi-ce-hooks-" + Date.now();
 mkdirSync(hookCwd, { recursive: true });
+const defaultStore = new ContextStore(hookCwd);
+const defaultEntry = defaultStore.write("default-retention", "test", "default retention probe");
+const defaultMetadata = defaultStore.list().find((entry) => entry.id === defaultEntry.id);
+checkHook("global store defaults are one week and 500 MB",
+  DEFAULT_CONTEXT_STORE_TTL_MS === 7 * 24 * 60 * 60 * 1000
+  && MAX_CONTEXT_STORE_BYTES === 500_000_000
+  && Boolean(defaultMetadata?.expiresAt));
 const callHook = async (name: string, event: any) => {
   let out: any;
   for (const fn of hooks[name] ?? []) {

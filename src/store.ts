@@ -10,6 +10,8 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+export const DEFAULT_CONTEXT_STORE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+export const MAX_CONTEXT_STORE_BYTES = 500_000_000;
 
 export interface StoreEntry {
   id: string;
@@ -26,9 +28,9 @@ export interface StoreEntry {
 }
 
 export interface StoreOptions {
-  /** Remove entries older than this many milliseconds. */
+  /** Remove entries older than this many milliseconds. Defaults to one week. */
   ttlMs?: number;
-  /** Keep the total payload bytes below this value where possible. */
+  /** Keep total payload bytes below this value; values above the global 500 MB cap are clamped. */
   maxBytes?: number;
 }
 
@@ -64,6 +66,14 @@ const DEFAULT_CONTEXT_LINES = 2;
 function estimateTokens(bytes: number): number {
   return Math.ceil(bytes / 4);
 }
+function normalizeTtlMs(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return DEFAULT_CONTEXT_STORE_TTL_MS;
+  return Math.max(0, Math.floor(value));
+}
+function normalizeMaxBytes(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return MAX_CONTEXT_STORE_BYTES;
+  return Math.max(0, Math.min(MAX_CONTEXT_STORE_BYTES, Math.floor(value)));
+}
 
 function utf8Slice(data: string, maxBytes: number): string {
   return Buffer.from(data, "utf8").subarray(0, maxBytes).toString("utf8");
@@ -75,7 +85,10 @@ export class ContextStore {
 
   constructor(workspaceRoot: string, relativeDir = ".pi/context-store", options: StoreOptions = {}) {
     this.dir = resolve(workspaceRoot, relativeDir);
-    this.options = options;
+    this.options = {
+      ttlMs: normalizeTtlMs(options.ttlMs),
+      maxBytes: normalizeMaxBytes(options.maxBytes),
+    };
   }
 
   /** Write a payload, deduplicating identical content by hash. */

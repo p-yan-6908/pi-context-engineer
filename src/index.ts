@@ -26,7 +26,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { ContextStore } from "./store.js";
+import { ContextStore, DEFAULT_CONTEXT_STORE_TTL_MS, MAX_CONTEXT_STORE_BYTES } from "./store.js";
 import { ceTools, type ToolContext } from "./tools.js";
 import { evaluateProgram, runtimeAdvisoryLine, type WrapperOptions } from "./wrapper.js";
 import { runChildPi } from "./child.js";
@@ -633,6 +633,8 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         readOffloadThreshold: cfg.readOffloadThreshold ?? READ_OFFLOAD_THRESHOLD,
         runtimeAdvisoryThreshold: cfg.runtimeAdvisoryThreshold ?? 4096,
         offloadPreviewBytes: Math.max(256, Math.min(4096, cfg.offloadPreviewBytes ?? PREVIEW_BYTES)),
+        storeTtlMs: cfg.storeTtlMs ?? DEFAULT_CONTEXT_STORE_TTL_MS,
+        storeMaxBytes: Math.min(MAX_CONTEXT_STORE_BYTES, cfg.storeMaxBytes ?? MAX_CONTEXT_STORE_BYTES),
         maxReturnTokens: cfg.maxReturnTokens ?? 4000,
         policy: "blocks direct raw-tool passthroughs; reduced returns warn; 4KB+ advisory; 8KB+ auto-offload; previews are independently bounded",
         session: summary,

@@ -58,7 +58,7 @@ A Fovea call with `maxTokens` is classified as a budgeted `SELECT` operation. Co
 
 ### Addressable context store
 
-Stored payloads include content hashes, provenance/source, content type, creation/access timestamps, estimated tokens, and optional expiry. Identical payloads deduplicate. `ctx_read` supports UTF-8 byte ranges and literal line queries. Optional TTL and disk budgets provide garbage collection.
+Stored payloads include content hashes, provenance/source, content type, creation/access timestamps, estimated tokens, and expiry. Identical payloads deduplicate. `ctx_read` supports UTF-8 byte ranges and literal line queries. By default, entries expire after one week and the store is capped at 500 MB; cleanup runs opportunistically during store activity.
 
 ### Telemetry
 
@@ -140,12 +140,12 @@ Create `.pi/context-engineer.json` in a project when needed:
   "readOffloadThreshold": 8192,
   "nestedResultThreshold": 8192,
   "offloadPreviewBytes": 1024,
-  "storeMaxBytes": 50000000,
+  "storeMaxBytes": 500000000,
   "storeTtlMs": 604800000
 }
 ```
 
-`maxUnprocessedToolCalls` remains accepted for compatibility with older configurations, but reduction and observed context cost are the primary policy signals.
+Unless overridden with a shorter TTL or lower budget, global defaults are one week (`604800000` ms) and 500 MB (`500000000` bytes). Configured storage budgets cannot exceed the 500 MB cap. Cleanup is not a background daemon; expired and over-budget entries are removed on later store writes, while reads remove an individual expired entry.
 
 `strict` turns soft warnings, such as oversized estimated returns, into blocks. Hard raw/encoded/unknown data-flow violations are blocked by default.
 

@@ -110,7 +110,7 @@ Create `<repo>/.pi/context-engineer.json`:
   "readOffloadThreshold": 8192,
   "nestedResultThreshold": 8192,
   "offloadPreviewBytes": 1024,
-  "storeMaxBytes": 50000000,
+  "storeMaxBytes": 500000000,
   "storeTtlMs": 604800000
 }
 ```
@@ -121,9 +121,9 @@ Create `<repo>/.pi/context-engineer.json`:
 - `readOffloadThreshold`: ordinary text-result threshold
 - `nestedResultThreshold`: Fabric provider-proxy threshold
 - `offloadPreviewBytes`: handle preview size; smaller previews save tokens while `ctx_read` keeps full data addressable
-- `storeMaxBytes` / `storeTtlMs`: optional addressable-store limits
+- `storeMaxBytes` / `storeTtlMs`: addressable-store limits; defaults are 500 MB and one week, and the storage budget cannot exceed 500 MB
 
-`maxUnprocessedToolCalls` remains accepted for older configurations, but data-flow reduction and observed context cost are primary.
+By default, entries expire after one week. Cleanup is opportunistic during later store activity rather than a background daemon; reads remove an individual expired entry and writes enforce expiry plus the disk budget. `maxUnprocessedToolCalls` remains accepted for older configurations, but data-flow reduction and observed context cost are primary.
 
 ## Storage and observability
 
