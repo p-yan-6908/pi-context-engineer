@@ -169,6 +169,24 @@ The package can also be loaded from a checkout:
 pi --extension /path/to/pi-context-engineer/src/index.ts
 ```
 
+## Automated releases
+
+Publishing is tag-driven through `.github/workflows/publish.yml` and uses npm trusted publishing (OIDC), so no npm token is stored in GitHub. Configure the repository once in the npm package settings under **Trusted Publishers**:
+
+- Provider: GitHub Actions
+- Owner: `p-yan-6908`
+- Repository: `pi-context-engineer`
+- Workflow: `publish.yml`
+
+Then release a new version with:
+
+```sh
+npm version patch
+git push origin main --follow-tags
+```
+
+The workflow verifies the `vX.Y.Z` tag matches `package.json`, runs the full test suite, and publishes to npm.
+
 ## Verification
 
 ```sh
