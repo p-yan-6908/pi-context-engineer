@@ -86,29 +86,27 @@ function metricLines(metrics: AnalysisResult["metrics"]): string[] {
 
 function formatBlockGuidance(reasons: string[], metrics: AnalysisResult["metrics"]): string {
   return [
-    "⛔ fabric_exec program BLOCKED by context-engineer.",
+    "fabric_exec BLOCKED by context-engineer — direct raw-tool passthrough.",
     "",
-    "Reason(s):",
     ...reasons.map((reason) => `  • ${reason}`),
     "",
-    "Program metrics:",
-    ...metricLines(metrics),
+    `  • transformations: ${metrics.meaningfulTransformations}, est. retention: ${metrics.estimatedRetentionRatio === null ? "?" : Math.round(metrics.estimatedRetentionRatio * 100) + "%"}, est. return tokens: ${metrics.estimatedReturnTokens ?? "?"}`,
     "",
-    "How to fix — choose one:",
-    "  1. PROJECT: extract only the fields you need before returning.",
-    "     const r = await pi.read({ path }); return { lines: r.split('\\n').length, path };",
-    "  2. SELECT/FILTER: use map, filter, find, slice, or a bounded Fovea call.",
-    "  3. COMPRESS: call extensions.ctx_summarize() before returning.",
-    "  4. OFFLOAD: call extensions.ctx_offload() and return a handle + preview.",
-    "  5. ISOLATE: delegate a separable subtask with ctx_delegate or Fabric agents.",
-    "",
-    "See the context-engineer skill for full patterns.",
+    "Fastest fixes:",
+    "  • project scalars:  return { lines: r.split('\\n').length }",
+    "  • compress inline:  return extensions.ctx_summarize({ text, mode: 'structural', maxTokens: 400 })",
+    "  • offload + preview: return extensions.ctx_offload({ key: 'label', source: 'bash', data })",
   ].join("\n");
+}
+
+/** One-line post-execution nudge for oversized (but executed) returns. */
+export function runtimeAdvisoryLine(bytes: number): string {
+  return `[context-engineer] ${(bytes / 1024).toFixed(1)} KB reached the model boundary — consider scalar projections or extensions.ctx_summarize({ text, mode: "structural", maxTokens }).`;
 }
 
 function formatWarning(reasons: string[], metrics: AnalysisResult["metrics"]): string {
   return [
-    "⚠️  context-engineer WARNING:",
+    "context-engineer WARNING:",
     ...reasons.map((reason) => `  • ${reason}`),
     ...metricLines(metrics),
     "  Consider reducing the returned context further.",

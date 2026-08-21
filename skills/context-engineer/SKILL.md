@@ -49,8 +49,11 @@ Registered extension tools are available in Fabric code mode through `extensions
 
 ```ts
 const result = await pi.grep({ pattern: "TODO", path: "src" });
-return extensions.ctx_summarize({ text: result, mode: "structural", maxTokens: 300 });
+return extensions.ctx_summarize({ text: result, mode: "code", maxTokens: 300 });
 ```
+
+`ctx_summarize` supports three modes: `structural` (default deterministic extraction), `code` (deterministic code-aware extraction), and `model` (isolated semantic LLM compression). Unknown modes are rejected; use `code` or `structural` for source inspection to avoid an unnecessary model call.
+
 
 For manual offloading:
 
@@ -70,7 +73,7 @@ const focus = await extensions.fovea_focus({
   query: "authentication",
   maxTokens: 500,
 });
-return extensions.ctx_summarize({ text: focus, maxTokens: 300 });
+return extensions.ctx_summarize({ text: focus, mode: "code", maxTokens: 300 });
 ```
 
 A Fovea call with `maxTokens` is recognized as a budgeted selection. Context Engineer does not duplicate Fovea's graph.
@@ -80,7 +83,7 @@ A Fovea call with `maxTokens` is recognized as a budgeted selection. Context Eng
 ## Standalone tools
 
 - `ctx_read`: read a UTF-8 byte range or search literal matches in a stored handle
-- `ctx_summarize`: deterministic structural compression or isolated no-tools model compression
+- `ctx_summarize`: deterministic structural/code compression or isolated no-tools model compression
 - `ctx_remember` / `ctx_recall`: durable project facts; recall is bounded by `limit` and `maxTokens`
 - `ctx_delegate`: isolated child-Pi fallback for separable work
 - `ctx_offload`: manually write a payload and return a handle plus preview
@@ -106,6 +109,7 @@ Create `<repo>/.pi/context-engineer.json`:
   "maxReturnTokens": 4000,
   "readOffloadThreshold": 8192,
   "nestedResultThreshold": 8192,
+  "offloadPreviewBytes": 1024,
   "storeMaxBytes": 50000000,
   "storeTtlMs": 604800000
 }
@@ -116,6 +120,7 @@ Create `<repo>/.pi/context-engineer.json`:
 - `maxReturnTokens`: estimated static-return threshold
 - `readOffloadThreshold`: ordinary text-result threshold
 - `nestedResultThreshold`: Fabric provider-proxy threshold
+- `offloadPreviewBytes`: handle preview size; smaller previews save tokens while `ctx_read` keeps full data addressable
 - `storeMaxBytes` / `storeTtlMs`: optional addressable-store limits
 
 `maxUnprocessedToolCalls` remains accepted for older configurations, but data-flow reduction and observed context cost are primary.

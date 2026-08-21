@@ -20,6 +20,20 @@ import { ContextStore } from "./store.js";
 const RESULT_ENVELOPE_SLACK_BYTES = 1024;
 /** Default ceiling for one CE tool result; mirrors index.ts's offload threshold. */
 const DEFAULT_MAX_RETURN_BYTES = 8192;
+type SummaryMode = "structural" | "code" | "model";
+const DEFAULT_SUMMARY_TOKENS = 500;
+const MIN_SUMMARY_TOKENS = 64;
+const MAX_SUMMARY_TOKENS = 4000;
+function normalizeSummaryMode(value: unknown): SummaryMode | null {
+  const mode = value == null ? "structural" : String(value);
+  return mode === "structural" || mode === "code" || mode === "model" ? mode : null;
+}
+function normalizeSummaryTokens(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return DEFAULT_SUMMARY_TOKENS;
+  return Math.max(MIN_SUMMARY_TOKENS, Math.min(MAX_SUMMARY_TOKENS, Math.floor(parsed)));
+}
+
 
 export interface ToolContext {
   store: ContextStore;
@@ -123,15 +137,16 @@ const ctxSummarize: ToolDef = {
       text: { type: "string", description: "Inline text to summarize (used if no id)." },
       mode: {
         type: "string",
-        enum: ["structural", "model"],
-        description: "structural = free, deterministic extraction. model = LLM summarization. Default: structural.",
+        enum: ["structural", "code", "model"],
+        description: "structural = free general extraction. code = free code-aware extraction. model = isolated LLM summarization. Default: structural.",
       },
       maxTokens: { type: "integer", description: "Target max tokens for the summary. Default 500." },
     },
   },
   async handler(args, ctx) {
-    const mode = (args.mode as string) ?? "structural";
-    const maxTokens = (args.maxTokens as number) ?? 500;
+    const mode = normalizeSummaryMode(args.mode);
+    if (!mode) return { error: "Unknown summary mode. Use structural, code, or model.", code: "invalid_summary_mode", allowedModes: ["structural", "code", "model"] };
+    const maxTokens = normalizeSummaryTokens(args.maxTokens);
 
     let data: string;
     let source: string;
@@ -147,8 +162,8 @@ const ctxSummarize: ToolDef = {
       return { error: "Provide either id (stored payload) or text (inline)." };
     }
 
-    if (mode === "structural") {
-      return capSummary(structuralSummary(data, source, maxTokens), maxTokens);
+    if (mode === "structural" || mode === "code") {
+      return capSummary(structuralSummary(data, source, maxTokens, mode), maxTokens);
     }
 
     // Model mode
@@ -275,23 +290,31 @@ function capSummary(summary: unknown, maxTokens: number): unknown {
   if (Buffer.byteLength(serialized, "utf8") <= maxBytes) return summary;
   const record = summary && typeof summary === "object" ? summary as Record<string, unknown> : {};
   const compact: Record<string, unknown> = {};
-  for (const key of ["source", "mode", "kind", "originalTokens", "lines", "keys", "length", "truncated"]) {
+  for (const key of ["source", "mode", "kind", "originalTokens", "lines", "keys", "length"]) {
     if (key in record) compact[key] = record[key];
   }
   compact.truncated = true;
-  const metadata = JSON.stringify(compact);
-  const remaining = Math.max(64, maxBytes - Buffer.byteLength(metadata, "utf8") - 40);
-  compact.summary = capText(serialized, remaining);
+  for (const key of ["imports", "signatures", "head", "tail", "sample", "summary"]) {
+    if (!(key in record)) continue;
+    const used = Buffer.byteLength(JSON.stringify(compact), "utf8");
+    const remaining = maxBytes - used - 32;
+    if (remaining < 80) break;
+    const value = record[key];
+    if (typeof value === "string") compact[key] = capText(value, Math.floor(remaining * 0.72));
+    else if (Array.isArray(value)) compact[key] = value.slice(0, 5).map((item) => typeof item === "string" ? capText(item, 160) : item);
+    else if (value && typeof value === "object") compact[key] = Object.fromEntries(Object.entries(value).slice(0, 12));
+    if (Buffer.byteLength(JSON.stringify(compact), "utf8") > maxBytes) delete compact[key];
+  }
   return compact;
 }
 
-function structuralSummary(data: string, source: string, maxTokens: number): unknown {
+function structuralSummary(data: string, source: string, maxTokens: number, mode: "structural" | "code" = "structural"): unknown {
   const trimmed = data.trim();
   const totalTokens = Math.ceil(trimmed.length / 4);
   const lines = trimmed.split("\n");
   const result: Record<string, unknown> = {
     source,
-    mode: "structural",
+    mode,
     originalTokens: totalTokens,
     lines: lines.length,
   };

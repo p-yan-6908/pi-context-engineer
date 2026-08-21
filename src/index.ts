@@ -28,7 +28,7 @@ import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ContextStore } from "./store.js";
 import { ceTools, type ToolContext } from "./tools.js";
-import { evaluateProgram, type WrapperOptions } from "./wrapper.js";
+import { evaluateProgram, runtimeAdvisoryLine, type WrapperOptions } from "./wrapper.js";
 import { runChildPi } from "./child.js";
 import { ContextTelemetry } from "./telemetry.js";
 
@@ -38,8 +38,13 @@ interface CeConfig extends WrapperOptions {
   enabled?: boolean;
   /** UTF-8 bytes before text results are auto-offloaded. Default: 8192. */
   readOffloadThreshold?: number;
+  /** fabric_exec boundary results at or above this size get a one-line
+   *  advisory instead of silence. Default: 4096. Set to 0 to disable. */
+  runtimeAdvisoryThreshold?: number;
   /** Nested Fabric provider threshold. Defaults to readOffloadThreshold. */
   nestedResultThreshold?: number;
+  /** UTF-8 preview bytes retained in an offload handle message. Default: 1024. */
+  offloadPreviewBytes?: number;
   /** Optional maximum bytes retained by the context store. */
   storeMaxBytes?: number;
   /** Optional age limit for stored payloads. */
@@ -80,6 +85,33 @@ function serializeResult(value: unknown): string {
   catch { return String(value); }
 }
 
+/**
+ * Slim an object for the tool-result `details` channel. The full payload is
+ * already serialized into content[0].text; duplicating bulky strings (head,
+ * tail, sample, preview, ...) into details triples what the model context
+ * sees for the same information.
+ */
+const BULKY_KEY = /^(head|tail|preview|content|sample|facts|summary|text|value|imports|signatures)$/;
+function slimForDetails(value: unknown, depth = 0): unknown {
+  if (typeof value === "string") {
+    return value.length > 240 ? `${value.slice(0, 120)}… [+${value.length - 120} chars]` : value;
+  }
+  if (Array.isArray(value)) {
+    return depth >= 2 ? `[${value.length} items]` : value.slice(0, 5).map((item) => slimForDetails(item, depth + 1));
+  }
+  if (value && typeof value === "object") {
+    if (depth >= 2) return `object(${Object.keys(value).length} keys)`;
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = BULKY_KEY.test(key) && typeof entry === "string" && entry.length > 240
+        ? `[${entry.length} chars — see content]`
+        : slimForDetails(entry, depth + 1);
+    }
+    return out;
+  }
+  return value;
+}
+
 function isProviderBounded(toolName: string, input: Record<string, unknown>, details: Record<string, unknown>, textLength: number): boolean {
   if (toolName === "fabric_exec") {
     const artifactKeys = ["artifact", "artifactPath", "outputArtifact", "fabricTruncated", "omittedChars", "originalChars"];
@@ -111,7 +143,7 @@ function formatHandleText(id: string, bytes: number, estimatedTokens: number, te
   const handle =
     `[offloaded to handle "${id}" — ${bytes} bytes, ~${estimatedTokens} tokens]\n` +
     `Preview (first ${previewBytes} bytes):\n${preview}` +
-    (truncated ? `\n... [${raw.length - previewBytes} more bytes — use ctx_read with id "${id}" to inspect]` : "");
+    (truncated ? `\n... [${raw.length - previewBytes} more bytes — use extensions.ctx_read({ id: "${id}", offset: 0, length: 2048 }) to inspect; use query for a literal match]` : "");
   return warning ? `${warning}\n\n${handle}` : handle;
 }
 
@@ -281,7 +313,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   // result is text content (including fabric_exec results that are large).
 
   const READ_OFFLOAD_THRESHOLD = 8192; // ~2K tokens
-  const PREVIEW_BYTES = 2048;
+  const PREVIEW_BYTES = 1024;
 
   pi.on("tool_result", async (event, ctx) => {
     // Classify first: the fabric_exec result itself closes a program execution;
@@ -334,14 +366,15 @@ export default function contextEngineer(pi: ExtensionAPI): void {
       const store = storeFor(ctx.cwd, cfg);
       const key = `fabric-${event.toolName}-${inputHint(input)}`.replace(/[^a-z0-9-]/gi, "-").slice(0, 64);
       const offloaded = store.write(key, event.toolName, serialized);
+      const previewBytes = Math.max(256, Math.min(4096, cfg.offloadPreviewBytes ?? PREVIEW_BYTES));
       const replacement = {
         contextEngineerTruncated: true,
         handle: offloaded.id,
         originalBytes: offloaded.bytes,
         originalTokens: offloaded.estimatedTokens,
-        preview: Buffer.from(serialized, "utf8").subarray(0, PREVIEW_BYTES).toString("utf8"),
+        preview: Buffer.from(serialized, "utf8").subarray(0, previewBytes).toString("utf8"),
       };
-      const nestedText = formatHandleText(offloaded.id, offloaded.bytes, offloaded.estimatedTokens, serialized, PREVIEW_BYTES, warning);
+      const nestedText = formatHandleText(offloaded.id, offloaded.bytes, offloaded.estimatedTokens, serialized, previewBytes, warning);
       telemetry.record(ctx.cwd, {
         strategy: "WRITE",
         tool: event.toolName,
@@ -392,6 +425,21 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           note: providerBounded ? "provider-bounded final result" : "final result below CE threshold",
         });
       }
+      // Runtime feedback loop: sub-threshold fabric_exec returns that are
+      // still large get a one-line advisory instead of silence. The static
+      // gate only blocks direct passthroughs; this catches "reduced but
+      // still heavy" returns so the model can adjust on its next program.
+      if (
+        !warning &&
+        event.toolName === "fabric_exec" &&
+        textBytes >= (cfg.runtimeAdvisoryThreshold ?? 4096)
+      ) {
+        const advisory = runtimeAdvisoryLine(textBytes);
+        const content = event.content.map((item) =>
+          item.type === "text" ? { ...item, text: item === textContent ? `${text}\n${advisory}` : item.text } : item
+        );
+        return { content, details: { ...existingDetails, ce_advisory: advisory } };
+      }
       if (!warning) return undefined;
       const replacementText = `${warning}\n\n${text}`;
       const content = event.content.map((item) =>
@@ -408,7 +456,8 @@ export default function contextEngineer(pi: ExtensionAPI): void {
 
     const store = storeFor(ctx.cwd, cfg);
     const offloaded = store.write(key, event.toolName, text);
-    const replacementText = formatHandleText(offloaded.id, offloaded.bytes, offloaded.estimatedTokens, text, PREVIEW_BYTES, warning);
+    const previewBytes = Math.max(256, Math.min(4096, cfg.offloadPreviewBytes ?? PREVIEW_BYTES));
+    const replacementText = formatHandleText(offloaded.id, offloaded.bytes, offloaded.estimatedTokens, text, previewBytes, warning);
     telemetry.record(ctx.cwd, {
       strategy: "WRITE",
       tool: event.toolName,
@@ -500,7 +549,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           });
           return {
             content: [{ type: "text" as const, text: serialized }],
-            details: { tool: def.name, result: typeof result === "string" ? undefined : result },
+            details: { tool: def.name, result: typeof result === "string" ? undefined : slimForDetails(result) },
           };
         } catch (err) {
           return {
@@ -522,18 +571,29 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     label: "ctx_offload",
     description:
       "Offload a large result to disk storage and return a compact handle + preview. " +
+      "Signature: { key, source, data } — data accepts text/content aliases, source defaults to 'manual'. " +
       "The data stays out of context. Use ctx_read to inspect slices later.",
     parameters: Type.Object({
       key: Type.String({ description: "Human-readable label for the data." }),
-      source: Type.String({ description: "What produced this data (e.g. 'grep', 'read', 'bash')." }),
-      data: Type.String({ description: "The full payload to offload." }),
+      source: Type.Optional(Type.String({ description: "What produced this data (e.g. 'grep', 'read', 'bash'). Default: 'manual'." })),
+      data: Type.Optional(Type.String({ description: "The full payload to offload." })),
+      text: Type.Optional(Type.String({ description: "Alias for data." })),
+      content: Type.Optional(Type.String({ description: "Alias for data." })),
     }),
     async execute(_id, params, _signal, _onUpdate, execCtx) {
+      const payload = (params.data ?? params.text ?? params.content) as string | undefined;
+      if (!payload) {
+        return {
+          content: [{ type: "text" as const, text: "ctx_offload requires a payload: extensions.ctx_offload({ key, source, data }) — data accepts text/content aliases." }],
+          isError: true,
+          details: { tool: "ctx_offload", error: true },
+        };
+      }
       const store = storeFor(execCtx.cwd, configFor(execCtx.cwd));
       const result = store.write(
         params.key as string,
-        params.source as string,
-        params.data as string
+        ((params.source as string) ?? "manual"),
+        payload
       );
       telemetry.record(execCtx.cwd, {
         strategy: "WRITE",
@@ -549,6 +609,37 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           text: `Offloaded ${result.bytes} bytes (~${result.estimatedTokens} tokens) to handle "${result.id}".\nPreview:\n${result.preview}`,
         }],
         details: { id: result.id, bytes: result.bytes, estimatedTokens: result.estimatedTokens },
+      };
+    },
+  });
+
+  // ================================================================
+  // ctx_status tool (policy introspection for agents)
+  // ================================================================
+
+  pi.registerTool({
+    name: "ctx_status",
+    label: "ctx_status",
+    description:
+      "Report context-engineer policy state: enabled, strict mode, offload/advisory thresholds, " +
+      "and token savings so far. Call this instead of guessing why a program was blocked.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _signal, _onUpdate, execCtx) {
+      const cfg = configFor(execCtx.cwd);
+      const summary = telemetry.summary(execCtx.cwd, false);
+      const body = {
+        enabled: cfg.enabled !== false,
+        strict: cfg.strict ?? false,
+        readOffloadThreshold: cfg.readOffloadThreshold ?? READ_OFFLOAD_THRESHOLD,
+        runtimeAdvisoryThreshold: cfg.runtimeAdvisoryThreshold ?? 4096,
+        offloadPreviewBytes: Math.max(256, Math.min(4096, cfg.offloadPreviewBytes ?? PREVIEW_BYTES)),
+        maxReturnTokens: cfg.maxReturnTokens ?? 4000,
+        policy: "blocks direct raw-tool passthroughs; reduced returns warn; 4KB+ advisory; 8KB+ auto-offload; previews are independently bounded",
+        session: summary,
+      };
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(body, null, 2) }],
+        details: body,
       };
     },
   });
@@ -603,8 +694,8 @@ export default function contextEngineer(pi: ExtensionAPI): void {
       }
 
       const message = decision.tier === "WARN"
-        ? `⚠️ Program passed analysis with a warning:\n${decision.guidance}\n\n✅ Safe to run via fabric_exec.`
-        : "✅ Program passed context-engineering analysis. Safe to run via fabric_exec.";
+        ? `Program passed analysis with a warning:\n${decision.guidance}\n\nSafe to run via fabric_exec.`
+        : "Program passed context-engineering analysis. Safe to run via fabric_exec.";
 
       return {
         content: [{ type: "text" as const, text: message }],
@@ -661,9 +752,9 @@ export default function contextEngineer(pi: ExtensionAPI): void {
       } else if (command === "explain") {
         message = [
           "Context Engineer is the context governor above Fabric and Fovea.",
-          "Static data-flow analysis blocks raw/encoded tool data at fabric_exec returns.",
-          "Runtime hooks preserve Fabric intermediate values, guard nested provider proxies, and offload oversized boundary results.",
-          "Fovea calls with maxTokens are treated as budgeted SELECT operations.",
+          "The gate hard-blocks only DIRECT raw-tool passthroughs (zero transformation).",
+          "Tainted-but-reduced returns run with an advisory; results of 4KB+ get a one-line nudge, 8KB+ are auto-offloaded.",
+          "extensions.ctx_status reports thresholds and savings; extensions.ce_exec pre-checks a program.",
           "Use /ce status, /ce trace, /ce settings, or /ce status --all.",
         ].join("\n");
       } else if (command === "clear") {

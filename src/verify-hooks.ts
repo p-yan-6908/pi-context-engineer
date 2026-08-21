@@ -86,7 +86,7 @@ for (const test of grepTests) {
   const input = JSON.parse(JSON.stringify(test.input));
   const result = repairGrepInput(input);
   const ok = result.repaired === test.expectRepaired;
-  const status = ok ? "✅" : "❌";
+  const status = ok ? "[ok]" : "[FAIL]";
   console.log(`${status} ${test.name}`);
   console.log(`   expected repaired=${test.expectRepaired}, got repaired=${result.repaired}`);
   if (result.repaired) {
@@ -122,7 +122,7 @@ for (const test of offloadTests) {
   const result = store.write("test-read", "read", test.text);
   const isLarge = result.bytes > 8192;
   const ok = test.expectTruncated ? isLarge : !isLarge;
-  const status = ok ? "✅" : "❌";
+  const status = ok ? "[ok]" : "[FAIL]";
   console.log(`${status} ${test.name}`);
   console.log(`   bytes=${result.bytes}, tokens=${result.estimatedTokens}, handle=${result.id.slice(0, 20)}...`);
   if (!ok) offloadFailed++;
@@ -139,8 +139,8 @@ const offloaded = store.write("test-readback", "read", largeText);
 const readResult = store.read(offloaded.id, {});
 const queryResult = store.read(offloaded.id, { query: "clearCustomerSession" });
 
-console.log(`✅ ctx_read full preview (first ${readResult.bytesRead} bytes of ${readResult.totalBytes})`);
-console.log(`✅ ctx_read query "clearCustomerSession": ${queryResult.matchedLines?.length ?? 0} matches`);
+console.log(`[ok] ctx_read full preview (first ${readResult.bytesRead} bytes of ${readResult.totalBytes})`);
+console.log(`[ok] ctx_read query "clearCustomerSession": ${queryResult.matchedLines?.length ?? 0} matches`);
 
 // ---- Test boundary vs intermediate results (nested offload fix) ----
 
@@ -150,7 +150,7 @@ let hookFailed = 0;
 let hookChecks = 0;
 function checkHook(name: string, cond: boolean, detail = "") {
   hookChecks++;
-  console.log(`${cond ? "✅" : "❌"} ${name}${detail ? `\n   ${detail}` : ""}`);
+  console.log(`${cond ? "[ok]" : "[FAIL]"} ${name}${detail ? `\n   ${detail}` : ""}`);
   if (!cond) hookFailed++;
 }
 
@@ -192,6 +192,9 @@ const ctrl = await callHook("tool_result", {
   content: [{ type: "text", text: BIG }],
 });
 checkHook("top-level large result is offloaded", ctrl?.details?.ce_offloaded === true);
+const ctrlText = ctrl?.content?.find((item: any) => item.type === "text")?.text ?? "";
+checkHook("offload message includes a copyable ctx_read recipe", ctrlText.includes("extensions.ctx_read({ id:"));
+checkHook("offload preview stays bounded", Buffer.byteLength(ctrlText, "utf8") < 1800);
 
 // While a program runs, inner results are intermediate values consumed by
 // program code and must arrive byte-for-byte intact.
@@ -245,11 +248,13 @@ const resumed = await callHook("tool_result", {
 checkHook("boundary offload resumes after program completes", resumed?.details?.ce_offloaded === true);
 
 // WARN programs also execute (opening the intermediate window), and their
-// warning must land on their own boundary result.
+// warning must land on their own boundary result. A tainted-but-reduced
+// return (raw + normalization) is the canonical WARN under the cost-based
+// policy; statically-known oversize literals are BLOCKs now.
 await callHook("tool_call", {
   toolCallId: "fe2",
   toolName: "fabric_exec",
-  input: { code: `return { data: "${"x".repeat(20000)}" };` },
+  input: { code: `const raw = await pi.read({ path: "f" }); return raw.trim();` },
 });
 const fe2 = await callHook("tool_result", {
   toolCallId: "fe2",
@@ -259,7 +264,7 @@ const fe2 = await callHook("tool_result", {
 });
 checkHook(
   "WARN annotated on its own boundary result",
-  typeof fe2?.content?.[0]?.text === "string" && fe2.content[0].text.startsWith("⚠️")
+  typeof fe2?.content?.[0]?.text === "string" && fe2.content[0].text.startsWith("context-engineer WARNING")
 );
 const afterWarn = await callHook("tool_result", {
   toolCallId: "afterwarn1",
@@ -292,7 +297,7 @@ let ctlFailed = 0;
 let ctlChecks = 0;
 function checkCtl(name: string, cond: boolean, detail = "") {
   ctlChecks++;
-  console.log(`${cond ? "✅" : "❌"} ${name}${detail ? `\n   ${detail}` : ""}`);
+  console.log(`${cond ? "[ok]" : "[FAIL]"} ${name}${detail ? `\n   ${detail}` : ""}`);
   if (!cond) ctlFailed++;
 }
 
@@ -349,9 +354,9 @@ checkCtl("hook never re-offloads ctx_read results", crBig === undefined || crBig
 console.log("\n=== Addressable Store Regressions ===\n");
 const duplicate = store.write("same-payload-different-key", "grep", largeText);
 checkCtl("identical payloads deduplicate by content hash", duplicate.id === offloaded.id);
-const unicode = store.write("unicode", "read", "λ🙂\nsecond line");
-const unicodePrefix = store.read(unicode.id, { offset: 0, length: Buffer.byteLength("λ🙂", "utf8") });
-checkCtl("UTF-8 byte ranges do not split a code point", unicodePrefix.content === "λ🙂" || unicodePrefix.content.startsWith("λ🙂"));
+const unicode = store.write("unicode", "read", "λ𐍈\nsecond line");
+const unicodePrefix = store.read(unicode.id, { offset: 0, length: Buffer.byteLength("λ𐍈", "utf8") });
+checkCtl("UTF-8 byte ranges do not split a code point", unicodePrefix.content === "λ𐍈" || unicodePrefix.content.startsWith("λ𐍈"));
 const budgetStore = new ContextStore("/tmp/pi-ce-budget-" + Date.now(), ".pi/context-store", { maxBytes: 10 });
 const retained = budgetStore.write("retained", "bash", "payload larger than budget");
 checkCtl("newest handle remains valid under a tiny disk budget", budgetStore.has(retained.id));
@@ -360,6 +365,80 @@ const telemetry = new ContextTelemetry();
 telemetry.record(telemetryCwd, { strategy: "WRITE", tool: "read", sourceBytes: 40000, visibleBytes: 2200, note: "payload sizes only" });
 const telemetrySummary = telemetry.summary(telemetryCwd);
 checkCtl("telemetry reports saved tokens", telemetrySummary.savedTokens > 0 && telemetrySummary.byStrategy.WRITE?.events === 1);
+
+// ---- ctx_offload signature ergonomics (session regressions) ----
+
+console.log("\n=== ctx_offload Signature ===\n");
+const offDef = registeredTools.get("ctx_offload");
+checkCtl("ctx_offload tool is registered", Boolean(offDef));
+if (offDef) {
+  const o1 = await offDef.execute("o1", { key: "k1", source: "bash", data: "payload-one" }, undefined, undefined, { cwd: capCwd });
+  checkCtl("canonical { key, source, data } works", o1?.details?.id !== undefined);
+  const o2 = await offDef.execute("o2", { key: "k2", text: "payload-two" }, undefined, undefined, { cwd: capCwd });
+  checkCtl("{ key, text } alias works", o2?.details?.id !== undefined);
+  const o3 = await offDef.execute("o3", { key: "k3", content: "payload-three" }, undefined, undefined, { cwd: capCwd });
+  checkCtl("{ key, content } alias works", o3?.details?.id !== undefined);
+  const o4 = await offDef.execute("o4", { key: "k4" }, undefined, undefined, { cwd: capCwd });
+  checkCtl("missing payload errors with a signature hint", o4?.isError === true && String(o4?.content?.[0]?.text).includes("data"));
+}
+
+// ---- CE tool details are slimmed (no payload duplication into context) ----
+
+console.log("\n=== CE Details Slimming ===\n");
+const sumDef = registeredTools.get("ctx_summarize");
+checkCtl("ctx_summarize tool is registered", Boolean(sumDef));
+if (sumDef) {
+  const bigText = "lorem-ipsum-dolor-line\n".repeat(300); // ~6.9KB of repetitive text
+  const sum = await sumDef.execute("s1", { text: bigText, mode: "structural", maxTokens: 400 }, undefined, undefined, { cwd: capCwd });
+  const detJson = JSON.stringify(sum.details ?? {});
+  checkCtl("details no longer duplicate the summarized payload", !detJson.includes("lorem-ipsum-dolor-line"));
+  checkCtl("content still carries the full summary once", typeof sum.content?.[0]?.text === "string" && sum.content[0].text.length > 100);
+}
+
+// ---- Runtime advisory for heavy-but-below-threshold fabric_exec results ----
+
+console.log("\n=== Runtime Advisory ===\n");
+const adv1 = await callHook("tool_result", {
+  toolCallId: "adv1",
+  toolName: "fabric_exec",
+  input: { code: "return 1;" },
+  content: [{ type: "text", text: "m".repeat(5000) }],
+});
+checkCtl(
+  "5KB fabric_exec result gets a one-line advisory",
+  typeof adv1?.details?.ce_advisory === "string" && String(adv1?.content?.[0]?.text).endsWith(").").valueOf() && String(adv1?.content?.[0]?.text).includes("context-engineer"),
+);
+const adv2 = await callHook("tool_result", {
+  toolCallId: "adv2",
+  toolName: "fabric_exec",
+  input: { code: "return 1;" },
+  content: [{ type: "text", text: "tiny" }],
+});
+checkCtl("small fabric_exec result is untouched", adv2 === undefined);
+const adv3 = await callHook("tool_result", {
+  toolCallId: "adv3",
+  toolName: "fabric_exec",
+  input: { code: "return 1;" },
+  content: [{ type: "text", text: "b".repeat(20000) }],
+});
+checkCtl(
+  "8KB+ fabric_exec result still auto-offloads without double annotation",
+  adv3?.details?.ce_offloaded === true && adv3?.details?.ce_advisory === undefined,
+);
+
+// ---- ctx_status reports policy state ----
+
+console.log("\n=== ctx_status ===\n");
+const statusDef = registeredTools.get("ctx_status");
+checkCtl("ctx_status tool is registered", Boolean(statusDef));
+if (statusDef) {
+  const st = await statusDef.execute("st1", {}, undefined, undefined, { cwd: capCwd });
+  const parsed = JSON.parse(st.content[0].text);
+  checkCtl(
+    "ctx_status exposes thresholds and policy",
+    parsed.enabled === true && typeof parsed.readOffloadThreshold === "number" && typeof parsed.policy === "string",
+  );
+}
 
 // ---- Summary ----
 
@@ -371,8 +450,8 @@ console.log(`ctx_read self-cap: ${ctlChecks - ctlFailed} passed, ${ctlFailed} fa
 
 const totalFailed = grepFailed + offloadFailed + hookFailed + ctlFailed;
 if (totalFailed > 0) {
-  console.log(`\n❌ ${totalFailed} test(s) failed`);
+  console.log(`\n${totalFailed} test(s) failed`);
   process.exit(1);
 } else {
-  console.log(`\n✅ All tests passed`);
+  console.log(`\nAll tests passed`);
 }

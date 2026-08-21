@@ -84,10 +84,21 @@ const result = await pi.grep({ pattern: "TODO", path: "src" });
 
 return extensions.ctx_summarize({
   text: result,
-  mode: "structural",
+  mode: "code",
   maxTokens: 300,
 });
 ```
+
+### Summarization modes
+`ctx_summarize` accepts an inline `text` value or an offloaded `id`:
+
+- `structural` (default) — free deterministic JSON/text extraction.
+- `code` — free deterministic code-aware extraction of imports, signatures, and head/tail windows.
+- `model` — isolated no-tools semantic summarization; use only when structural context is insufficient.
+
+Unknown modes are rejected. `maxTokens` is an approximate UTF-8 budget and is clamped to a safe range. Prefer `code` or `structural` for source inspection because they avoid an extra model call.
+
+Offloaded results include a copyable `extensions.ctx_read({ id, offset, length })` example. Use `query` when you know a literal symbol or phrase.
 
 For large data, write it off-window instead of returning it directly:
 
@@ -108,10 +119,11 @@ Use the returned handle with `ctx_read` to retrieve a range or literal matches l
 The registered tools are callable directly by the model and inside Fabric through `extensions.*`:
 
 - `ctx_read` — select a range or literal matches from a stored handle
-- `ctx_summarize` — free structural compression or isolated no-tools model compression
+- `ctx_summarize` — free structural/code compression or isolated no-tools model compression
 - `ctx_remember` / `ctx_recall` — durable project facts with bounded recall
 - `ctx_delegate` — isolated child Pi fallback for separable tasks
 - `ctx_offload` — manual Write operation
+- `ctx_status` — current policy thresholds and observed savings
 - `ce_exec` — explicit static preflight (`PASS`, `WARN`, or `BLOCK`)
 
 For Fabric-native orchestration and recursive decomposition, call Fabric's `agents.*` APIs directly when available.
@@ -127,6 +139,7 @@ Create `.pi/context-engineer.json` in a project when needed:
   "maxReturnTokens": 4000,
   "readOffloadThreshold": 8192,
   "nestedResultThreshold": 8192,
+  "offloadPreviewBytes": 1024,
   "storeMaxBytes": 50000000,
   "storeTtlMs": 604800000
 }
@@ -162,6 +175,7 @@ The test suite includes 32 static data-flow cases and live hook probes covering:
 - nested Fabric provider proxies
 - intermediate-result preservation
 - automatic offload and self-capping `ctx_read`
+- deterministic `ctx_summarize` structural/code modes and invalid-mode rejection
 - content deduplication and UTF-8 ranges
 
 ## License

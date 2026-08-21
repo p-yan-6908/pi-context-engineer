@@ -53,7 +53,8 @@
       "ctx_remember",
       "ctx_recall",
       "ctx_delegate",
-      "ctx_offload"
+      "ctx_offload",
+      "ctx_status"
     ]
   }
 }

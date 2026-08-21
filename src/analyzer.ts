@@ -288,20 +288,24 @@ function evaluateMethodCall(
       state.meaningfulTransformations++;
       return reducedFlow("projected", `${method} scalar predicate`, 0.01);
     case "join":
-      if (receiver.kind === "raw" || receiver.kind === "encoded" || receiver.kind === "unknown") {
-        return { ...receiver, kind: "encoded", operation: "join preserves source" };
+      if (UNSAFE_KINDS.has(receiver.kind)) {
+        return { ...receiver, operation: "join preserves source" };
       }
       state.meaningfulTransformations++;
       return reducedFlow("selected", "join projected values", Math.min(receiver.retention, 0.5));
     case "split":
       // Splitting alone does not reduce data; `.length`, `.filter`, etc. do.
-      return { ...receiver, kind: "raw", operation: "split without reduction" };
+      // Preserve the receiver's taint instead of escalating it.
+      return { ...receiver, operation: "split without reduction" };
     case "trim":
     case "replace":
     case "replaceAll":
     case "normalize":
     case "toString":
-      return { ...receiver, kind: "encoded", operation: `${method} preserves source` };
+      // Normalization does not add data. Preserve the receiver's taint and let
+      // the transformation counter decide: raw + transforms => WARN, not BLOCK.
+      state.meaningfulTransformations++;
+      return { ...receiver, operation: `${method} normalizes source` };
     case "sort":
     case "reverse":
       return { ...receiver, operation: `${method} reorders source` };
@@ -359,6 +363,12 @@ function evaluateCall(call: ts.CallExpression, env: Map<string, Flow>, state: Ev
     const flow = args.find((item) => item.hasSource);
     return flow ? { ...flow, kind: "unknown", meaningful: false, operation: "JSON.parse preserves source" } : cleanFlow(name);
   }
+  if (name === "Object.fromEntries") {
+    return sourced ? reducedFlow("projected", "Object.fromEntries projection", 0.25) : cleanFlow(name);
+  }
+  if (name === "Array.from" || name === "Array.of") {
+    return sourced ? reducedFlow("projected", `${name} projection`, 0.5) : cleanFlow(name);
+  }
   if (["Object.keys", "Object.entries"].includes(name)) {
     return sourced ? reducedFlow("projected", `${name} projection`, 0.25) : cleanFlow(name);
   }
@@ -402,7 +412,9 @@ function evaluateExpression(expr: ts.Expression, env: Map<string, Flow>, state: 
   if (ts.isTemplateExpression(value)) {
     const expressions = value.templateSpans.map((span) => evaluateExpression(span.expression, env, state, sf));
     const flow = combine(expressions, "template interpolation");
-    return flow.hasSource ? { ...flow, kind: "encoded", meaningful: false, operation: "template preserves source" } : cleanFlow("template");
+    // Interpolation is bounded composition, not data amplification: keep the
+    // worst source kind but do not escalate to "encoded".
+    return flow.hasSource ? { ...flow, operation: "template interpolation" } : cleanFlow("template");
   }
   if (ts.isPropertyAccessExpression(value)) return propertyFlow(evaluateExpression(value.expression, env, state, sf), value.name.text);
   if (ts.isElementAccessExpression(value)) {
@@ -430,13 +442,13 @@ function evaluateExpression(expr: ts.Expression, env: Map<string, Flow>, state: 
     const left = evaluateExpression(value.left, env, state, sf);
     const right = evaluateExpression(value.right, env, state, sf);
     const operation = ts.tokenToString(value.operatorToken.kind) ?? "binary operation";
-    if (["===", "!==", "==", "!=", ">", ">=", "<", "<=", "&&", "||"].includes(operation)) {
+    if (["===", "!==", "==", "!=", ">", ">=", "<", "<=", "&&", "||", "??"].includes(operation)) {
       return (left.hasSource || right.hasSource)
         ? reducedFlow("projected", `scalar ${operation}`, 0.01)
         : cleanFlow(`scalar ${operation}`);
     }
     const flow = combine([left, right], operation);
-    return flow.hasSource ? { ...flow, kind: "encoded", meaningful: false, operation: `${operation} preserves source` } : flow;
+    return flow.hasSource ? { ...flow, operation: `${operation} combines source` } : flow;
   }
   if (ts.isParenthesizedExpression(value)) return evaluateExpression(value.expression, env, state, sf);
 
@@ -615,16 +627,34 @@ export function analyzeProgram(source: string, opts: AnalyzerOptions = {}): Anal
   const reasons: string[] = [];
   let hardBlock = false;
   if (metrics.returnIsRawToolResult) {
-    hardBlock = true;
-    reasons.push(
-      `Return data-flow is ${metrics.returnTaint} (${metrics.returnOperation}) after ${metrics.sourceCalls} source call(s). ` +
-        "Tool-originated data reaches the main context without a meaningful projection, selection, aggregation, compression, or offload. " +
-        "Use map/filter/reduce, extract scalar fields, call extensions.ctx_summarize, call extensions.ctx_offload, or delegate the work."
-    );
+    // Cost-based policy: only a DIRECT passthrough (no transformation at all,
+    // most of the source retained) is worth a hard stop. Tainted-but-reduced
+    // returns execute with an advisory — the runtime offload hook is the
+    // backstop for actual size problems.
+    const zeroEffort = metrics.meaningfulTransformations === 0;
+    const highRetention = metrics.estimatedRetentionRatio === null || metrics.estimatedRetentionRatio >= 0.5;
+    if (zeroEffort && highRetention) {
+      hardBlock = true;
+      reasons.push(
+        `Return data-flow is ${metrics.returnTaint} (${metrics.returnOperation}) after ${metrics.sourceCalls} source call(s). ` +
+          "Tool-originated data reaches the main context as a direct passthrough with no reduction. " +
+          "Use map/filter/reduce, extract scalar fields, call extensions.ctx_summarize({ text, mode: \"structural\", maxTokens }), " +
+          "call extensions.ctx_offload({ key, source, data }), or delegate the work."
+      );
+    } else {
+      const reduction = metrics.estimatedReductionRatio === null ? "unknown" : `${Math.round(metrics.estimatedReductionRatio * 100)}%`;
+      reasons.push(
+        `Return carries ${metrics.returnTaint} tool data (${metrics.returnOperation}) despite ${metrics.meaningfulTransformations} transformation(s), ~${reduction} of the source retained. ` +
+          "Executing with an advisory: prefer scalar projections or extensions.ctx_summarize for smaller returns."
+      );
+    }
   }
 
   const maxReturnTokens = opts.maxReturnTokens ?? 4000;
   if (metrics.estimatedReturnTokens !== null && metrics.estimatedReturnTokens > maxReturnTokens) {
+    // Statically known oversize: stopping before execution is free, and the
+    // size is certain (unlike taint heuristics), so this stays a hard block.
+    hardBlock = true;
     reasons.push(
       `Return is estimated at ~${metrics.estimatedReturnTokens} tokens (>${maxReturnTokens}). ` +
         "Use ctx_summarize or project to a smaller structure before returning."

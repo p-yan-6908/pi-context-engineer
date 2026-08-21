@@ -3,11 +3,15 @@
  */
 
 import { analyzeProgram, type AnalyzerOptions } from "./analyzer.js";
+import { ceToolMap } from "./tools.js";
 
 type TestCase = {
   name: string;
   program: string;
-  expectBlock: boolean;
+  /** Expect a hard block (direct passthrough). */
+  expectBlock?: boolean;
+  /** Expect execution with an advisory (tainted but reduced). */
+  expectWarn?: boolean;
   options?: AnalyzerOptions;
 };
 
@@ -173,6 +177,38 @@ const tests: TestCase[] = [
     program: `return extensions.fovea_focus({ query: "authentication" });`,
     expectBlock: true,
   },
+
+  // ---- Session regressions: the old gate hard-blocked legitimate work ----
+  {
+    name: "trim keeps taint but earns WARN, not BLOCK",
+    program: `const raw = await pi.read({ path: "log.txt" }); return raw.trim();`,
+    expectWarn: true,
+  },
+  {
+    name: "replace keeps taint but earns WARN, not BLOCK",
+    program: `const raw = await pi.read({ path: "cfg.json" }); return raw.replace("x", "y");`,
+    expectWarn: true,
+  },
+  {
+    name: "nullish coalescing on a compressed result is safe",
+    program: `const s = await extensions.ctx_summarize({ text: "x" }); return { summary: s.text ?? s };`,
+    expectBlock: false,
+  },
+  {
+    name: "template interpolation inside map is a projection",
+    program: `const out = await pi.bash({ cmd: "ps" }); return out.output.split("\\n").filter(Boolean).map(l => ({ row: l.slice(0, 10) }));`,
+    expectBlock: false,
+  },
+  {
+    name: "Object.fromEntries is a recognized projection",
+    program: `const pairs = await pi.bash({ cmd: "echo" }); return Object.fromEntries(pairs.output.split("\\n").map(l => [l.slice(0, 3), l.length]));`,
+    expectBlock: false,
+  },
+  {
+    name: "aggregated findings object passes (real-world diagnostic shape)",
+    program: `const d = await pi.bash({ cmd: "uptime" }); const p = await pi.bash({ cmd: "ps" });\nconst rows = p.output.split("\\n").filter(Boolean);\nreturn { up: d.output.trim(), lineCount: rows.length, first: rows[0]?.slice(0, 20) ?? "none" };`,
+    expectBlock: false,
+  },
 ];
 
 let passed = 0;
@@ -180,22 +216,57 @@ let failed = 0;
 
 for (const test of tests) {
   const result = analyzeProgram(test.program, test.options);
-  const wasBlocked = !result.ok;
-  const status = wasBlocked === test.expectBlock ? "✅" : "❌";
-  const label = wasBlocked === test.expectBlock ? "PASS" : "FAIL";
+  const tier: "BLOCK" | "WARN" | "PASS" = result.hardBlock ? "BLOCK" : !result.ok ? "WARN" : "PASS";
+  const expected = test.expectBlock ? "BLOCK" : test.expectWarn ? "WARN" : "PASS";
+  const matched = tier === expected;
+  const status = matched ? "[ok]" : "[FAIL]";
 
-  console.log(`${status} [${label}] ${test.name}`);
-  console.log(`     expected block=${test.expectBlock}, got block=${wasBlocked}`);
+  console.log(`${status} [${tier}] ${test.name}`);
+  console.log(`     expected ${expected}, got ${tier}`);
   if (result.reasons.length > 0) {
-    console.log(`     reasons: ${result.reasons.map((r) => r.slice(0, 80)).join("; ")}`);
+    console.log(`     reasons: ${result.reasons.map((r) => r.slice(0, 110)).join("; ")}`);
   }
-  console.log(`     metrics: toolCalls=${result.metrics.toolCalls}, rawReturn=${result.metrics.returnIsRawToolResult}, processing=${result.metrics.hasProcessingBetweenToolAndReturn}, branching=${result.metrics.hasLoopOrConditional}, estTokens=${result.metrics.estimatedReturnTokens}`);
+  console.log(`     metrics: toolCalls=${result.metrics.toolCalls}, rawReturn=${result.metrics.returnIsRawToolResult}, transforms=${result.metrics.meaningfulTransformations}, retention=${result.metrics.estimatedRetentionRatio ?? "?"}, estTokens=${result.metrics.estimatedReturnTokens}`);
   console.log();
 
-  if (wasBlocked === test.expectBlock) passed++;
+  if (matched) passed++;
   else failed++;
 }
 
 console.log("---");
 console.log(`Results: ${passed} passed, ${failed} failed out of ${tests.length} tests.`);
-process.exit(failed > 0 ? 1 : 0);
+const summarizeTool = ceToolMap.get("ctx_summarize");
+let toolFailures = 0;
+if (!summarizeTool) {
+  console.log("[FAIL] ctx_summarize is not registered");
+  toolFailures++;
+} else {
+  let modelCalls = 0;
+  const toolContext = {
+    store: { read: () => ({ content: "", truncated: false }) },
+    workspaceRoot: process.cwd(),
+    callTool: async () => ({}),
+    spawnAgent: async () => "",
+    modelCall: async () => { modelCalls++; return "model summary"; },
+  } as any;
+  const codeText = Array.from({ length: 120 }, (_, index) => `export function item${index}() { return ${index}; }`).join("\\n");
+  const codeSummary = await summarizeTool.handler({ text: codeText, mode: "code", maxTokens: 120 }, toolContext);
+  const codeRecord = codeSummary && typeof codeSummary === "object" ? codeSummary as Record<string, unknown> : {};
+  const codeBytes = Buffer.byteLength(JSON.stringify(codeSummary), "utf8");
+  const codeOk = codeRecord.mode === "code" && codeRecord.kind === "code" && modelCalls === 0 && codeBytes <= 120 * 4;
+  console.log(`${codeOk ? "[ok]" : "[FAIL]"} ctx_summarize code mode is deterministic and bounded (${codeBytes} bytes)`);
+  if (!codeOk) toolFailures++;
+  const objectText = JSON.stringify(Object.fromEntries(Array.from({ length: 80 }, (_, index) => [`key${index}`, "x".repeat(180)])));
+  const objectSummary = await summarizeTool.handler({ text: objectText, mode: "structural", maxTokens: 120 }, toolContext);
+  const objectBytes = Buffer.byteLength(JSON.stringify(objectSummary), "utf8");
+  const objectOk = objectBytes <= 120 * 4;
+  console.log(`${objectOk ? "[ok]" : "[FAIL]"} ctx_summarize JSON mode is bounded (${objectBytes} bytes)`);
+  if (!objectOk) toolFailures++;
+  const invalid = await summarizeTool.handler({ text: "x", mode: "code-ish" }, toolContext);
+  const invalidRecord = invalid && typeof invalid === "object" ? invalid as Record<string, unknown> : {};
+  const invalidOk = invalidRecord.code === "invalid_summary_mode" && Array.isArray(invalidRecord.allowedModes);
+  console.log(`${invalidOk ? "[ok]" : "[FAIL]"} ctx_summarize rejects unknown modes`);
+  if (!invalidOk) toolFailures++;
+}
+console.log(`Tool checks: ${toolFailures === 0 ? "passed" : `${toolFailures} failed`}.`);
+process.exit(failed + toolFailures > 0 ? 1 : 0);
