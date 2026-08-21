@@ -1,0 +1,44 @@
+{
+  "name": "pi-context-engineer",
+  "version": "0.1.0",
+  "description": "Context engineering enforcement for Pi Fabric: covers Write/Select/Compress/Isolate and forces agents to actually process data in fabric_exec programs instead of passthrough returns.",
+  "author": "pyan",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/p-yan-6908/pi-context-engineer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/p-yan-6908/pi-context-engineer/issues"
+  },
+  "homepage": "https://github.com/p-yan-6908/pi-context-engineer#readme",
+  "types": ["extension", "skill"],
+  "main": "src/index.ts",
+  "dependencies": {
+    "typescript": "^5.5.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.80.0",
+    "typebox": "*",
+    "pi-fabric": "*"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^11.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"],
+    "skills": ["./skills"],
+    "providesTools": [
+      "ce_exec",
+      "ctx_read",
+      "ctx_summarize",
+      "ctx_remember",
+      "ctx_recall",
+      "ctx_delegate",
+      "ctx_offload"
+    ]
+  }
+}
