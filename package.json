@@ -3,16 +3,26 @@
   "version": "0.2.0",
   "type": "module",
   "description": "Context governor for Pi Fabric and Pi Fovea: taint-gates data flow, budgets selection, compresses results, offloads payloads, and records context cost.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-fabric",
+    "context-engineering",
+    "fovea"
+  ],
   "author": "pyan",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/p-yan-6908/pi-context-engineer.git"
+    "url": "git+https://github.com/p-yan-6908/pi-context-engineer.git"
   },
   "bugs": {
     "url": "https://github.com/p-yan-6908/pi-context-engineer/issues"
   },
   "homepage": "https://github.com/p-yan-6908/pi-context-engineer#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck src/*.ts",
     "build": "rm -rf .tmp/pi-ce-build && tsc --outDir .tmp/pi-ce-build --rootDir src --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck src/*.ts",
@@ -24,7 +34,12 @@
     "skill"
   ],
   "main": "src/index.ts",
-  "files": ["src", "skills", "README.md", "LICENSE"],
+  "files": [
+    "src",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
   "dependencies": {
     "typescript": "^5.5.0"
   },
@@ -32,9 +47,6 @@
     "@earendil-works/pi-coding-agent": ">=0.80.0",
     "typebox": "*",
     "pi-fabric": "*"
-  },
-  "optionalDependencies": {
-    "better-sqlite3": "^11.0.0"
   },
   "engines": {
     "node": ">=20"

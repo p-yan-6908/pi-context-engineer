@@ -14,6 +14,12 @@ description: "Governs what data crosses the Main-model boundary in Pi Fabric: ta
 ## Quick start
 
 ```bash
+pi install npm:pi-context-engineer
+```
+
+For local development, install a checkout instead:
+
+```bash
 pi install /path/to/pi-context-engineer
 ```
 

@@ -149,9 +149,21 @@ Unless overridden with a shorter TTL or lower budget, global defaults are one we
 
 `strict` turns soft warnings, such as oversized estimated returns, into blocks. Hard raw/encoded/unknown data-flow violations are blocked by default.
 
-## Loading
+## Install in Pi
 
-The package manifest declares the extension and skill. It can also be loaded explicitly:
+After installing from npm, Pi loads the extension and skill from the package manifest:
+
+```sh
+pi install npm:pi-context-engineer
+```
+
+Try it for one run without saving it to settings:
+
+```sh
+pi -e npm:pi-context-engineer
+```
+
+The package can also be loaded from a checkout:
 
 ```sh
 pi --extension /path/to/pi-context-engineer/src/index.ts
