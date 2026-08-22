@@ -19,13 +19,13 @@ The analyzer distinguishes:
 - `RAW` — direct or near-direct tool data
 - `ENCODED` — `String(raw)`, `JSON.stringify(raw)`, templates, and similar representations that still contain the payload
 - `UNKNOWN` — an untrusted helper received tainted data
-- `PROJECTED` — scalar fields, counts, keys, and field projections
-- `SELECTED` — slices, filters, matches, bounded Fovea results
+- `PROJECTED` — scalar fields, counts, keys, and field projections (only scalar projections are inherently bounded)
+- `SELECTED` — slices, filters, matches, and bounded Fovea results (only explicit bounds are safe)
 - `AGGREGATED` — reductions and scalar summaries
 - `COMPRESSED` — context summaries
 - `OFFLOADED` — disk handles
 
-Raw, encoded, and unknown tainted returns are blocked. Oversized static returns warn by default and block in strict mode. The number of internal calls is no longer the primary limit: a Fabric program may make many calls when it returns a small, meaningful result.
+A source-bearing return must be **provably bounded** to cross the boundary. Scalar projections, `some()`/`every()`/`includes()`, one-item selectors such as `find()`, explicit `slice(0, N)`, Fovea `maxTokens`, summaries, and offloads establish bounds. `map()`, `filter()`, `reduce()`, `Object.entries()`/`values()`, `trim()`, `replace()`, and similar transformations can still retain the full source, so they remain blocked unless a bound is derived. Statically oversized literal returns are also blocked. The number of internal calls is no longer the primary limit: a Fabric program may make many calls when it returns a small, bounded result.
 
 ### Runtime boundary guard
 
@@ -62,7 +62,7 @@ Stored payloads include content hashes, provenance/source, content type, creatio
 
 ### Telemetry
 
-The extension records sizes and strategies—not prompts or payloads—in `.pi/context-store/context-events.jsonl`.
+The extension records sizes and strategies—not prompts or payloads—in `.pi/context-store/context-events.jsonl`. Metrics separate `internalTokensProcessed`, `mainTokensPrevented`, `mainTokensInjected`, and `storeTokensWritten`; the legacy `savedTokens` field aliases Main-context prevention for compatibility.
 
 Interactive commands:
 
@@ -75,7 +75,7 @@ Interactive commands:
 /ce clear          clear telemetry
 ```
 
-The numbers are approximate context-token estimates, useful for comparing policies rather than billing reconciliation.
+The numbers are approximate context-token estimates, useful for comparing policies rather than billing reconciliation. Internal provider work is not counted as Main context saved unless CE actually prevents it from crossing the Main boundary.
 
 ## Fabric example
 

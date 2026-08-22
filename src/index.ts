@@ -31,6 +31,7 @@ import { ceTools, type ToolContext } from "./tools.js";
 import { evaluateProgram, runtimeAdvisoryLine, type WrapperOptions } from "./wrapper.js";
 import { runChildPi } from "./child.js";
 import { ContextTelemetry } from "./telemetry.js";
+import { FabricExecutionScopes } from "./execution-scope.js";
 
 // ---- Config ----
 
@@ -211,11 +212,11 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   // WARN decisions are attached to the corresponding tool result.
   const pendingWarnings = new Map<string, string>();
 
-  // Number of fabric_exec programs currently executing. A tool_result that
-  // arrives while this is > 0 (and is not the fabric_exec result itself) is an
-  // INTERMEDIATE value consumed by program code — never rewritten, because the
-  // program would receive the placeholder/handle text instead of real data.
-  let fabricExecDepth = 0;
+  // Track parent executions by their stable toolCallId. Fabric-generated
+  // nested IDs carry the documented `fabric_` prefix, so overlapping programs
+  // can finish out of order without a shared depth counter misclassifying an
+  // unrelated result.
+  const fabricExecutions = new FabricExecutionScopes();
   const telemetry = new ContextTelemetry();
 
   const storeFor = (cwd: string, cfg: CeConfig): ContextStore => new ContextStore(
@@ -257,6 +258,8 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         tool: "fabric_exec",
         sourceTokens: decision.analysis.metrics.estimatedSourceTokens ?? 0,
         visibleTokens: Math.ceil(decision.guidance.length / 4),
+        mainTokensPrevented: decision.analysis.metrics.estimatedSourceTokens ?? 0,
+        mainTokensInjected: Math.ceil(decision.guidance.length / 4),
         note: decision.analysis.reasons[0] ?? "static policy block",
       });
       return {
@@ -271,8 +274,12 @@ export default function contextEngineer(pi: ExtensionAPI): void {
 
     // PASS and WARN both execute; track the execution so tool_result can tell
     // model-boundary results apart from intermediate ones. BLOCK does not
-    // execute, so it must not increment.
-    fabricExecDepth++;
+    // execute, so it must not open a scope.
+    fabricExecutions.start({
+      toolCallId: event.toolCallId,
+      workspaceRoot: ctx.cwd,
+      startedAt: Date.now(),
+    });
 
     // WARN is annotated in the tool_result hook.
     return undefined;
@@ -316,12 +323,15 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   const PREVIEW_BYTES = 1024;
 
   pi.on("tool_result", async (event, ctx) => {
-    // Classify first: the fabric_exec result itself closes a program execution;
-    // anything else arriving while one is running is an intermediate value.
+    // Classify first: the fabric_exec result itself closes its own scope.
+    // Nested Fabric IDs remain intermediate even when sibling executions are
+    // active; ordinary non-prefixed calls stay model-boundary results.
     const isFabricExecResult = event.toolName === "fabric_exec";
-    if (isFabricExecResult) fabricExecDepth = Math.max(0, fabricExecDepth - 1);
+    if (isFabricExecResult) fabricExecutions.finish(event.toolCallId);
     const fabricProxy = readFabricProxy(event.toolCallId, event.toolName, event.details);
-    const isIntermediate = !isFabricExecResult && fabricExecDepth > 0;
+    const isIntermediate = !isFabricExecResult && (
+      fabricProxy !== undefined || fabricExecutions.isNestedToolResult(event.toolCallId)
+    );
 
     const warning = pendingWarnings.get(event.toolCallId);
     if (warning) pendingWarnings.delete(event.toolCallId);
@@ -356,6 +366,9 @@ export default function contextEngineer(pi: ExtensionAPI): void {
             tool: event.toolName,
             sourceBytes: Buffer.byteLength(serialized, "utf8"),
             visibleBytes: Buffer.byteLength(serialized, "utf8"),
+            internalTokensProcessed: Math.ceil(serializedBytes / 4),
+            mainTokensPrevented: 0,
+            mainTokensInjected: 0,
             provider: event.toolName.split(".")[0],
             note: providerBounded ? "provider-bounded nested result" : "nested result below CE threshold",
           });
@@ -380,6 +393,10 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         tool: event.toolName,
         sourceBytes: Buffer.byteLength(serialized, "utf8"),
         visibleBytes: Buffer.byteLength(nestedText, "utf8"),
+        internalTokensProcessed: offloaded.estimatedTokens,
+        mainTokensPrevented: 0,
+        mainTokensInjected: 0,
+        storeTokensWritten: offloaded.estimatedTokens,
         provider: event.toolName.split(".")[0],
         handle: offloaded.id,
         note: "nested Fabric provider result offloaded before QuickJS",
@@ -422,6 +439,8 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           tool: event.toolName,
           sourceBytes: Buffer.byteLength(text, "utf8"),
           visibleBytes: Buffer.byteLength(text, "utf8"),
+          mainTokensPrevented: 0,
+          mainTokensInjected: Math.ceil(textBytes / 4),
           note: providerBounded ? "provider-bounded final result" : "final result below CE threshold",
         });
       }
@@ -463,6 +482,9 @@ export default function contextEngineer(pi: ExtensionAPI): void {
       tool: event.toolName,
       sourceBytes: Buffer.byteLength(text, "utf8"),
       visibleBytes: Buffer.byteLength(replacementText, "utf8"),
+      mainTokensPrevented: Math.max(0, offloaded.estimatedTokens - Math.ceil(Buffer.byteLength(replacementText, "utf8") / 4)),
+      mainTokensInjected: Math.ceil(Buffer.byteLength(replacementText, "utf8") / 4),
+      storeTokensWritten: offloaded.estimatedTokens,
       handle: offloaded.id,
       note: "large final text result offloaded",
     });
@@ -595,18 +617,23 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         ((params.source as string) ?? "manual"),
         payload
       );
+      const visibleText = `Offloaded ${result.bytes} bytes (~${result.estimatedTokens} tokens) to handle "${result.id}".\nPreview:\n${result.preview}`;
+      const visibleBytes = Buffer.byteLength(visibleText, "utf8");
       telemetry.record(execCtx.cwd, {
         strategy: "WRITE",
         tool: "ctx_offload",
         sourceBytes: result.bytes,
-        visibleBytes: Buffer.byteLength(result.preview, "utf8"),
+        visibleBytes,
+        mainTokensPrevented: Math.max(0, result.estimatedTokens - Math.ceil(visibleBytes / 4)),
+        mainTokensInjected: Math.ceil(visibleBytes / 4),
+        storeTokensWritten: result.estimatedTokens,
         handle: result.id,
         note: "manual context offload",
       });
       return {
         content: [{
           type: "text" as const,
-          text: `Offloaded ${result.bytes} bytes (~${result.estimatedTokens} tokens) to handle "${result.id}".\nPreview:\n${result.preview}`,
+          text: visibleText,
         }],
         details: { id: result.id, bytes: result.bytes, estimatedTokens: result.estimatedTokens },
       };
@@ -636,7 +663,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         storeTtlMs: cfg.storeTtlMs ?? DEFAULT_CONTEXT_STORE_TTL_MS,
         storeMaxBytes: Math.min(MAX_CONTEXT_STORE_BYTES, cfg.storeMaxBytes ?? MAX_CONTEXT_STORE_BYTES),
         maxReturnTokens: cfg.maxReturnTokens ?? 4000,
-        policy: "blocks direct raw-tool passthroughs; reduced returns warn; 4KB+ advisory; 8KB+ auto-offload; previews are independently bounded",
+        policy: "blocks source-bearing returns without a provable bound; bounded selectors/compression pass; 4KB+ advisory; 8KB+ auto-offload; previews are independently bounded",
         session: summary,
       };
       return {
@@ -689,6 +716,9 @@ export default function contextEngineer(pi: ExtensionAPI): void {
             rawReturn: decision.analysis.metrics.returnIsRawToolResult,
             returnTaint: decision.analysis.metrics.returnTaint,
             reductionRatio: decision.analysis.metrics.estimatedReductionRatio,
+            provablyBounded: decision.analysis.metrics.provablyBounded,
+            returnIsReduced: decision.analysis.metrics.returnIsReduced,
+            transformationCount: decision.analysis.metrics.transformationCount,
             boundedSelectionCalls: decision.analysis.metrics.boundedSelectionCalls,
             hasProcessing: decision.analysis.metrics.hasProcessingBetweenToolAndReturn,
           },
@@ -733,29 +763,31 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         const summary = telemetry.summary(ctx.cwd, allSessions);
         const reduction = `${(summary.reductionRatio * 100).toFixed(1)}%`;
         const strategyLines = Object.entries(summary.byStrategy)
-          .sort(([, left], [, right]) => right.savedTokens - left.savedTokens)
-          .map(([name, bucket]) => `  ${name.padEnd(8)} ${bucket.savedTokens.toLocaleString()} saved tokens (${bucket.events} event${bucket.events === 1 ? "" : "s"})`);
+          .sort(([, left], [, right]) => right.mainTokensPrevented - left.mainTokensPrevented)
+          .map(([name, bucket]) => `  ${name.padEnd(8)} ${bucket.mainTokensPrevented.toLocaleString()} Main tokens prevented (${bucket.events} event${bucket.events === 1 ? "" : "s"})`);
         message = [
           `Context Engineer${allSessions ? " (all sessions)" : " (current session)"}`,
-          `Observed source: ${summary.sourceTokens.toLocaleString()} tokens`,
-          `Visible to model: ${summary.visibleTokens.toLocaleString()} tokens`,
-          `Main context saved: ${summary.savedTokens.toLocaleString()} tokens (${reduction})`,
+          `Internal provider work: ${summary.internalTokensProcessed.toLocaleString()} tokens`,
+          `Main tokens prevented: ${summary.mainTokensPrevented.toLocaleString()}`,
+          `Main tokens injected: ${summary.mainTokensInjected.toLocaleString()}`,
+          `Store tokens written: ${summary.storeTokensWritten.toLocaleString()}`,
+          `Main context reduction: ${summary.mainTokensPrevented.toLocaleString()} tokens (${reduction})`,
           `Events: ${summary.events}`,
           ...(strategyLines.length > 0 ? ["", "By strategy:", ...strategyLines] : []),
-          ...(summary.largest ? ["", `Largest saving: ${summary.largest.tool} — ${summary.largest.savedTokens.toLocaleString()} tokens`] : []),
+          ...(summary.largest ? ["", `Largest Main-context prevention: ${summary.largest.tool} — ${summary.largest.mainTokensPrevented.toLocaleString()} tokens`] : []),
         ].join("\n");
       } else if (command === "trace") {
         const events = telemetry.recent(ctx.cwd, 20, allSessions);
         message = events.length === 0
           ? "No Context Engineer events recorded."
-          : events.map((event) => `${event.timestamp.slice(11, 19)} ${event.strategy.padEnd(8)} ${event.tool} source=${event.sourceTokens} visible=${event.visibleTokens} saved=${event.savedTokens}${event.note ? ` — ${event.note}` : ""}`).join("\n");
+          : events.map((event) => `${event.timestamp.slice(11, 19)} ${event.strategy.padEnd(8)} ${event.tool} internal=${event.internalTokensProcessed} prevented=${event.mainTokensPrevented} injected=${event.mainTokensInjected} store=${event.storeTokensWritten}${event.note ? ` — ${event.note}` : ""}`).join("\n");
       } else if (command === "settings") {
         message = JSON.stringify(configFor(ctx.cwd), null, 2);
       } else if (command === "explain") {
         message = [
           "Context Engineer is the context governor above Fabric and Fovea.",
-          "The gate hard-blocks only DIRECT raw-tool passthroughs (zero transformation).",
-          "Tainted-but-reduced returns run with an advisory; results of 4KB+ get a one-line nudge, 8KB+ are auto-offloaded.",
+          "The gate hard-blocks source-bearing returns without a provable context bound; transformations alone are not trusted.",
+          "Explicit scalar projections, bounded slices/selections, summaries, and offloads pass; 4KB+ gets a nudge and 8KB+ is auto-offloaded.",
           "extensions.ctx_status reports thresholds and savings; extensions.ce_exec pre-checks a program.",
           "Use /ce status, /ce trace, /ce settings, or /ce status --all.",
         ].join("\n");
@@ -775,6 +807,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   // ================================================================
 
   pi.on("session_start", async (_event, ctx) => {
+    fabricExecutions.clear();
     const cfg = configFor(ctx.cwd);
     if (cfg.enabled === false) return;
     if (ctx.hasUI) {

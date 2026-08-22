@@ -3,6 +3,12 @@
  *
  * Events intentionally contain sizes, strategies, tool names, and handles only;
  * they never contain prompts, source text, command arguments, or tool payloads.
+ *
+ * The accounting domains are deliberately separate:
+ *   - internalTokensProcessed: work kept inside a provider/runtime;
+ *   - mainTokensPrevented: potential Main-bound tokens withheld by CE;
+ *   - mainTokensInjected: tokens actually shown to Main;
+ *   - storeTokensWritten: payload tokens persisted for later retrieval.
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -11,16 +17,22 @@ import { resolve } from "node:path";
 export type ContextStrategy = "PASS" | "WARN" | "BLOCK" | "WRITE" | "SELECT" | "COMPRESS" | "ISOLATE";
 
 export interface ContextEvent {
-  version: 1;
+  version: 2;
   timestamp: string;
   sessionId: string;
   strategy: ContextStrategy;
   tool: string;
+  /** Legacy payload-size fields retained for compatibility. */
   sourceBytes: number;
   visibleBytes: number;
   sourceTokens: number;
   visibleTokens: number;
+  /** Legacy alias for mainTokensPrevented. */
   savedTokens: number;
+  internalTokensProcessed: number;
+  mainTokensPrevented: number;
+  mainTokensInjected: number;
+  storeTokensWritten: number;
   provider?: string;
   handle?: string;
   note?: string;
@@ -31,15 +43,27 @@ export interface StrategySummary {
   sourceTokens: number;
   visibleTokens: number;
   savedTokens: number;
+  internalTokensProcessed: number;
+  mainTokensPrevented: number;
+  mainTokensInjected: number;
+  storeTokensWritten: number;
 }
 
 export interface ContextSummary {
   sessionId?: string;
   events: number;
+  /** Legacy aggregate fields. */
   sourceTokens: number;
   visibleTokens: number;
   savedTokens: number;
+  /** Explicit accounting domains. */
+  internalTokensProcessed: number;
+  mainTokensPrevented: number;
+  mainTokensInjected: number;
+  storeTokensWritten: number;
+  /** Compatibility alias for Main-context reduction. */
   reductionRatio: number;
+  mainContextReductionRatio: number;
   byStrategy: Record<string, StrategySummary>;
   largest?: ContextEvent;
 }
@@ -51,6 +75,10 @@ export interface RecentContextEvent {
   sourceTokens: number;
   visibleTokens: number;
   savedTokens: number;
+  internalTokensProcessed: number;
+  mainTokensPrevented: number;
+  mainTokensInjected: number;
+  storeTokensWritten: number;
   note?: string;
   handle?: string;
 }
@@ -61,6 +89,10 @@ function estimateTokens(charsOrBytes: number): number {
 
 function safeNumber(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function isStrategy(value: unknown): value is ContextStrategy {
+  return typeof value === "string" && ["PASS", "WARN", "BLOCK", "WRITE", "SELECT", "COMPRESS", "ISOLATE"].includes(value);
 }
 
 export class ContextTelemetry {
@@ -76,6 +108,10 @@ export class ContextTelemetry {
       visibleBytes?: number;
       sourceTokens?: number;
       visibleTokens?: number;
+      internalTokensProcessed?: number;
+      mainTokensPrevented?: number;
+      mainTokensInjected?: number;
+      storeTokensWritten?: number;
       provider?: string;
       handle?: string;
       note?: string;
@@ -88,8 +124,12 @@ export class ContextTelemetry {
       const visibleBytes = safeNumber(event.visibleBytes);
       const sourceTokens = event.sourceTokens === undefined ? estimateTokens(sourceBytes) : safeNumber(event.sourceTokens);
       const visibleTokens = event.visibleTokens === undefined ? estimateTokens(visibleBytes) : safeNumber(event.visibleTokens);
+      const mainTokensInjected = event.mainTokensInjected === undefined ? visibleTokens : safeNumber(event.mainTokensInjected);
+      const mainTokensPrevented = event.mainTokensPrevented === undefined
+        ? Math.max(0, sourceTokens - visibleTokens)
+        : safeNumber(event.mainTokensPrevented);
       const item: ContextEvent = {
-        version: 1,
+        version: 2,
         timestamp: new Date().toISOString(),
         sessionId: this.sessionId,
         strategy: event.strategy,
@@ -98,7 +138,11 @@ export class ContextTelemetry {
         visibleBytes,
         sourceTokens,
         visibleTokens,
-        savedTokens: Math.max(0, sourceTokens - visibleTokens),
+        savedTokens: mainTokensPrevented,
+        internalTokensProcessed: safeNumber(event.internalTokensProcessed),
+        mainTokensPrevented,
+        mainTokensInjected,
+        storeTokensWritten: safeNumber(event.storeTokensWritten),
         ...(event.provider ? { provider: event.provider.slice(0, 80) } : {}),
         ...(event.handle ? { handle: event.handle.slice(0, 120) } : {}),
         ...(event.note ? { note: event.note.replace(/[\r\n]+/g, " ").slice(0, 240) } : {}),
@@ -117,27 +161,55 @@ export class ContextTelemetry {
     let sourceTokens = 0;
     let visibleTokens = 0;
     let savedTokens = 0;
+    let internalTokensProcessed = 0;
+    let mainTokensPrevented = 0;
+    let mainTokensInjected = 0;
+    let storeTokensWritten = 0;
     let largest: ContextEvent | undefined;
 
     for (const event of events) {
       sourceTokens += event.sourceTokens;
       visibleTokens += event.visibleTokens;
       savedTokens += event.savedTokens;
-      const bucket = byStrategy[event.strategy] ??= { events: 0, sourceTokens: 0, visibleTokens: 0, savedTokens: 0 };
+      internalTokensProcessed += event.internalTokensProcessed;
+      mainTokensPrevented += event.mainTokensPrevented;
+      mainTokensInjected += event.mainTokensInjected;
+      storeTokensWritten += event.storeTokensWritten;
+      const bucket = byStrategy[event.strategy] ??= {
+        events: 0,
+        sourceTokens: 0,
+        visibleTokens: 0,
+        savedTokens: 0,
+        internalTokensProcessed: 0,
+        mainTokensPrevented: 0,
+        mainTokensInjected: 0,
+        storeTokensWritten: 0,
+      };
       bucket.events++;
       bucket.sourceTokens += event.sourceTokens;
       bucket.visibleTokens += event.visibleTokens;
       bucket.savedTokens += event.savedTokens;
-      if (!largest || event.savedTokens > largest.savedTokens) largest = event;
+      bucket.internalTokensProcessed += event.internalTokensProcessed;
+      bucket.mainTokensPrevented += event.mainTokensPrevented;
+      bucket.mainTokensInjected += event.mainTokensInjected;
+      bucket.storeTokensWritten += event.storeTokensWritten;
+      if (!largest || event.mainTokensPrevented > largest.mainTokensPrevented) largest = event;
     }
 
+    const potentialMainTokens = mainTokensPrevented + mainTokensInjected;
+    const mainContextReductionRatio = potentialMainTokens > 0 ? mainTokensPrevented / potentialMainTokens : 0;
     return {
       ...(allSessions ? {} : { sessionId: this.sessionId }),
       events: events.length,
       sourceTokens,
       visibleTokens,
       savedTokens,
-      reductionRatio: sourceTokens > 0 ? savedTokens / sourceTokens : 0,
+      internalTokensProcessed,
+      mainTokensPrevented,
+      mainTokensInjected,
+      storeTokensWritten,
+      reductionRatio: mainContextReductionRatio,
+      mainContextReductionRatio,
       byStrategy,
       ...(largest ? { largest } : {}),
     };
@@ -154,6 +226,10 @@ export class ContextTelemetry {
         sourceTokens: event.sourceTokens,
         visibleTokens: event.visibleTokens,
         savedTokens: event.savedTokens,
+        internalTokensProcessed: event.internalTokensProcessed,
+        mainTokensPrevented: event.mainTokensPrevented,
+        mainTokensInjected: event.mainTokensInjected,
+        storeTokensWritten: event.storeTokensWritten,
         ...(event.note ? { note: event.note } : {}),
         ...(event.handle ? { handle: event.handle } : {}),
       }));
@@ -180,11 +256,43 @@ export class ContextTelemetry {
         .split("\n")
         .filter(Boolean)
         .slice(-this.maxEvents)
-        .map((line) => JSON.parse(line) as ContextEvent)
-        .filter((event) => event && event.version === 1 && typeof event.sessionId === "string");
+        .map((line) => {
+          try { return this.normalize(JSON.parse(line) as Record<string, unknown>); }
+          catch { return undefined; }
+        })
+        .filter((event): event is ContextEvent => event !== undefined);
     } catch {
       return [];
     }
+  }
+
+  private normalize(raw: Record<string, unknown>): ContextEvent | undefined {
+    if (!raw || typeof raw.sessionId !== "string" || !isStrategy(raw.strategy)) return undefined;
+    const sourceBytes = safeNumber(raw.sourceBytes);
+    const visibleBytes = safeNumber(raw.visibleBytes);
+    const sourceTokens = raw.sourceTokens === undefined ? estimateTokens(sourceBytes) : safeNumber(raw.sourceTokens);
+    const visibleTokens = raw.visibleTokens === undefined ? estimateTokens(visibleBytes) : safeNumber(raw.visibleTokens);
+    const legacySaved = raw.savedTokens === undefined ? Math.max(0, sourceTokens - visibleTokens) : safeNumber(raw.savedTokens);
+    const mainTokensPrevented = raw.mainTokensPrevented === undefined ? legacySaved : safeNumber(raw.mainTokensPrevented);
+    return {
+      version: 2,
+      timestamp: typeof raw.timestamp === "string" ? raw.timestamp : new Date(0).toISOString(),
+      sessionId: raw.sessionId,
+      strategy: raw.strategy,
+      tool: typeof raw.tool === "string" ? raw.tool.slice(0, 120) : "unknown",
+      sourceBytes,
+      visibleBytes,
+      sourceTokens,
+      visibleTokens,
+      savedTokens: mainTokensPrevented,
+      internalTokensProcessed: safeNumber(raw.internalTokensProcessed),
+      mainTokensPrevented,
+      mainTokensInjected: raw.mainTokensInjected === undefined ? visibleTokens : safeNumber(raw.mainTokensInjected),
+      storeTokensWritten: safeNumber(raw.storeTokensWritten),
+      ...(typeof raw.provider === "string" ? { provider: raw.provider } : {}),
+      ...(typeof raw.handle === "string" ? { handle: raw.handle } : {}),
+      ...(typeof raw.note === "string" ? { note: raw.note } : {}),
+    };
   }
 
   private trimIfNeeded(path: string): void {

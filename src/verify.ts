@@ -4,6 +4,7 @@
 
 import { analyzeProgram, type AnalyzerOptions } from "./analyzer.js";
 import { ceToolMap } from "./tools.js";
+import { FabricExecutionScopes } from "./execution-scope.js";
 
 type TestCase = {
   name: string;
@@ -52,9 +53,9 @@ const tests: TestCase[] = [
     expectBlock: false,
   },
   {
-    name: "mapped return: extract names from list",
+    name: "mapped return remains dynamically sized",
     program: `const files = await tools.list({}); return files.map(f => f.name);`,
-    expectBlock: false,
+    expectBlock: true,
   },
   {
     name: "summarized return: current extension helper",
@@ -98,9 +99,9 @@ const tests: TestCase[] = [
     expectBlock: true,
   },
   {
-    name: "filtered return: .filter() on array",
+    name: "filtered return remains dynamically sized",
     program: `const logs = await tools.bash({command:"cat log.txt"}); return logs.split('\\n').filter(l => l.includes("ERROR"));`,
-    expectBlock: false,
+    expectBlock: true,
   },
   {
     name: "String() does not reduce raw data",
@@ -143,9 +144,9 @@ const tests: TestCase[] = [
     expectBlock: true,
   },
   {
-    name: "property map projects fields",
+    name: "property map remains dynamically sized",
     program: `const rows = await tools.list({}); return rows.map(row => row.name);`,
-    expectBlock: false,
+    expectBlock: true,
   },
   {
     name: "split alone does not reduce text",
@@ -153,9 +154,9 @@ const tests: TestCase[] = [
     expectBlock: true,
   },
   {
-    name: "split and filter selects matching lines",
+    name: "split and filter are not a static bound",
     program: `const raw = await tools.bash({ command: "cat massive.log" }); return raw.split("\\n").filter(line => line.includes("ERROR"));`,
-    expectBlock: false,
+    expectBlock: true,
   },
   {
     name: "Promise.all raw aggregate is blocked",
@@ -163,9 +164,9 @@ const tests: TestCase[] = [
     expectBlock: true,
   },
   {
-    name: "Promise.all followed by field projection is safe",
+    name: "Promise.all map remains dynamically sized",
     program: `const values = await Promise.all([pi.read({ path: "a" }), pi.read({ path: "b" })]); return values.map(value => value.path);`,
-    expectBlock: false,
+    expectBlock: true,
   },
   {
     name: "bounded Fovea selection is accepted",
@@ -178,16 +179,37 @@ const tests: TestCase[] = [
     expectBlock: true,
   },
 
-  // ---- Session regressions: the old gate hard-blocked legitimate work ----
+  // ---- Provable-bound regressions ----
   {
-    name: "trim keeps taint but earns WARN, not BLOCK",
-    program: `const raw = await pi.read({ path: "log.txt" }); return raw.trim();`,
-    expectWarn: true,
+    name: "filter can retain every item",
+    program: "const raw = await pi.read({ path: \"rows.json\" }); return raw.filter(() => true);",
+    expectBlock: true
   },
   {
-    name: "replace keeps taint but earns WARN, not BLOCK",
+    name: "bounded slice is safe",
+    program: "const raw = await pi.read({ path: \"log.txt\" }); return raw.slice(0, 10);",
+    expectBlock: false
+  },
+  {
+    name: "one-item find is bounded",
+    program: "const raw = await pi.read({ path: \"rows.json\" }); return raw.find(row => row.id === 7);",
+    expectBlock: false
+  },
+  {
+    name: "unbounded reduce is guarded",
+    program: "const raw = await pi.read({ path: \"rows.json\" }); return raw.reduce((all, row) => [...all, row], []);",
+    expectBlock: true
+  },
+
+  {
+    name: "trim does not establish a bound",
+    program: `const raw = await pi.read({ path: "log.txt" }); return raw.trim();`,
+    expectBlock: true,
+  },
+  {
+    name: "replace does not establish a bound",
     program: `const raw = await pi.read({ path: "cfg.json" }); return raw.replace("x", "y");`,
-    expectWarn: true,
+    expectBlock: true,
   },
   {
     name: "nullish coalescing on a compressed result is safe",
@@ -195,19 +217,19 @@ const tests: TestCase[] = [
     expectBlock: false,
   },
   {
-    name: "template interpolation inside map is a projection",
+    name: "template/map output remains dynamically sized",
     program: `const out = await pi.bash({ cmd: "ps" }); return out.output.split("\\n").filter(Boolean).map(l => ({ row: l.slice(0, 10) }));`,
-    expectBlock: false,
+    expectBlock: true,
   },
   {
-    name: "Object.fromEntries is a recognized projection",
+    name: "Object.fromEntries remains dynamically sized",
     program: `const pairs = await pi.bash({ cmd: "echo" }); return Object.fromEntries(pairs.output.split("\\n").map(l => [l.slice(0, 3), l.length]));`,
-    expectBlock: false,
+    expectBlock: true,
   },
   {
-    name: "aggregated findings object passes (real-world diagnostic shape)",
+    name: "mixed diagnostic object still carries unbounded text",
     program: `const d = await pi.bash({ cmd: "uptime" }); const p = await pi.bash({ cmd: "ps" });\nconst rows = p.output.split("\\n").filter(Boolean);\nreturn { up: d.output.trim(), lineCount: rows.length, first: rows[0]?.slice(0, 20) ?? "none" };`,
-    expectBlock: false,
+    expectBlock: true,
   },
 ];
 
@@ -235,6 +257,21 @@ for (const test of tests) {
 
 console.log("---");
 console.log(`Results: ${passed} passed, ${failed} failed out of ${tests.length} tests.`);
+const scopes = new FabricExecutionScopes();
+scopes.start({ toolCallId: "fabric_a", workspaceRoot: "/tmp/a", startedAt: 1 });
+scopes.start({ toolCallId: "fabric_b", workspaceRoot: "/tmp/b", startedAt: 2 });
+const sizeAfterStarts = scopes.size;
+const nestedA = scopes.isNestedToolResult("fabric_child_a");
+const ordinaryIsBoundary = !scopes.isNestedToolResult("model-read");
+const finishedA = scopes.finish("fabric_a");
+const nestedB = scopes.isNestedToolResult("fabric_child_b");
+const finishedB = scopes.finish("fabric_b");
+const sizeAfterFinishes = scopes.size;
+const nestedAfterFinishes = scopes.isNestedToolResult("fabric_child_after");
+const scopeOk = sizeAfterStarts === 2 && nestedA && ordinaryIsBoundary && finishedA && nestedB && finishedB && sizeAfterFinishes === 0 && !nestedAfterFinishes;
+console.log(`${scopeOk ? "[ok]" : "[FAIL]"} execution scopes handle overlapping out-of-order Fabric runs`);
+let scopeFailures = scopeOk ? 0 : 1;
+
 const summarizeTool = ceToolMap.get("ctx_summarize");
 let toolFailures = 0;
 if (!summarizeTool) {
@@ -269,4 +306,4 @@ if (!summarizeTool) {
   if (!invalidOk) toolFailures++;
 }
 console.log(`Tool checks: ${toolFailures === 0 ? "passed" : `${toolFailures} failed`}.`);
-process.exit(failed + toolFailures > 0 ? 1 : 0);
+process.exit(failed + toolFailures + scopeFailures > 0 ? 1 : 0);

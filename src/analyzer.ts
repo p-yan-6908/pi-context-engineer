@@ -22,7 +22,7 @@ export type TaintKind =
 
 export interface AnalysisResult {
   ok: boolean;
-  /** True when a source value reaches return without meaningful reduction. */
+  /** True when a source value reaches return without a provable context bound. */
   hardBlock: boolean;
   reasons: string[];
   metrics: ProgramMetrics;
@@ -41,7 +41,14 @@ export interface ProgramMetrics {
   declaredVariables: number;
   returnTaint: TaintKind;
   returnOperation: string;
+  /** Legacy-compatible count of source-bearing transformations observed. */
   meaningfulTransformations: number;
+  /** Whether the final source-bearing flow used a reducing operation. */
+  returnIsReduced: boolean;
+  /** Whether the final source-bearing flow has an explicit static bound. */
+  provablyBounded: boolean;
+  /** Alias for the transformation count with less ambiguous naming. */
+  transformationCount: number;
   boundedSelectionCalls: number;
   /** Static estimate; null when source size is only known at runtime. */
   estimatedSourceTokens: number | null;
@@ -61,7 +68,11 @@ export interface AnalyzerOptions {
 interface Flow {
   kind: TaintKind;
   hasSource: boolean;
+  /** True only when the output has an explicit static context-size bound. */
+  bounded: boolean;
+  /** True when an operation reduced/projected the source, even if unbounded. */
   meaningful: boolean;
+  /** Upper bound on source retention; unbounded flows are always 1. */
   retention: number;
   operation: string;
 }
@@ -86,15 +97,27 @@ const UNSAFE_KINDS = new Set<TaintKind>(["raw", "encoded", "unknown"]);
 const REDUCING_KINDS = new Set<TaintKind>(["projected", "selected", "aggregated", "compressed", "offloaded"]);
 
 function cleanFlow(operation = "constant"): Flow {
-  return { kind: "clean", hasSource: false, meaningful: false, retention: 0, operation };
+  return { kind: "clean", hasSource: false, bounded: true, meaningful: false, retention: 0, operation };
 }
 
 function sourceFlow(kind: TaintKind = "raw", operation = "tool result", retention = 1): Flow {
-  return { kind, hasSource: true, meaningful: false, retention, operation };
+  return { kind, hasSource: true, bounded: false, meaningful: false, retention: Math.max(0, Math.min(1, retention)), operation };
 }
 
-function reducedFlow(kind: TaintKind, operation: string, retention: number): Flow {
-  return { kind, hasSource: true, meaningful: true, retention: Math.max(0, Math.min(1, retention)), operation };
+function reducedFlow(kind: TaintKind, operation: string, retention: number, bounded = false): Flow {
+  return {
+    kind,
+    hasSource: true,
+    bounded,
+    meaningful: true,
+    // If the operation is dynamically sized, it may retain the entire source.
+    retention: bounded ? Math.max(0, Math.min(1, retention)) : 1,
+    operation,
+  };
+}
+
+function boundedFlow(kind: TaintKind, operation: string, retention: number): Flow {
+  return reducedFlow(kind, operation, retention, true);
 }
 
 function getCalleeText(expr: ts.Expression, sf: ts.SourceFile): string {
@@ -162,6 +185,7 @@ function combine(flows: Flow[], operation: string): Flow {
   return {
     kind,
     hasSource: true,
+    bounded: sourced.every((flow) => flow.bounded),
     meaningful: sourced.some((flow) => flow.meaningful),
     retention: Math.max(...sourced.map((flow) => flow.retention)),
     operation,
@@ -171,18 +195,20 @@ function combine(flows: Flow[], operation: string): Flow {
 function propertyFlow(receiver: Flow, property: string): Flow {
   if (!receiver.hasSource) return cleanFlow(`property ${property}`);
   if (["length", "size", "count", "byteLength", "estimatedTokens"].includes(property)) {
-    return reducedFlow("projected", `scalar property ${property}`, 0.01);
+    return boundedFlow("projected", `scalar property ${property}`, 0.01);
   }
   if (["content", "data", "result", "stdout", "stderr", "text", "body", "value"].includes(property)) {
     return { ...receiver, operation: `raw property ${property}` };
   }
+  // A property projection is structurally smaller but the property itself can
+  // still contain the whole source. It is therefore not a proof of a bound.
   return reducedFlow("projected", `project property ${property}`, Math.min(receiver.retention, 0.5));
 }
 
 function elementFlow(receiver: Flow, index?: string): Flow {
   if (!receiver.hasSource) return cleanFlow("array element");
   if (index === "length" || index === "size") return reducedFlow("projected", "scalar element", 0.01);
-  return reducedFlow("selected", "select element", Math.min(receiver.retention, 0.25));
+  return boundedFlow("selected", "select element", Math.min(receiver.retention, 0.25));
 }
 
 function literalNumber(expr: ts.Expression | undefined, sf: ts.SourceFile): number | undefined {
@@ -253,6 +279,8 @@ function evaluateMethodCall(
       if (!mapped.hasSource) return cleanFlow(`${method} scalar projection`);
       if (UNSAFE_KINDS.has(mapped.kind)) return { ...mapped, operation: `${method} preserves source` };
       state.meaningfulTransformations++;
+      // map/flatMap can emit one item per input (or more), so field mapping
+      // is not a proof that the total result is context-bounded.
       return reducedFlow(mapped.kind === "aggregated" ? "aggregated" : "projected", `${method} projection`, Math.min(receiver.retention, mapped.retention, 0.5));
     }
     case "filter":
@@ -261,7 +289,7 @@ function evaluateMethodCall(
     case "find":
     case "findLast":
       state.meaningfulTransformations++;
-      return reducedFlow("selected", `select ${method} item`, Math.min(receiver.retention, 0.15));
+      return boundedFlow("selected", `select ${method} item`, Math.min(receiver.retention, 0.15));
     case "reduce":
     case "reduceRight":
       state.meaningfulTransformations++;
@@ -270,8 +298,19 @@ function evaluateMethodCall(
     case "substring":
     case "substr": {
       state.meaningfulTransformations++;
-      const limit = literalNumber(call.arguments[1], sf) ?? literalNumber(call.arguments[0], sf);
-      return reducedFlow("selected", `${method} selection`, limit !== undefined ? Math.min(receiver.retention, Math.max(0.02, Math.abs(limit) / 1000)) : Math.min(receiver.retention, 0.5));
+      const start = literalNumber(call.arguments[0], sf);
+      const second = literalNumber(call.arguments[1], sf);
+      // `slice(0, 10)`, `substring(0, 10)`, and `substr(0, 10)` have an
+      // explicit output bound. A one-argument positive slice is a tail of
+      // unbounded size and must not be treated as safe.
+      const limit = second !== undefined
+        ? Math.abs(second - (start ?? 0))
+        : start !== undefined && start < 0
+          ? Math.abs(start)
+          : undefined;
+      return limit !== undefined
+        ? boundedFlow("selected", `${method} bounded selection`, Math.min(receiver.retention, Math.max(0.02, limit / 1000)))
+        : reducedFlow("selected", `${method} unbounded selection`, receiver.retention);
     }
     case "match":
     case "matchAll":
@@ -286,13 +325,13 @@ function evaluateMethodCall(
     case "every":
     case "has":
       state.meaningfulTransformations++;
-      return reducedFlow("projected", `${method} scalar predicate`, 0.01);
+      return boundedFlow("projected", `${method} scalar predicate`, 0.01);
     case "join":
       if (UNSAFE_KINDS.has(receiver.kind)) {
         return { ...receiver, operation: "join preserves source" };
       }
       state.meaningfulTransformations++;
-      return reducedFlow("selected", "join projected values", Math.min(receiver.retention, 0.5));
+      return reducedFlow("selected", "join projected values", receiver.retention, receiver.bounded);
     case "split":
       // Splitting alone does not reduce data; `.length`, `.filter`, etc. do.
       // Preserve the receiver's taint instead of escalating it.
@@ -302,10 +341,10 @@ function evaluateMethodCall(
     case "replaceAll":
     case "normalize":
     case "toString":
-      // Normalization does not add data. Preserve the receiver's taint and let
-      // the transformation counter decide: raw + transforms => WARN, not BLOCK.
+      // Normalization does not prove any context bound. Preserve the receiver's
+      // taint and let the final bound check reject raw-preserving transforms.
       state.meaningfulTransformations++;
-      return { ...receiver, operation: `${method} normalizes source` };
+      return { ...receiver, operation: `${method} preserves source` };
     case "sort":
     case "reverse":
       return { ...receiver, operation: `${method} reorders source` };
@@ -322,19 +361,19 @@ function evaluateCall(call: ts.CallExpression, env: Map<string, Flow>, state: Ev
     if (/ctx_summarize|ce_summarize|summarize/.test(name)) {
       state.meaningfulTransformations++;
       const maxTokens = objectNumberArgument(call, "maxTokens", sf);
-      return reducedFlow("compressed", "context summary", maxTokens ? Math.min(0.08, maxTokens / 10000) : 0.08);
+      return boundedFlow("compressed", "context summary", maxTokens ? Math.min(0.08, maxTokens / 10000) : 0.08);
     }
     if (/ctx_offload|ce_offload|offload/.test(name)) {
       state.meaningfulTransformations++;
-      return reducedFlow("offloaded", "context offload", 0);
+      return boundedFlow("offloaded", "context offload", 0);
     }
     if (/ctx_read|ce_read|read/.test(name)) {
       state.meaningfulTransformations++;
-      return reducedFlow("selected", "context slice", 0.25);
+      return boundedFlow("selected", "context slice", 0.25);
     }
     if (/ctx_delegate|ce_delegate|delegate/.test(name)) {
       state.meaningfulTransformations++;
-      return reducedFlow("compressed", "isolated delegation", 0.05);
+      return boundedFlow("compressed", "isolated delegation", 0.05);
     }
     return source ? reducedFlow("selected", "context helper", 0.25) : cleanFlow("context helper");
   }
@@ -344,7 +383,7 @@ function evaluateCall(call: ts.CallExpression, env: Map<string, Flow>, state: Ev
     if (maxTokens !== undefined) {
       state.boundedSelectionCalls++;
       state.meaningfulTransformations++;
-      return reducedFlow("selected", "Fovea budgeted selection", Math.min(0.25, maxTokens / 10000));
+      return boundedFlow("selected", "Fovea budgeted selection", Math.min(0.25, maxTokens / 10000));
     }
     return sourceFlow("unknown", "unbounded Fovea selection");
   }
@@ -370,13 +409,13 @@ function evaluateCall(call: ts.CallExpression, env: Map<string, Flow>, state: Ev
     return sourced ? reducedFlow("projected", `${name} projection`, 0.5) : cleanFlow(name);
   }
   if (["Object.keys", "Object.entries"].includes(name)) {
-    return sourced ? reducedFlow("projected", `${name} projection`, 0.25) : cleanFlow(name);
+    return sourced ? reducedFlow("projected", `${name} dynamically sized projection`, 0.25) : cleanFlow(name);
   }
   if (name === "Object.values") {
-    return sourced ? reducedFlow("selected", "Object.values selection", 0.5) : cleanFlow(name);
+    return sourced ? reducedFlow("selected", "Object.values dynamically sized selection", 0.5) : cleanFlow(name);
   }
   if (["Math.abs", "Math.ceil", "Math.floor", "Math.round", "Number", "Boolean", "parseInt", "parseFloat"].includes(name)) {
-    return sourced ? reducedFlow("projected", `${name} scalar projection`, 0.01) : cleanFlow(name);
+    return sourced ? boundedFlow("projected", `${name} scalar projection`, 0.01) : cleanFlow(name);
   }
   if (/^Promise\.(?:all|allSettled|race|any)$/.test(name)) {
     return combine(args, `${name} aggregate`);
@@ -444,7 +483,7 @@ function evaluateExpression(expr: ts.Expression, env: Map<string, Flow>, state: 
     const operation = ts.tokenToString(value.operatorToken.kind) ?? "binary operation";
     if (["===", "!==", "==", "!=", ">", ">=", "<", "<=", "&&", "||", "??"].includes(operation)) {
       return (left.hasSource || right.hasSource)
-        ? reducedFlow("projected", `scalar ${operation}`, 0.01)
+        ? boundedFlow("projected", `scalar ${operation}`, 0.01)
         : cleanFlow(`scalar ${operation}`);
     }
     const flow = combine([left, right], operation);
@@ -562,6 +601,9 @@ export function analyzeProgram(source: string, opts: AnalyzerOptions = {}): Anal
     toolCalls: 0,
     sourceCalls: 0,
     returnIsRawToolResult: false,
+    returnIsReduced: false,
+    provablyBounded: true,
+    transformationCount: 0,
     hasProcessingBetweenToolAndReturn: false,
     hasLoopOrConditional: false,
     hasVariableAssignment: false,
@@ -597,9 +639,12 @@ export function analyzeProgram(source: string, opts: AnalyzerOptions = {}): Anal
 
   metrics.boundedSelectionCalls = state.boundedSelectionCalls;
   metrics.meaningfulTransformations = state.meaningfulTransformations;
+  metrics.transformationCount = state.meaningfulTransformations;
   metrics.returnTaint = returned.kind;
   metrics.returnOperation = returned.operation;
   metrics.returnIsRawToolResult = returned.hasSource && UNSAFE_KINDS.has(returned.kind);
+  metrics.returnIsReduced = returned.hasSource && returned.meaningful;
+  metrics.provablyBounded = !returned.hasSource || returned.bounded;
   metrics.hasProcessingBetweenToolAndReturn = returned.hasSource && (returned.meaningful || REDUCING_KINDS.has(returned.kind));
   metrics.estimatedRetentionRatio = returned.hasSource ? returned.retention : null;
   metrics.estimatedReductionRatio = returned.hasSource ? Math.max(0, 1 - returned.retention) : null;
@@ -626,28 +671,14 @@ export function analyzeProgram(source: string, opts: AnalyzerOptions = {}): Anal
 
   const reasons: string[] = [];
   let hardBlock = false;
-  if (metrics.returnIsRawToolResult) {
-    // Cost-based policy: only a DIRECT passthrough (no transformation at all,
-    // most of the source retained) is worth a hard stop. Tainted-but-reduced
-    // returns execute with an advisory — the runtime offload hook is the
-    // backstop for actual size problems.
-    const zeroEffort = metrics.meaningfulTransformations === 0;
-    const highRetention = metrics.estimatedRetentionRatio === null || metrics.estimatedRetentionRatio >= 0.5;
-    if (zeroEffort && highRetention) {
-      hardBlock = true;
-      reasons.push(
-        `Return data-flow is ${metrics.returnTaint} (${metrics.returnOperation}) after ${metrics.sourceCalls} source call(s). ` +
-          "Tool-originated data reaches the main context as a direct passthrough with no reduction. " +
-          "Use map/filter/reduce, extract scalar fields, call extensions.ctx_summarize({ text, mode: \"structural\", maxTokens }), " +
-          "call extensions.ctx_offload({ key, source, data }), or delegate the work."
-      );
-    } else {
-      const reduction = metrics.estimatedReductionRatio === null ? "unknown" : `${Math.round(metrics.estimatedReductionRatio * 100)}%`;
-      reasons.push(
-        `Return carries ${metrics.returnTaint} tool data (${metrics.returnOperation}) despite ${metrics.meaningfulTransformations} transformation(s), ~${reduction} of the source retained. ` +
-          "Executing with an advisory: prefer scalar projections or extensions.ctx_summarize for smaller returns."
-      );
-    }
+  if (returned.hasSource && !returned.bounded) {
+    hardBlock = true;
+    reasons.push(
+      `Return carries ${metrics.returnTaint} tool data (${metrics.returnOperation}) without a provable context bound after ${metrics.sourceCalls} source call(s). ` +
+        "A transformation such as map, filter, reduce, trim, or replace may still retain the full source. " +
+        "Use scalar projections, find/some/every, slice(0, N), extensions.ctx_summarize({ text, mode: \"structural\", maxTokens }), " +
+        "extensions.ctx_offload({ key, source, data }), or delegate the work."
+    );
   }
 
   const maxReturnTokens = opts.maxReturnTokens ?? 4000;

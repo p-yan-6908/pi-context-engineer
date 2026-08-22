@@ -206,9 +206,9 @@ checkHook("offload preview stays bounded", Buffer.byteLength(ctrlText, "utf8") <
 // While a program runs, inner results are intermediate values consumed by
 // program code and must arrive byte-for-byte intact.
 await callHook("tool_call", { toolCallId: "fe1", toolName: "fabric_exec", input: { code: PROGRAM } });
-await callHook("tool_call", { toolCallId: "inner1", toolName: "read", input: { path: "big.txt" } });
+await callHook("tool_call", { toolCallId: "fabric_inner1", toolName: "read", input: { path: "big.txt" } });
 const inner = await callHook("tool_result", {
-  toolCallId: "inner1",
+  toolCallId: "fabric_inner1",
   toolName: "read",
   input: { path: "big.txt" },
   content: [{ type: "text", text: BIG }],
@@ -254,33 +254,20 @@ const resumed = await callHook("tool_result", {
 });
 checkHook("boundary offload resumes after program completes", resumed?.details?.ce_offloaded === true);
 
-// WARN programs also execute (opening the intermediate window), and their
-// warning must land on their own boundary result. A tainted-but-reduced
-// return (raw + normalization) is the canonical WARN under the cost-based
-// policy; statically-known oversize literals are BLOCKs now.
-await callHook("tool_call", {
+// Raw-preserving transforms are now BLOCKs: they do not establish a static bound.
+const fe2 = await callHook("tool_call", {
   toolCallId: "fe2",
   toolName: "fabric_exec",
-  input: { code: `const raw = await pi.read({ path: "f" }); return raw.trim();` },
+  input: { code: "const raw = await pi.read({ path: \"f\" }); return raw.trim();" },
 });
-const fe2 = await callHook("tool_result", {
-  toolCallId: "fe2",
-  toolName: "fabric_exec",
-  input: { code: "return { data: 'small' };" },
-  content: [{ type: "text", text: "small result" }],
-});
-checkHook(
-  "WARN annotated on its own boundary result",
-  typeof fe2?.content?.[0]?.text === "string" && fe2.content[0].text.startsWith("context-engineer WARNING")
-);
-const afterWarn = await callHook("tool_result", {
-  toolCallId: "afterwarn1",
+checkHook("raw-preserving transform is blocked", fe2?.block === true);
+const afterBlockedTransform = await callHook("tool_result", {
+  toolCallId: "fabric_afterwarn1",
   toolName: "read",
   input: { path: "w.txt" },
   content: [{ type: "text", text: BIG }],
 });
-checkHook("intermediate window closed after WARN program", afterWarn?.details?.ce_offloaded === true);
-
+checkHook("blocked transform does not open intermediate window", afterBlockedTransform?.details?.ce_offloaded === true);
 // BLOCK does not execute, so it must not open the intermediate window.
 const blocked = await callHook("tool_call", {
   toolCallId: "fe3",
@@ -369,9 +356,16 @@ const retained = budgetStore.write("retained", "bash", "payload larger than budg
 checkCtl("newest handle remains valid under a tiny disk budget", budgetStore.has(retained.id));
 const telemetryCwd = "/tmp/pi-ce-telemetry-" + Date.now();
 const telemetry = new ContextTelemetry();
-telemetry.record(telemetryCwd, { strategy: "WRITE", tool: "read", sourceBytes: 40000, visibleBytes: 2200, note: "payload sizes only" });
+telemetry.record(telemetryCwd, { strategy: "WRITE", tool: "read", sourceBytes: 40000, visibleBytes: 2200, storeTokensWritten: 10000, note: "payload sizes only" });
+telemetry.record(telemetryCwd, { strategy: "WRITE", tool: "fabric_exec", sourceTokens: 10000, visibleTokens: 100, internalTokensProcessed: 10000, mainTokensPrevented: 0, mainTokensInjected: 0, storeTokensWritten: 10000, note: "internal provider accounting" });
 const telemetrySummary = telemetry.summary(telemetryCwd);
-checkCtl("telemetry reports saved tokens", telemetrySummary.savedTokens > 0 && telemetrySummary.byStrategy.WRITE?.events === 1);
+checkCtl("telemetry reports saved tokens", telemetrySummary.savedTokens > 0 && telemetrySummary.byStrategy.WRITE?.events === 2);
+checkCtl("telemetry separates internal work from Main savings", telemetrySummary.internalTokensProcessed === 10000 && telemetrySummary.mainTokensPrevented === telemetrySummary.savedTokens && telemetrySummary.mainTokensInjected > 0 && telemetrySummary.storeTokensWritten === 20000);
+const legacyCwd = "/tmp/pi-ce-legacy-telemetry-" + Date.now();
+mkdirSync(join(legacyCwd, ".pi/context-store"), { recursive: true });
+writeFileSync(join(legacyCwd, ".pi/context-store/context-events.jsonl"), JSON.stringify({ version: 1, timestamp: new Date().toISOString(), sessionId: "legacy", strategy: "WRITE", tool: "read", sourceBytes: 4000, visibleBytes: 400, sourceTokens: 1000, visibleTokens: 100, savedTokens: 900 }) + "\n");
+const legacySummary = new ContextTelemetry().summary(legacyCwd, true);
+checkCtl("telemetry reads legacy version-1 events", legacySummary.mainTokensPrevented === 900 && legacySummary.mainTokensInjected === 100 && legacySummary.savedTokens === 900);
 
 // ---- ctx_offload signature ergonomics (session regressions) ----
 
@@ -443,7 +437,7 @@ if (statusDef) {
   const parsed = JSON.parse(st.content[0].text);
   checkCtl(
     "ctx_status exposes thresholds and policy",
-    parsed.enabled === true && typeof parsed.readOffloadThreshold === "number" && typeof parsed.policy === "string",
+    parsed.enabled === true && typeof parsed.readOffloadThreshold === "number" && typeof parsed.policy === "string" && typeof parsed.session?.internalTokensProcessed === "number" && typeof parsed.session?.mainTokensPrevented === "number" && typeof parsed.session?.mainTokensInjected === "number" && typeof parsed.session?.storeTokensWritten === "number",
   );
 }
 

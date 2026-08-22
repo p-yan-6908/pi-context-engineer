@@ -1,9 +1,9 @@
 /**
  * Enforcement policy for Fabric code-mode programs.
  *
- * The analyzer supplies data-flow severity. Raw, encoded, or unknown tainted
- * values crossing the return boundary are hard blocks; oversized but otherwise
- * reduced returns are warnings unless strict mode is enabled.
+ * The analyzer supplies data-flow severity. Any source-bearing value without a
+ * provable context bound is a hard block; bounded results may still receive a
+ * runtime advisory when their actual boundary payload is large.
  */
 
 import { analyzeProgram, type AnalysisResult } from "./analyzer.js";
@@ -13,7 +13,7 @@ export interface WrapperOptions {
   strict?: boolean;
   /** Legacy compatibility setting; reduction/cost is now the primary policy. */
   maxUnprocessedToolCalls?: number;
-  /** Max estimated return tokens before warning. Default: 4000. */
+  /** Max estimated return tokens before a static hard block. Default: 4000. */
   maxReturnTokens?: number;
 }
 
@@ -76,7 +76,9 @@ function metricLines(metrics: AnalysisResult["metrics"]): string[] {
   return [
     `  • source/tool calls: ${metrics.sourceCalls}`,
     `  • return data-flow: ${metrics.returnTaint} (${metrics.returnOperation})`,
-    `  • meaningful transformations: ${metrics.meaningfulTransformations}`,
+    `  • transformations observed: ${metrics.transformationCount}`,
+    `  • return is reduced: ${metrics.returnIsReduced}`,
+    `  • return is provably bounded: ${metrics.provablyBounded}`,
     `  • bounded Fovea selections: ${metrics.boundedSelectionCalls}`,
     `  • return is unsafe/near-raw: ${metrics.returnIsRawToolResult}`,
     `  • estimated return tokens: ${metrics.estimatedReturnTokens ?? "unknown"}`,
@@ -86,11 +88,11 @@ function metricLines(metrics: AnalysisResult["metrics"]): string[] {
 
 function formatBlockGuidance(reasons: string[], metrics: AnalysisResult["metrics"]): string {
   return [
-    "fabric_exec BLOCKED by context-engineer — direct raw-tool passthrough.",
+    "fabric_exec BLOCKED by context-engineer — source-bearing return lacks a provable bound.",
     "",
     ...reasons.map((reason) => `  • ${reason}`),
     "",
-    `  • transformations: ${metrics.meaningfulTransformations}, est. retention: ${metrics.estimatedRetentionRatio === null ? "?" : Math.round(metrics.estimatedRetentionRatio * 100) + "%"}, est. return tokens: ${metrics.estimatedReturnTokens ?? "?"}`,
+    `  • transformations: ${metrics.transformationCount}, reduced: ${metrics.returnIsReduced}, bounded: ${metrics.provablyBounded}, est. retention upper bound: ${metrics.estimatedRetentionRatio === null ? "?" : Math.round(metrics.estimatedRetentionRatio * 100) + "%"}, est. return tokens: ${metrics.estimatedReturnTokens ?? "?"}`,
     "",
     "Fastest fixes:",
     "  • project scalars:  return { lines: r.split('\\n').length }",
