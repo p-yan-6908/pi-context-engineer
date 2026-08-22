@@ -5,7 +5,7 @@
  *
  * 1. fabric_exec interception (Fix 2)
  *    Hook `tool_call` for fabric_exec. Run the analyzer before execution.
- *    Block passthroughs; let clean programs through.
+ *    Block source-bearing returns without provable bounds; let bounded programs through.
  *
  * 2. grep auto-repair (Fix 1 → auto-repair, not block)
  *    Hook `tool_call` for grep. Detect regex patterns that will fail
