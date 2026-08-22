@@ -179,6 +179,46 @@ const tests: TestCase[] = [
     expectBlock: true,
   },
 
+  {
+    name: "short-circuit OR preserves raw",
+    program: "const raw = await pi.read({ path: \"big.txt\" }); return raw || \"\";",
+    expectBlock: true
+  },
+  {
+    name: "short-circuit AND preserves raw",
+    program: "const raw = await pi.read({ path: \"big.txt\" }); return true && raw;",
+    expectBlock: true
+  },
+  {
+    name: "nullish coalescing preserves raw",
+    program: "const raw = await pi.read({ path: \"big.txt\" }); return raw ?? \"fallback\";",
+    expectBlock: true
+  },
+  {
+    name: "bounded scalar short-circuit remains safe",
+    program: "const raw = await pi.read({ path: \"big.txt\" }); return raw.length || 0;",
+    expectBlock: false
+  },
+  {
+    name: "bracket content property preserves raw",
+    program: "const raw = await pi.read({ path: \"big.json\" }); return raw[\"content\"];",
+    expectBlock: true
+  },
+  {
+    name: "bracket data property preserves raw",
+    program: "const raw = await pi.read({ path: \"big.json\" }); return raw[\"data\"];",
+    expectBlock: true
+  },
+  {
+    name: "bracket text property preserves raw",
+    program: "const raw = await pi.read({ path: \"big.json\" }); return raw[\"text\"];",
+    expectBlock: true
+  },
+  {
+    name: "bracket body property preserves raw",
+    program: "const raw = await pi.read({ path: \"big.json\" }); return raw[\"body\"];",
+    expectBlock: true
+  },
   // ---- Provable-bound regressions ----
   {
     name: "filter can retain every item",

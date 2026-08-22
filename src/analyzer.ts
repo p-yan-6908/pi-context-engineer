@@ -458,8 +458,10 @@ function evaluateExpression(expr: ts.Expression, env: Map<string, Flow>, state: 
   if (ts.isPropertyAccessExpression(value)) return propertyFlow(evaluateExpression(value.expression, env, state, sf), value.name.text);
   if (ts.isElementAccessExpression(value)) {
     const receiver = evaluateExpression(value.expression, env, state, sf);
-    const index = value.argumentExpression && ts.isStringLiteral(value.argumentExpression) ? value.argumentExpression.text : undefined;
-    return elementFlow(receiver, index);
+    if (value.argumentExpression && ts.isStringLiteral(value.argumentExpression)) {
+      return propertyFlow(receiver, value.argumentExpression.text);
+    }
+    return elementFlow(receiver);
   }
   if (ts.isCallExpression(value)) return evaluateCall(value, env, state, sf);
   if (ts.isSpreadElement(value)) return evaluateExpression(value.expression, env, state, sf);
@@ -481,10 +483,15 @@ function evaluateExpression(expr: ts.Expression, env: Map<string, Flow>, state: 
     const left = evaluateExpression(value.left, env, state, sf);
     const right = evaluateExpression(value.right, env, state, sf);
     const operation = ts.tokenToString(value.operatorToken.kind) ?? "binary operation";
-    if (["===", "!==", "==", "!=", ">", ">=", "<", "<=", "&&", "||", "??"].includes(operation)) {
+    if (["===", "!==", "==", "!=", ">", ">=", "<", "<="].includes(operation)) {
       return (left.hasSource || right.hasSource)
         ? boundedFlow("projected", `scalar ${operation}`, 0.01)
         : cleanFlow(`scalar ${operation}`);
+    }
+    if (["&&", "||", "??"].includes(operation)) {
+      // JavaScript returns one of the operands for short-circuit operators;
+      // they are not scalar predicates and must preserve source taint/bounds.
+      return combine([left, right], `short-circuit ${operation}`);
     }
     const flow = combine([left, right], operation);
     return flow.hasSource ? { ...flow, operation: `${operation} combines source` } : flow;
