@@ -1,20 +1,27 @@
 /**
  * Enforcement policy for Fabric code-mode programs.
  *
- * The analyzer supplies data-flow severity. Any source-bearing value without a
- * provable context bound is a hard block; bounded results may still receive a
- * runtime advisory when their actual boundary payload is large.
+ * The analyzer supplies data-flow severity. By default, uncertain source-bearing
+ * returns execute under the runtime boundary guard; strict mode blocks them.
+ * Certain static failures remain hard blocks, and optional size advisories can
+ * annotate large-but-sub-threshold boundary payloads.
  */
 
 import { analyzeProgram, type AnalysisResult } from "./analyzer.js";
 
 export interface WrapperOptions {
-  /** When true, soft warnings are blocked instead of warned. Default: false. */
+  /** When true, uncertain source returns and soft warnings are blocked. Default: false. */
   strict?: boolean;
   /** Legacy compatibility setting; reduction/cost is now the primary policy. */
   maxUnprocessedToolCalls?: number;
   /** Max estimated return tokens before a static hard block. Default: 4000. */
   maxReturnTokens?: number;
+  /**
+   * Block statically unbounded source returns before execution. Default: false.
+   * When false, the runtime boundary guard executes the task and offloads only
+   * if the actual result is large. `strict: true` always enables blocking.
+   */
+  blockUnboundedReturns?: boolean;
 }
 
 export interface ExecResult {
@@ -37,7 +44,20 @@ export function evaluateProgram(
   const strict = opts.strict ?? false;
 
   if (!analysis.ok) {
-    if (analysis.hardBlock || strict) {
+    // Unknown source sizes are better decided at the real model boundary: a
+    // small result is harmless, while a large one is automatically offloaded.
+    // Keep certain failures (empty/static oversize) blocked, and preserve the
+    // old fail-closed policy behind either explicit switch.
+    const runtimeGuardable =
+      analysis.hardBlock &&
+      !strict &&
+      opts.blockUnboundedReturns !== true &&
+      analysis.metrics.sourceCalls > 0 &&
+      !analysis.metrics.provablyBounded &&
+      (analysis.metrics.estimatedReturnTokens === null ||
+        analysis.metrics.estimatedReturnTokens <= (opts.maxReturnTokens ?? 4000));
+
+    if (!runtimeGuardable && (analysis.hardBlock || strict)) {
       return {
         tier: "BLOCK",
         analysis,
@@ -47,7 +67,9 @@ export function evaluateProgram(
     return {
       tier: "WARN",
       analysis,
-      guidance: formatWarning(analysis.reasons, analysis.metrics),
+      guidance: runtimeGuardable
+        ? formatRuntimeGuardWarning(analysis.metrics)
+        : formatWarning(analysis.reasons, analysis.metrics),
     };
   }
 
@@ -99,6 +121,12 @@ function formatBlockGuidance(reasons: string[], metrics: AnalysisResult["metrics
     "  • compress inline:  return extensions.ctx_summarize({ text, mode: 'structural', maxTokens: 400 })",
     "  • offload + preview: return extensions.ctx_offload({ key: 'label', source: 'bash', data })",
   ].join("\n");
+}
+
+function formatRuntimeGuardWarning(metrics: AnalysisResult["metrics"]): string {
+  return "[context-engineer] Unbounded " + metrics.returnTaint +
+    " return executed in runtime-guard mode; the actual result will stay visible if small " +
+    "or be offloaded if large. Set strict=true or blockUnboundedReturns=true to fail closed.";
 }
 
 /** One-line post-execution nudge for oversized (but executed) returns. */

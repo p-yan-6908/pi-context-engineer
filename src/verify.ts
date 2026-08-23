@@ -3,6 +3,7 @@
  */
 
 import { analyzeProgram, type AnalyzerOptions } from "./analyzer.js";
+import { evaluateProgram } from "./wrapper.js";
 import { ceToolMap } from "./tools.js";
 import { FabricExecutionScopes } from "./execution-scope.js";
 
@@ -231,6 +232,26 @@ const tests: TestCase[] = [
     expectBlock: false
   },
   {
+    name: "numeric helper argument preserves a static slice bound",
+    program: `const raw = await pi.read({ path: "log.txt" }); const clip = (value, limit) => String(value).slice(0, limit); return clip(raw, 500);`,
+    expectBlock: false,
+  },
+  {
+    name: "settled command status fields are scalar while output stays bounded",
+    program: `const result = await pi.bash({ cmd: "test", settle: true }); return { ok: result.ok, exitCode: result.exitCode, tail: result.output.slice(0, 500) };`,
+    expectBlock: false,
+  },
+  {
+    name: "aliased Fovea token budget remains bounded",
+    program: `const budget = 600; return extensions.fovea_focus({ query: "auth", maxTokens: budget });`,
+    expectBlock: false,
+  },
+  {
+    name: "ctx_read nextOffset metadata is scalar",
+    program: `const page = await extensions.ctx_read({ id: "handle", offset: 0, length: 500 }); return page.nextOffset;`,
+    expectBlock: false,
+  },
+  {
     name: "one-item find is bounded",
     program: "const raw = await pi.read({ path: \"rows.json\" }); return raw.find(row => row.id === 7);",
     expectBlock: false
@@ -295,6 +316,19 @@ for (const test of tests) {
   else failed++;
 }
 
+const uncertainProgram = `const raw = await pi.read({ path: "large.log" }); return raw;`;
+const runtimeDecision = evaluateProgram(uncertainProgram);
+const strictDecision = evaluateProgram(uncertainProgram, { strict: true });
+const explicitBlockDecision = evaluateProgram(uncertainProgram, { blockUnboundedReturns: true });
+const certainDecision = evaluateProgram("");
+const wrapperOk =
+  runtimeDecision.tier === "WARN" &&
+  strictDecision.tier === "BLOCK" &&
+  explicitBlockDecision.tier === "BLOCK" &&
+  certainDecision.tier === "BLOCK";
+console.log(`${wrapperOk ? "[ok]" : "[FAIL]"} runtime-first wrapper keeps strict/certain fail-closed modes`);
+let wrapperFailures = wrapperOk ? 0 : 1;
+
 console.log("---");
 console.log(`Results: ${passed} passed, ${failed} failed out of ${tests.length} tests.`);
 const scopes = new FabricExecutionScopes();
@@ -345,5 +379,38 @@ if (!summarizeTool) {
   console.log(`${invalidOk ? "[ok]" : "[FAIL]"} ctx_summarize rejects unknown modes`);
   if (!invalidOk) toolFailures++;
 }
+
+const delegateTool = ceToolMap.get("ctx_delegate");
+if (!delegateTool) {
+  console.log("[FAIL] ctx_delegate is not registered");
+  toolFailures++;
+} else {
+  let delegatedPrompt = "";
+  let delegatedTimeout = 0;
+  const delegateContext = {
+    store: { read: () => ({ content: "", truncated: false }) },
+    workspaceRoot: process.cwd(),
+    callTool: async () => ({}),
+    spawnAgent: async (prompt: string, opts?: { timeoutMs?: number }) => {
+      delegatedPrompt = prompt;
+      delegatedTimeout = opts?.timeoutMs ?? 0;
+      return "z".repeat(5000);
+    },
+    modelCall: async () => "",
+  } as any;
+  const delegated = await delegateTool.handler(
+    { prompt: "Audit the project", maxTokens: 100, timeoutSeconds: 500 },
+    delegateContext,
+  ) as Record<string, unknown>;
+  const delegateOk =
+    typeof delegated.result === "string" &&
+    Buffer.byteLength(delegated.result, "utf8") <= 400 &&
+    delegated.truncated === true &&
+    delegated.timeoutSeconds === 110 &&
+    delegatedTimeout === 110_000 &&
+    delegatedPrompt.includes("under 100 tokens");
+  console.log(`${delegateOk ? "[ok]" : "[FAIL]"} ctx_delegate bounds output and nested deadline`);
+  if (!delegateOk) toolFailures++;
+}
 console.log(`Tool checks: ${toolFailures === 0 ? "passed" : `${toolFailures} failed`}.`);
-process.exit(failed + toolFailures + scopeFailures > 0 ? 1 : 0);
+process.exit(failed + wrapperFailures + toolFailures + scopeFailures > 0 ? 1 : 0);

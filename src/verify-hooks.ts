@@ -6,7 +6,7 @@
 import contextEngineer, { repairGrepInput, isLikelyRegexParseError } from "./index.js";
 import { ContextStore, DEFAULT_CONTEXT_STORE_TTL_MS, MAX_CONTEXT_STORE_BYTES } from "./store.js";
 import { ContextTelemetry } from "./telemetry.js";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 
@@ -26,6 +26,11 @@ const grepTests: Array<{ name: string; input: Record<string, unknown>; expectRep
   {
     name: "braces in assignment: state.cart = {};",
     input: { pattern: "state.cart = {};" },
+    expectRepaired: true,
+  },
+  {
+    name: "lone opening brace accepted by JS but rejected by rg: return {",
+    input: { pattern: "return {" },
     expectRepaired: true,
   },
   {
@@ -68,6 +73,26 @@ const grepTests: Array<{ name: string; input: Record<string, unknown>; expectRep
   {
     name: "valid anchored alternation: ^(GET|POST)$",
     input: { pattern: "^(GET|POST)$" },
+    expectRepaired: false,
+  },
+  {
+    name: "valid brace quantifier: a{2,4}",
+    input: { pattern: "a{2,4}" },
+    expectRepaired: false,
+  },
+  {
+    name: "braces inside a character class: [{}]",
+    input: { pattern: "[{}]" },
+    expectRepaired: false,
+  },
+  {
+    name: "Unicode class braces: \\p{L}+",
+    input: { pattern: "\\p{L}+" },
+    expectRepaired: false,
+  },
+  {
+    name: "codepoint escape braces: \\x{41}",
+    input: { pattern: "\\x{41}" },
     expectRepaired: false,
   },
   {
@@ -179,10 +204,10 @@ checkHook("global store defaults are one week and 500 MB",
   DEFAULT_CONTEXT_STORE_TTL_MS === 7 * 24 * 60 * 60 * 1000
   && MAX_CONTEXT_STORE_BYTES === 500_000_000
   && Boolean(defaultMetadata?.expiresAt));
-const callHook = async (name: string, event: any) => {
+const callHook = async (name: string, event: any, cwd = hookCwd, extraContext: Record<string, unknown> = {}) => {
   let out: any;
   for (const fn of hooks[name] ?? []) {
-    const result = await fn(event, { cwd: hookCwd });
+    const result = await fn(event, { cwd, ...extraContext });
     if (result !== undefined) out = result;
   }
   return out;
@@ -202,6 +227,26 @@ checkHook("top-level large result is offloaded", ctrl?.details?.ce_offloaded ===
 const ctrlText = ctrl?.content?.find((item: any) => item.type === "text")?.text ?? "";
 checkHook("offload message includes a copyable ctx_read recipe", ctrlText.includes("extensions.ctx_read({ id:"));
 checkHook("offload preview stays bounded", Buffer.byteLength(ctrlText, "utf8") < 1800);
+
+const addressableMessage = {
+  role: "toolResult",
+  toolCallId: "ctrl",
+  toolName: "read",
+  content: ctrl?.content ?? [],
+  details: ctrl?.details,
+  isError: false,
+  timestamp: Date.now(),
+};
+const firstAddressableContext = await callHook("context", { messages: [addressableMessage] });
+const repeatedAddressableContext = await callHook("context", { messages: [addressableMessage] });
+const compactedAddressableText = repeatedAddressableContext?.messages?.[0]?.content?.[0]?.text ?? "";
+checkHook("addressable preview is preserved for its first model call", firstAddressableContext === undefined);
+checkHook(
+  "repeated addressable preview compacts to a re-readable handle",
+  compactedAddressableText.includes("preview compacted after use") &&
+    compactedAddressableText.includes(ctrl?.details?.ce_handle) &&
+    Buffer.byteLength(compactedAddressableText, "utf8") < Buffer.byteLength(ctrlText, "utf8") / 2,
+);
 
 // While a program runs, inner results are intermediate values consumed by
 // program code and must arrive byte-for-byte intact.
@@ -254,34 +299,99 @@ const resumed = await callHook("tool_result", {
 });
 checkHook("boundary offload resumes after program completes", resumed?.details?.ce_offloaded === true);
 
-// Raw-preserving transforms are now BLOCKs: they do not establish a static bound.
+// Runtime-first mode executes uncertain programs. Intermediate Pi values stay
+// intact, and only the actual final boundary payload is kept/offloaded.
 const fe2 = await callHook("tool_call", {
   toolCallId: "fe2",
   toolName: "fabric_exec",
   input: { code: "const raw = await pi.read({ path: \"f\" }); return raw.trim();" },
 });
-checkHook("raw-preserving transform is blocked", fe2?.block === true);
-const afterBlockedTransform = await callHook("tool_result", {
+checkHook("raw-preserving transform executes in runtime-guard mode", fe2?.block !== true);
+const duringRuntimeGuard = await callHook("tool_result", {
   toolCallId: "fabric_afterwarn1",
   toolName: "read",
   input: { path: "w.txt" },
   content: [{ type: "text", text: BIG }],
 });
-checkHook("blocked transform does not open intermediate window", afterBlockedTransform?.details?.ce_offloaded === true);
-// BLOCK does not execute, so it must not open the intermediate window.
-const blocked = await callHook("tool_call", {
+checkHook("runtime-guard execution preserves its intermediate result", duringRuntimeGuard === undefined);
+const fe2Boundary = await callHook("tool_result", {
+  toolCallId: "fe2",
+  toolName: "fabric_exec",
+  input: { code: "const raw = await pi.read({ path: \"f\" }); return raw.trim();" },
+  content: [{ type: "text", text: BIG }],
+});
+checkHook(
+  "large uncertain boundary result is offloaded without static-warning noise",
+  fe2Boundary?.details?.ce_offloaded === true && fe2Boundary?.details?.ce_warning === undefined,
+);
+
+const fe3 = await callHook("tool_call", {
   toolCallId: "fe3",
   toolName: "fabric_exec",
   input: { code: `const r = await pi.read({ path: "f" }); return r;` },
 });
-checkHook("raw passthrough program is blocked", blocked?.block === true);
+checkHook("raw passthrough executes by default", fe3?.block !== true);
+const fe3Boundary = await callHook("tool_result", {
+  toolCallId: "fe3",
+  toolName: "fabric_exec",
+  input: { code: `const r = await pi.read({ path: "f" }); return r;` },
+  content: [{ type: "text", text: "small result" }],
+});
+checkHook(
+  "small uncertain boundary result passes through untouched",
+  fe3Boundary === undefined,
+);
+
+const interrupted = await callHook("tool_call", {
+  toolCallId: "interrupted-fe",
+  toolName: "fabric_exec",
+  input: { code: `const r = await pi.read({ path: "f" }); return r;` },
+});
+checkHook("interrupted runtime-guard call starts without blocking", interrupted?.block !== true);
+await callHook("tool_execution_end", {
+  toolCallId: "interrupted-fe",
+  toolName: "fabric_exec",
+  isError: true,
+});
+const afterInterrupted = await callHook("tool_result", {
+  toolCallId: "fabric_after_interrupted",
+  toolName: "read",
+  input: { path: "later.txt" },
+  content: [{ type: "text", text: BIG }],
+});
+checkHook("execution_end cleanup prevents a stale intermediate scope", afterInterrupted?.details?.ce_offloaded === true);
+
+const strictCwd = "/tmp/pi-ce-strict-" + Date.now();
+mkdirSync(join(strictCwd, ".pi"), { recursive: true });
+writeFileSync(join(strictCwd, ".pi", "context-engineer.json"), JSON.stringify({ strict: true }));
+const blocked = await callHook("tool_call", {
+  toolCallId: "strict-fe",
+  toolName: "fabric_exec",
+  input: { code: `const r = await pi.read({ path: "f" }); return r;` },
+}, strictCwd);
+checkHook("strict mode still blocks raw passthrough", blocked?.block === true);
+writeFileSync(join(strictCwd, ".pi", "context-engineer.json"), JSON.stringify({ strict: false }));
+const futureMtime = new Date(Date.now() + 2000);
+utimesSync(join(strictCwd, ".pi", "context-engineer.json"), futureMtime, futureMtime);
+const afterConfigReload = await callHook("tool_call", {
+  toolCallId: "reloaded-fe",
+  toolName: "fabric_exec",
+  input: { code: `const r = await pi.read({ path: "f" }); return r;` },
+}, strictCwd);
+checkHook("updated project config applies without extension reload", afterConfigReload?.block !== true);
+await callHook("tool_result", {
+  toolCallId: "reloaded-fe",
+  toolName: "fabric_exec",
+  input: { code: `const r = await pi.read({ path: "f" }); return r;` },
+  content: [{ type: "text", text: "reloaded" }],
+}, strictCwd);
 const postBlock = await callHook("tool_result", {
   toolCallId: "postblock1",
   toolName: "bash",
   input: { cmd: "cat big" },
   content: [{ type: "text", text: BIG }],
-});
-checkHook("blocked program did not suppress boundary offload", postBlock?.details?.ce_offloaded === true);
+}, strictCwd);
+checkHook("strict block does not suppress later boundary offload", postBlock?.details?.ce_offloaded === true);
 
 // ---- Test ctx_read self-cap (recursive offload fix) ----
 
@@ -309,16 +419,60 @@ if (ctxReadDef) {
   const p1 = JSON.parse(out1.content[0].text);
   checkCtl(
     "default ranged read stays under the 8KB threshold",
-    p1.bytesRead < 8192 && p1.truncated === true && p1.totalBytes === Buffer.byteLength(payload),
+    Buffer.byteLength(out1.content[0].text, "utf8") < 8192 && p1.bytesRead < 8192 && p1.offset === 0 && p1.nextOffset === p1.bytesRead && p1.truncated === true && p1.totalBytes === Buffer.byteLength(payload),
     `bytesRead=${p1.bytesRead}, totalBytes=${p1.totalBytes}`
+  );
+  const ctxReadMessage = {
+    role: "toolResult",
+    toolCallId: "t1",
+    toolName: "ctx_read",
+    content: out1.content,
+    details: out1.details,
+    isError: false,
+    timestamp: Date.now(),
+  };
+  await callHook("context", { messages: [ctxReadMessage] }, capCwd);
+  const repeatedReadContext = await callHook("context", { messages: [ctxReadMessage] }, capCwd);
+  checkCtl(
+    "used ctx_read output compacts while retaining its source handle",
+    String(repeatedReadContext?.messages?.[0]?.content?.[0]?.text).includes(capEntry.id) &&
+      String(repeatedReadContext?.messages?.[0]?.content?.[0]?.text).includes("offset: 0"),
+  );
+  const outNext = await ctxReadDef.execute(
+    "t1-next",
+    { id: capEntry.id, offset: p1.nextOffset, length: 256 },
+    undefined,
+    undefined,
+    { cwd: capCwd },
+  );
+  const pNext = JSON.parse(outNext.content[0].text);
+  checkCtl(
+    "nextOffset can be copied directly into the following page",
+    pNext.offset === p1.nextOffset && pNext.nextOffset === p1.nextOffset + 256,
   );
 
   const out2 = await ctxReadDef.execute("t2", { id: capEntry.id, query: "needle" }, undefined, undefined, { cwd: capCwd });
   const p2 = JSON.parse(out2.content[0].text);
   checkCtl(
-    "query-mode output stays under the threshold",
-    p2.content.length < 8192 && p2.truncated === true,
-    `contentChars=${p2.content.length}, matches=${p2.matchedLines?.length}`
+    "query-mode serialized envelope stays under the threshold",
+    Buffer.byteLength(out2.content[0].text, "utf8") < 8192 &&
+      p2.content.length < 8192 &&
+      p2.truncated === true &&
+      p2.matchedLines?.length <= 64 &&
+      p2.totalMatches === 4000,
+    `serializedBytes=${Buffer.byteLength(out2.content[0].text, "utf8")}, contentChars=${p2.content.length}, sampledMatches=${p2.matchedLines?.length}, totalMatches=${p2.totalMatches}`
+  );
+  const outLimitedMatches = await ctxReadDef.execute(
+    "t2-limited",
+    { id: capEntry.id, query: "needle", maxMatches: 5 },
+    undefined,
+    undefined,
+    { cwd: capCwd },
+  );
+  const pLimitedMatches = JSON.parse(outLimitedMatches.content[0].text);
+  checkCtl(
+    "maxMatches bounds formatted windows while preserving the exact total",
+    pLimitedMatches.matchedLines?.length === 5 && pLimitedMatches.totalMatches === 4000,
   );
 }
 
@@ -405,9 +559,24 @@ const adv1 = await callHook("tool_result", {
   input: { code: "return 1;" },
   content: [{ type: "text", text: "m".repeat(5000) }],
 });
+checkCtl("default runtime advisory is silent", adv1 === undefined);
+
+const advisoryCwd = "/tmp/pi-ce-advisory-" + Date.now();
+mkdirSync(join(advisoryCwd, ".pi"), { recursive: true });
+writeFileSync(
+  join(advisoryCwd, ".pi", "context-engineer.json"),
+  JSON.stringify({ runtimeAdvisoryThreshold: 4096 }),
+);
+const configuredAdvisory = await callHook("tool_result", {
+  toolCallId: "adv-configured",
+  toolName: "fabric_exec",
+  input: { code: "return 1;" },
+  content: [{ type: "text", text: "m".repeat(5000) }],
+}, advisoryCwd);
 checkCtl(
-  "5KB fabric_exec result gets a one-line advisory",
-  typeof adv1?.details?.ce_advisory === "string" && String(adv1?.content?.[0]?.text).endsWith(").").valueOf() && String(adv1?.content?.[0]?.text).includes("context-engineer"),
+  "configured 4KB threshold adds a one-line advisory",
+  typeof configuredAdvisory?.details?.ce_advisory === "string" &&
+    String(configuredAdvisory?.content?.[0]?.text).includes("context-engineer"),
 );
 const adv2 = await callHook("tool_result", {
   toolCallId: "adv2",
@@ -437,9 +606,22 @@ if (statusDef) {
   const parsed = JSON.parse(st.content[0].text);
   checkCtl(
     "ctx_status exposes thresholds and policy",
-    parsed.enabled === true && typeof parsed.readOffloadThreshold === "number" && typeof parsed.policy === "string" && typeof parsed.session?.internalTokensProcessed === "number" && typeof parsed.session?.mainTokensPrevented === "number" && typeof parsed.session?.mainTokensInjected === "number" && typeof parsed.session?.storeTokensWritten === "number",
+    parsed.enabled === true && parsed.runtimeAdvisoryThreshold === 0 && parsed.blockUnboundedReturns === false && parsed.compactStaleResults === true && typeof parsed.readOffloadThreshold === "number" && typeof parsed.policy === "string" && typeof parsed.session?.internalTokensProcessed === "number" && typeof parsed.session?.mainTokensPrevented === "number" && typeof parsed.session?.mainTokensInjected === "number" && typeof parsed.session?.storeTokensWritten === "number",
   );
 }
+
+// ---- Quiet session startup ----
+
+console.log("\n=== Session Startup UX ===\n");
+let startupNotifications = 0;
+const ui = { notify: () => { startupNotifications++; } };
+await callHook("session_start", { reason: "startup" }, capCwd, { hasUI: true, ui });
+checkCtl("session-start notification is silent by default", startupNotifications === 0);
+const notifyCwd = "/tmp/pi-ce-notify-" + Date.now();
+mkdirSync(join(notifyCwd, ".pi"), { recursive: true });
+writeFileSync(join(notifyCwd, ".pi", "context-engineer.json"), JSON.stringify({ notifyOnStart: true }));
+await callHook("session_start", { reason: "startup" }, notifyCwd, { hasUI: true, ui });
+checkCtl("session-start notification remains opt-in", startupNotifications === 1);
 
 // ---- Summary ----
 

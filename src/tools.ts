@@ -43,7 +43,7 @@ export interface ToolContext {
   /** Call a Pi core tool by name (read, bash, grep, etc.) */
   callTool: (name: string, args: Record<string, unknown>) => Promise<unknown>;
   /** Spawn a child Pi agent with a fresh context window */
-  spawnAgent: (prompt: string, opts?: { model?: string }) => Promise<string>;
+  spawnAgent: (prompt: string, opts?: { model?: string; timeoutMs?: number }) => Promise<string>;
   /** Call a model for summarization (cheaper model preferred) */
   modelCall: (prompt: string, maxTokens?: number) => Promise<string>;
 }
@@ -68,9 +68,10 @@ const ctxRead: ToolDef = {
     properties: {
       id: { type: "string", description: "The handle returned when the data was offloaded." },
       offset: { type: "integer", description: "0-based byte offset for ranged read. Defaults to 0." },
-      length: { type: "integer", description: "Bytes to read. Defaults to ~8KB." },
+      length: { type: "integer", description: "Bytes to read. Defaults to ~8KB. Ranged results include a copyable nextOffset when more remains." },
       query: { type: "string", description: "Literal substring to search for. Overrides offset/length." },
-      contextLines: { type: "integer", description: "Lines of context around each query match. Default 2." },
+      contextLines: { type: "integer", description: "Lines of context around each query match. Default 2; clamped to 0-50." },
+      maxMatches: { type: "integer", description: "Maximum matching windows to format while still reporting exact totalMatches. Default 100; maximum 500." },
     },
     required: ["id"],
   },
@@ -84,9 +85,14 @@ const ctxRead: ToolDef = {
     );
 
     if (args.query) {
+      const requestedContextLines = Number(args.contextLines);
+      const contextLines = Number.isFinite(requestedContextLines)
+        ? Math.max(0, Math.min(50, Math.floor(requestedContextLines)))
+        : undefined;
       const result = await ctx.store.read(args.id as string, {
         query: args.query as string,
-        contextLines: args.contextLines as number | undefined,
+        contextLines,
+        maxMatches: Math.max(1, Math.min(500, Math.floor(Number(args.maxMatches) || 100))),
       });
       return capContent(result, budget, "narrow the query or reduce contextLines");
     }
@@ -105,20 +111,71 @@ const ctxRead: ToolDef = {
  * sliced with an explicit note so the model knows to page or narrow instead of
  * receiving a silent truncation.
  */
-function capContent<T extends { content: string; truncated: boolean }>(
+function capContent<T extends {
+  content: string;
+  truncated: boolean;
+  bytesRead: number;
+  offset?: number;
+  nextOffset?: number;
+  matchedLines?: number[];
+  totalMatches?: number;
+}>(
   result: T,
   budget: number,
   hint: string
 ): T {
-  if (Buffer.byteLength(result.content, "utf8") <= budget) return result;
-  const prefix = Buffer.from(result.content, "utf8").subarray(0, budget).toString("utf8");
-  return {
+  // Line-number metadata can dwarf an otherwise bounded query result. Preserve
+  // a useful sample plus the exact total, then budget the serialized object the
+  // tool actually returns rather than only its content field.
+  const matchedLines = result.matchedLines;
+  const normalized = {
     ...result,
-    content:
-      prefix +
-      `\n... [ctx_read output capped at ${budget} bytes to stay out of the offload path — ${hint}]`,
-    truncated: true,
+    ...(matchedLines
+      ? {
+          matchedLines: matchedLines.slice(0, 64),
+          totalMatches: result.totalMatches ?? matchedLines.length,
+        }
+      : {}),
+  } as T;
+  const serializedBytes = (value: unknown): number =>
+    Buffer.byteLength(JSON.stringify(value), "utf8");
+  if (serializedBytes(normalized) <= budget) return normalized;
+
+  const source = Buffer.from(result.content, "utf8");
+  const isRange = typeof result.offset === "number";
+  // Ranged content starts with the payload and may end with the store's paging
+  // note. Search results use the entire formatted content as their source.
+  const sourceBytes = isRange ? Math.min(result.bytesRead, source.length) : source.length;
+  const capNote = `\n... [ctx_read output capped to stay out of the offload path — ${hint}]`;
+
+  const candidate = (bytes: number): T => {
+    const prefix = source.subarray(0, bytes).toString("utf8");
+    const visibleBytes = Buffer.byteLength(prefix, "utf8");
+    return {
+      ...normalized,
+      content: prefix + capNote,
+      bytesRead: isRange ? visibleBytes : Buffer.byteLength(prefix + capNote, "utf8"),
+      ...(isRange
+        ? { nextOffset: (result.offset ?? 0) + visibleBytes }
+        : {}),
+      truncated: true,
+    };
   };
+
+  let low = 0;
+  let high = sourceBytes;
+  let best = candidate(0);
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const next = candidate(middle);
+    if (serializedBytes(next) <= budget) {
+      best = next;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return best;
 }
 
 // ---- ctx_summarize: compress data structurally or via model ----
@@ -256,13 +313,28 @@ const ctxDelegate: ToolDef = {
     properties: {
       prompt: { type: "string", description: "The subtask prompt for the child agent." },
       model: { type: "string", description: "Optional model override for the child." },
+      maxTokens: { type: "integer", description: "Maximum estimated tokens returned to Main. Default 1200; maximum 4000." },
+      timeoutSeconds: { type: "integer", description: "Child deadline in seconds. Default 90; clamped to 10-110 so nested Fabric calls fail cleanly before its outer deadline." },
     },
     required: ["prompt"],
   },
   async handler(args, ctx) {
-    const result = await ctx.spawnAgent(args.prompt as string, { model: args.model as string | undefined });
-    return { delegated: true, result, resultTokens: Math.ceil(result.length / 4) };
-  },
+    const maxTokens = normalizeSummaryTokens(args.maxTokens ?? 1200);
+    const timeoutSeconds = Math.max(10, Math.min(110, Math.floor(Number(args.timeoutSeconds) || 90)));
+    const prompt = `${args.prompt as string}\n\nReturn only the concise final findings needed by the parent, under ${maxTokens} tokens.`;
+    const result = await ctx.spawnAgent(prompt, {
+      model: args.model as string | undefined,
+      timeoutMs: timeoutSeconds * 1000,
+    });
+    const boundedResult = capText(result, maxTokens * 4);
+    return {
+      delegated: true,
+      result: boundedResult,
+      resultTokens: Math.ceil(Buffer.byteLength(boundedResult, "utf8") / 4),
+      truncated: boundedResult.length < result.length,
+      timeoutSeconds,
+    };
+  }
 };
 
 // ---- Export all tools ----

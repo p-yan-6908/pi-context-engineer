@@ -25,7 +25,9 @@ The analyzer distinguishes:
 - `COMPRESSED` — context summaries
 - `OFFLOADED` — disk handles
 
-A source-bearing return must be **provably bounded** to cross the boundary. Scalar projections, `some()`/`every()`/`includes()`, one-item selectors such as `find()`, explicit `slice(0, N)`, Fovea `maxTokens`, summaries, and offloads establish bounds. `map()`, `filter()`, `reduce()`, `Object.entries()`/`values()`, `trim()`, `replace()`, and similar transformations can still retain the full source, so they remain blocked unless a bound is derived. Statically oversized literal returns are also blocked. The number of internal calls is no longer the primary limit: a Fabric program may make many calls when it returns a small, bounded result.
+Scalar projections, `some()`/`every()`/`includes()`, one-item selectors such as `find()`, explicit `slice(0, N)`, Fovea `maxTokens`, summaries, and offloads establish bounds. Numeric bounds survive aliases and local helper arguments, and common tool status fields such as `ok`, `exitCode`, and `truncated` are treated as scalars. `map()`, `filter()`, `reduce()`, `Object.entries()`/`values()`, `trim()`, and `replace()` can still retain the full source, so the analyzer marks them unbounded unless a later operation derives an explicit bound.
+
+By default, an uncertain source-bearing return is classified as a warning but **executes silently**. The runtime boundary guard then keeps a small actual result or offloads a large one. Use `ce_exec` when you want the static diagnostic explicitly. This avoids blocking useful work because of a conservative static approximation. Set `strict: true` or `blockUnboundedReturns: true` for fail-closed preflight. Statically certain failures such as an empty program or oversized literal remain blocked in every mode. The number of internal calls is not the primary limit: a Fabric program may make many calls when its boundary result is controlled.
 
 ### Runtime boundary guard
 
@@ -36,7 +38,7 @@ The extension preserves ordinary intermediate `pi.*` results while Fabric code i
 3. patch the structured proxy value with a handle and preview;
 4. leave already-bounded Fabric and Fovea results alone.
 
-Large final text results are likewise offloaded, but existing Fabric artifact-backed results and budgeted Fovea results are not offloaded a second time.
+Large final text results are likewise offloaded, but existing Fabric artifact-backed results and budgeted Fovea results are not offloaded a second time. Runtime size advisories are disabled by default because bounded 4–8 KB results are usually intentional; set `runtimeAdvisoryThreshold` to opt in.
 
 ### Fovea-aware selection
 
@@ -58,7 +60,7 @@ A Fovea call with `maxTokens` is classified as a budgeted `SELECT` operation. Co
 
 ### Addressable context store
 
-Stored payloads include content hashes, provenance/source, content type, creation/access timestamps, estimated tokens, and expiry. Identical payloads deduplicate. `ctx_read` supports UTF-8 byte ranges and literal line queries. By default, entries expire after one week and the store is capped at 500 MB; cleanup runs opportunistically during store activity.
+Stored payloads include content hashes, provenance/source, content type, creation/access timestamps, estimated tokens, and expiry. Identical payloads deduplicate. `ctx_read` supports UTF-8 byte ranges and literal line queries. Ranged results expose copyable `offset` / `nextOffset`; query mode formats at most 100 match windows by default (`maxMatches`, capped at 500), samples `matchedLines`, and preserves the exact `totalMatches`. The complete serialized result—not only its text field—is budgeted below the recursive-offload threshold. An offload or `ctx_read` preview remains intact for the first model call that needs it; on later calls, the non-destructive `context` hook replaces that repeated text with a one-line handle recipe. The full payload remains re-readable, and session history is never rewritten. By default, entries expire after one week and the store is capped at 500 MB; cleanup runs opportunistically during store activity.
 
 ### Telemetry
 
@@ -121,7 +123,7 @@ The registered tools are callable directly by the model and inside Fabric throug
 - `ctx_read` — select a range or literal matches from a stored handle
 - `ctx_summarize` — free structural/code compression or isolated no-tools model compression
 - `ctx_remember` / `ctx_recall` — durable project facts with bounded recall
-- `ctx_delegate` — isolated child Pi fallback for separable tasks
+- `ctx_delegate` — isolated child Pi fallback with bounded output and a nested-safe deadline
 - `ctx_offload` — manual Write operation
 - `ctx_status` — current policy thresholds and observed savings
 - `ce_exec` — explicit static preflight (`PASS`, `WARN`, or `BLOCK`)
@@ -136,18 +138,27 @@ Create `.pi/context-engineer.json` in a project when needed:
 {
   "enabled": true,
   "strict": false,
+  "blockUnboundedReturns": false,
   "maxReturnTokens": 4000,
   "readOffloadThreshold": 8192,
   "nestedResultThreshold": 8192,
   "offloadPreviewBytes": 1024,
+  "runtimeAdvisoryThreshold": 0,
+  "compactStaleResults": true,
+  "notifyOnStart": false,
   "storeMaxBytes": 500000000,
   "storeTtlMs": 604800000
 }
 ```
 
-Unless overridden with a shorter TTL or lower budget, global defaults are one week (`604800000` ms) and 500 MB (`500000000` bytes). Configured storage budgets cannot exceed the 500 MB cap. Cleanup is not a background daemon; expired and over-budget entries are removed on later store writes, while reads remove an individual expired entry.
+Project configuration is re-read when the file's modification time changes, so tuning does not require an extension reload. `/ce settings` shows effective values, including defaults.
 
-`strict` turns soft warnings, such as oversized estimated returns, into blocks. Hard raw/encoded/unknown data-flow violations are blocked by default.
+- `strict` or `blockUnboundedReturns` restores fail-closed static enforcement.
+- `runtimeAdvisoryThreshold: 0` disables repetitive size nudges; use a positive byte threshold to opt in.
+- `compactStaleResults` controls automatic compaction of already-used, addressable previews.
+- `notifyOnStart` controls the session-start toast, which is off by default.
+
+Unless overridden with a shorter TTL or lower budget, store defaults are one week (`604800000` ms) and 500 MB (`500000000` bytes). Configured storage budgets cannot exceed the 500 MB cap. Cleanup is not a background daemon; expired and over-budget entries are removed on later store writes, while reads remove an individual expired entry.
 
 ## Install in Pi
 
@@ -194,9 +205,9 @@ npm ci
 npm test
 ```
 
-The test suite includes 32 static data-flow cases and live hook probes covering:
+The test suite includes more than 50 static data-flow cases plus live hook probes covering:
 
-- aliases and destructuring
+- aliases, destructuring, scalar result fields, numeric bounds passed through local helpers, and paging metadata
 - `String`/`JSON.stringify` false reductions
 - unknown helper arguments
 - callback projections and identity maps
@@ -204,9 +215,9 @@ The test suite includes 32 static data-flow cases and live hook probes covering:
 - bounded and unbounded Fovea calls
 - nested Fabric provider proxies
 - intermediate-result preservation
-- automatic offload and self-capping `ctx_read`
-- deterministic `ctx_summarize` structural/code modes and invalid-mode rejection
-- content deduplication and UTF-8 ranges
+- automatic final offload, one-use addressable previews, stale-result context compaction, serialized `ctx_read` envelope caps, and bounded query work
+- runtime-first versus strict preflight, bounded delegation, and deterministic `ctx_summarize` modes
+- content deduplication, UTF-8 ranges, and ripgrep-only brace parse repair
 
 ## License
 

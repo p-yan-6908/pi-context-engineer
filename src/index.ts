@@ -5,7 +5,7 @@
  *
  * 1. fabric_exec interception (Fix 2)
  *    Hook `tool_call` for fabric_exec. Run the analyzer before execution.
- *    Block source-bearing returns without provable bounds; let bounded programs through.
+ *    Warn and execute uncertain returns by default; strict mode blocks them.
  *
  * 2. grep auto-repair (Fix 1 → auto-repair, not block)
  *    Hook `tool_call` for grep. Detect regex patterns that will fail
@@ -22,7 +22,7 @@
  * the model to use directly.
  */
 
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -40,8 +40,12 @@ interface CeConfig extends WrapperOptions {
   /** UTF-8 bytes before text results are auto-offloaded. Default: 8192. */
   readOffloadThreshold?: number;
   /** fabric_exec boundary results at or above this size get a one-line
-   *  advisory instead of silence. Default: 4096. Set to 0 to disable. */
+   *  advisory instead of silence. Default: 0 (disabled). */
   runtimeAdvisoryThreshold?: number;
+  /** Compact addressable offload/ctx_read previews after one model call. Default: true. */
+  compactStaleResults?: boolean;
+  /** Show an activation notification at each session start. Default: false. */
+  notifyOnStart?: boolean;
   /** Nested Fabric provider threshold. Defaults to readOffloadThreshold. */
   nestedResultThreshold?: number;
   /** UTF-8 preview bytes retained in an offload handle message. Default: 1024. */
@@ -137,7 +141,7 @@ function strategyForTool(toolName: string): "WRITE" | "SELECT" | "COMPRESS" | "I
   return "PASS";
 }
 
-function formatHandleText(id: string, bytes: number, estimatedTokens: number, text: string, previewBytes: number, warning?: string): string {
+function formatHandleText(id: string, bytes: number, estimatedTokens: number, text: string, previewBytes: number): string {
   const raw = Buffer.from(text, "utf8");
   const preview = raw.subarray(0, previewBytes).toString("utf8");
   const truncated = raw.length > previewBytes;
@@ -145,7 +149,55 @@ function formatHandleText(id: string, bytes: number, estimatedTokens: number, te
     `[offloaded to handle "${id}" — ${bytes} bytes, ~${estimatedTokens} tokens]\n` +
     `Preview (first ${previewBytes} bytes):\n${preview}` +
     (truncated ? `\n... [${raw.length - previewBytes} more bytes — use extensions.ctx_read({ id: "${id}", offset: 0, length: 2048 }) to inspect; use query for a literal match]` : "");
-  return warning ? `${warning}\n\n${handle}` : handle;
+  return handle;
+}
+
+interface AddressableContextResult {
+  identity: string;
+  handle: string;
+  toolName: string;
+  readOffset: number;
+}
+
+function addressableContextResult(message: unknown): AddressableContextResult | undefined {
+  const record = asRecord(message);
+  if (record?.role !== "toolResult") return undefined;
+  const details = asRecord(record.details);
+  const toolName = typeof record.toolName === "string" ? record.toolName : "tool";
+  let handle = typeof details?.ce_handle === "string" ? details.ce_handle : undefined;
+  let readOffset = 0;
+  if (!handle && toolName === "ctx_read") {
+    const result = asRecord(details?.result);
+    if (typeof result?.id === "string") handle = result.id;
+    if (typeof result?.offset === "number" && Number.isFinite(result.offset)) readOffset = Math.max(0, result.offset);
+  }
+  if (!handle) return undefined;
+  const toolCallId = typeof record.toolCallId === "string" ? record.toolCallId : handle;
+  return { identity: `${toolCallId}:${handle}`, handle, toolName, readOffset };
+}
+
+function compactAddressableContextMessage<T>(
+  message: T,
+  exposed: Set<string>,
+): { message: T; changed: boolean } {
+  const addressable = addressableContextResult(message);
+  if (!addressable) return { message, changed: false };
+  if (!exposed.has(addressable.identity)) {
+    exposed.add(addressable.identity);
+    return { message, changed: false };
+  }
+
+  const record = message as unknown as Record<string, unknown>;
+  const originalContent = Array.isArray(record.content) ? record.content : [];
+  const nonText = originalContent.filter((item) => asRecord(item)?.type !== "text");
+  const text = addressable.toolName === "ctx_read"
+    ? `[ctx_read output compacted after use — source handle "${addressable.handle}" remains available; call extensions.ctx_read({ id: "${addressable.handle}", offset: ${addressable.readOffset}, length: 2048 }) or use a literal query to inspect again.]`
+    : `[offloaded preview compacted after use — handle "${addressable.handle}"; call extensions.ctx_read({ id: "${addressable.handle}", offset: 0, length: 2048 }) to inspect again.]`;
+  const compacted = {
+    ...record,
+    content: [{ type: "text", text }, ...nonText],
+  } as unknown as T;
+  return { message: compacted, changed: true };
 }
 
 // ---- Regex auto-repair (Fix 1) ----
@@ -159,19 +211,54 @@ function formatHandleText(id: string, bytes: number, estimatedTokens: number, te
  *   - Unescaped ) at end: loadLocalCart( → loadLocalCart\(
  *   - {} interpreted as quantifier: state.cart = {}; → state\.cart\s*=\s*\{\};
  *
- * Strategy: repair only patterns that cannot compile as regular expressions
- * (plus the {} edge case, which JS accepts as a literal but rg rejects as a
- * quantifier). Valid regexes are left untouched: a failed rg parse is loud
- * feedback the model can act on, while a wrongly literalized search fails
- * silently with plausible-looking zero-match results.
+ * Strategy: repair only patterns that cannot compile as regular expressions.
+ * JavaScript accepts some lone opening braces as literals while ripgrep treats
+ * them as malformed quantifiers, so check rg-compatible brace forms too. Valid
+ * regexes are left untouched: a wrongly literalized search fails silently with
+ * plausible-looking zero-match results.
  */
+function hasInvalidRipgrepBrace(pattern: string): boolean {
+  let inCharacterClass = false;
+  for (let index = 0; index < pattern.length; index++) {
+    const char = pattern[index];
+    if (char === "\\") {
+      // Rust regex uses braces in Unicode/codepoint escapes such as \p{L} and
+      // \x{41}; skip their complete escaped body as well as ordinary escapes.
+      const escaped = pattern[index + 1];
+      if ((escaped === "p" || escaped === "P" || escaped === "x") && pattern[index + 2] === "{") {
+        const close = pattern.indexOf("}", index + 3);
+        if (close >= 0) {
+          index = close;
+          continue;
+        }
+      }
+      index++;
+      continue;
+    }
+    if (char === "[" && !inCharacterClass) {
+      inCharacterClass = true;
+      continue;
+    }
+    if (char === "]" && inCharacterClass) {
+      inCharacterClass = false;
+      continue;
+    }
+    if (char !== "{" || inCharacterClass) continue;
+
+    const quantifier = pattern.slice(index).match(/^\{\d+(?:,\d*)?\}/)?.[0];
+    if (!quantifier) return true;
+    index += quantifier.length - 1;
+  }
+  return false;
+}
+
 export function isLikelyRegexParseError(pattern: string): boolean {
   try {
     new RegExp(pattern);
   } catch {
     return true;
   }
-  return /(^|[^\\])\{\}/.test(pattern);
+  return hasInvalidRipgrepBrace(pattern);
 }
 
 export function repairGrepInput(input: Record<string, unknown>): { repaired: boolean; reason: string } {
@@ -190,7 +277,7 @@ export function repairGrepInput(input: Record<string, unknown>): { repaired: boo
   return {
     repaired: true,
     reason: `Pattern "${pattern.slice(0, 60)}" does not compile as a regular expression ` +
-      "(unescaped special chars or empty {} quantifier braces). " +
+      "(unescaped special chars or malformed ripgrep quantifier braces). " +
       "Set literal=true to search for the literal text instead of a regex. " +
       "If you need regex, escape special chars: \\( \\) \\{ \\} \\[ \\].",
   };
@@ -199,18 +286,18 @@ export function repairGrepInput(input: Record<string, unknown>): { repaired: boo
 // ---- Extension setup ----
 
 export default function contextEngineer(pi: ExtensionAPI): void {
-  const configCache = new Map<string, CeConfig>();
+  const configCache = new Map<string, { mtimeMs: number; config: CeConfig }>();
 
   const configFor = (cwd: string): CeConfig => {
+    const configPath = resolve(cwd, ".pi", "context-engineer.json");
+    let mtimeMs = -1;
+    try { mtimeMs = statSync(configPath).mtimeMs; } catch { /* no project config */ }
     const hit = configCache.get(cwd);
-    if (hit) return hit;
-    const cfg = loadConfig(cwd);
-    configCache.set(cwd, cfg);
-    return cfg;
+    if (hit?.mtimeMs === mtimeMs) return hit.config;
+    const config = loadConfig(cwd);
+    configCache.set(cwd, { mtimeMs, config });
+    return config;
   };
-
-  // WARN decisions are attached to the corresponding tool result.
-  const pendingWarnings = new Map<string, string>();
 
   // Track parent executions by their stable toolCallId. Fabric-generated
   // nested IDs carry the documented `fabric_` prefix, so overlapping programs
@@ -218,6 +305,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   // unrelated result.
   const fabricExecutions = new FabricExecutionScopes();
   const telemetry = new ContextTelemetry();
+  const exposedAddressableResults = new Set<string>();
 
   const storeFor = (cwd: string, cfg: CeConfig): ContextStore => new ContextStore(
     cwd,
@@ -225,14 +313,30 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     { maxBytes: cfg.storeMaxBytes, ttlMs: cfg.storeTtlMs },
   );
 
+  // Addressable previews are useful on the first model call, but paying for
+  // them on every later call wastes context. Context events receive a deep
+  // copy, so this never rewrites session history or loses the stored payload.
+  pi.on("context", async (event, ctx) => {
+    const cfg = configFor(ctx.cwd);
+    if (cfg.enabled === false || cfg.compactStaleResults === false) return undefined;
+
+    let changed = false;
+    const messages = event.messages.map((message) => {
+      const compacted = compactAddressableContextMessage(message, exposedAddressableResults);
+      changed ||= compacted.changed;
+      return compacted.message;
+    });
+    return changed ? { messages } : undefined;
+  });
+
   // ================================================================
   // Fix 2: Intercept fabric_exec via tool_call hook
   // ================================================================
   //
   // This is the primary enforcement. When the model calls fabric_exec,
   // we intercept the program BEFORE it runs. If the analyzer detects a
-  // passthrough (raw tool result returned with no processing), we block
-  // execution and return guidance.
+  // passthrough (raw tool result returned with no processing), runtime-first
+  // mode executes under the actual boundary guard; strict mode blocks.
 
   pi.on("tool_call", async (event, ctx) => {
     if (event.toolName !== "fabric_exec") return undefined;
@@ -268,10 +372,6 @@ export default function contextEngineer(pi: ExtensionAPI): void {
       };
     }
 
-    if (decision.tier === "WARN") {
-      pendingWarnings.set(event.toolCallId, decision.guidance);
-    }
-
     // PASS and WARN both execute; track the execution so tool_result can tell
     // model-boundary results apart from intermediate ones. BLOCK does not
     // execute, so it must not open a scope.
@@ -283,6 +383,13 @@ export default function contextEngineer(pi: ExtensionAPI): void {
 
     // WARN is annotated in the tool_result hook.
     return undefined;
+  });
+
+  // A later extension can block a call after CE preflight. Always close any
+  // optimistic scope at lifecycle end even when no tool_result fired.
+  pi.on("tool_execution_end", async (event) => {
+    if (event.toolName !== "fabric_exec") return;
+    fabricExecutions.finish(event.toolCallId);
   });
 
   // ================================================================
@@ -332,9 +439,6 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     const isIntermediate = !isFabricExecResult && (
       fabricProxy !== undefined || fabricExecutions.isNestedToolResult(event.toolCallId)
     );
-
-    const warning = pendingWarnings.get(event.toolCallId);
-    if (warning) pendingWarnings.delete(event.toolCallId);
 
     if (isIntermediate && !fabricProxy) {
       // Leave ordinary intermediate Pi results byte-for-byte untouched: an
@@ -387,7 +491,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         originalTokens: offloaded.estimatedTokens,
         preview: Buffer.from(serialized, "utf8").subarray(0, previewBytes).toString("utf8"),
       };
-      const nestedText = formatHandleText(offloaded.id, offloaded.bytes, offloaded.estimatedTokens, serialized, previewBytes, warning);
+      const nestedText = formatHandleText(offloaded.id, offloaded.bytes, offloaded.estimatedTokens, serialized, previewBytes);
       telemetry.record(ctx.cwd, {
         strategy: "WRITE",
         tool: event.toolName,
@@ -414,9 +518,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
       (c): c is { type: "text"; text: string } => c.type === "text" && typeof (c as { text?: string }).text === "string"
     );
 
-    if (!textContent) {
-      return warning ? { details: { ...existingDetails, ce_warning: warning } } : undefined;
-    }
+    if (!textContent) return undefined;
 
     const text = textContent.text;
     const alreadyOffloaded =
@@ -428,7 +530,6 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     // Errors, small results, already-offloaded results, and provider-bounded
     // results are not rewritten; CE should not stack a second budget/artifact.
 
-    // they may still receive a pending analyzer warning.
     // ctx_read caps its own output below the threshold (see tools.ts); letting
     // the hook rewrite it would chain handles recursively and make stored
     // payloads effectively unreachable.
@@ -445,13 +546,13 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         });
       }
       // Runtime feedback loop: sub-threshold fabric_exec returns that are
-      // still large get a one-line advisory instead of silence. The static
-      // gate only blocks direct passthroughs; this catches "reduced but
-      // still heavy" returns so the model can adjust on its next program.
+      // still large can get an opt-in one-line advisory. This catches
+      // "reduced but still heavy" returns without adding default noise.
+      const advisoryThreshold = cfg.runtimeAdvisoryThreshold ?? 0;
       if (
-        !warning &&
         event.toolName === "fabric_exec" &&
-        textBytes >= (cfg.runtimeAdvisoryThreshold ?? 4096)
+        advisoryThreshold > 0 &&
+        textBytes >= advisoryThreshold
       ) {
         const advisory = runtimeAdvisoryLine(textBytes);
         const content = event.content.map((item) =>
@@ -459,15 +560,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         );
         return { content, details: { ...existingDetails, ce_advisory: advisory } };
       }
-      if (!warning) return undefined;
-      const replacementText = `${warning}\n\n${text}`;
-      const content = event.content.map((item) =>
-        item.type === "text" ? { ...item, text: item === textContent ? replacementText : item.text } : item
-      );
-      return {
-        content,
-        details: { ...existingDetails, ce_warning: warning },
-      };
+      return undefined;
     }
 
     // Build a descriptive key from the tool + input.
@@ -476,7 +569,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     const store = storeFor(ctx.cwd, cfg);
     const offloaded = store.write(key, event.toolName, text);
     const previewBytes = Math.max(256, Math.min(4096, cfg.offloadPreviewBytes ?? PREVIEW_BYTES));
-    const replacementText = formatHandleText(offloaded.id, offloaded.bytes, offloaded.estimatedTokens, text, previewBytes, warning);
+    const replacementText = formatHandleText(offloaded.id, offloaded.bytes, offloaded.estimatedTokens, text, previewBytes);
     telemetry.record(ctx.cwd, {
       strategy: "WRITE",
       tool: event.toolName,
@@ -495,7 +588,6 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     return {
       content,
       details: {
-        ...(warning ? { ce_warning: warning } : {}),
         ce_offloaded: true,
         ce_handle: offloaded.id,
         ce_original_bytes: offloaded.bytes,
@@ -546,13 +638,13 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           spawnAgent: (prompt, opts) => runChildPi(prompt, {
             cwd: execCtx.cwd,
             model: opts?.model ?? currentModel,
-            timeoutMs: 180_000,
+            timeoutMs: opts?.timeoutMs ?? 90_000,
           }),
           modelCall: (prompt, _maxTokens) => runChildPi(prompt, {
             cwd: execCtx.cwd,
             model: currentModel,
             noTools: true,
-            timeoutMs: 120_000,
+            timeoutMs: 90_000,
           }),
         };
 
@@ -654,16 +746,20 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     async execute(_id, _params, _signal, _onUpdate, execCtx) {
       const cfg = configFor(execCtx.cwd);
       const summary = telemetry.summary(execCtx.cwd, false);
+      const effectiveReadThreshold = cfg.readOffloadThreshold ?? READ_OFFLOAD_THRESHOLD;
       const body = {
         enabled: cfg.enabled !== false,
         strict: cfg.strict ?? false,
-        readOffloadThreshold: cfg.readOffloadThreshold ?? READ_OFFLOAD_THRESHOLD,
-        runtimeAdvisoryThreshold: cfg.runtimeAdvisoryThreshold ?? 4096,
+        readOffloadThreshold: effectiveReadThreshold,
+        runtimeAdvisoryThreshold: cfg.runtimeAdvisoryThreshold ?? 0,
+        blockUnboundedReturns: cfg.strict === true || cfg.blockUnboundedReturns === true,
+        compactStaleResults: cfg.compactStaleResults !== false,
+        notifyOnStart: cfg.notifyOnStart === true,
         offloadPreviewBytes: Math.max(256, Math.min(4096, cfg.offloadPreviewBytes ?? PREVIEW_BYTES)),
         storeTtlMs: cfg.storeTtlMs ?? DEFAULT_CONTEXT_STORE_TTL_MS,
         storeMaxBytes: Math.min(MAX_CONTEXT_STORE_BYTES, cfg.storeMaxBytes ?? MAX_CONTEXT_STORE_BYTES),
         maxReturnTokens: cfg.maxReturnTokens ?? 4000,
-        policy: "blocks source-bearing returns without a provable bound; bounded selectors/compression pass; 4KB+ advisory; 8KB+ auto-offload; previews are independently bounded",
+        policy: `runtime guard executes uncertain programs and auto-offloads actual ${effectiveReadThreshold}-byte+ boundary results; strict/blockUnboundedReturns restores fail-closed preflight; stale addressable previews compact after first use`,
         session: summary,
       };
       return {
@@ -782,12 +878,29 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           ? "No Context Engineer events recorded."
           : events.map((event) => `${event.timestamp.slice(11, 19)} ${event.strategy.padEnd(8)} ${event.tool} internal=${event.internalTokensProcessed} prevented=${event.mainTokensPrevented} injected=${event.mainTokensInjected} store=${event.storeTokensWritten}${event.note ? ` — ${event.note}` : ""}`).join("\n");
       } else if (command === "settings") {
-        message = JSON.stringify(configFor(ctx.cwd), null, 2);
+        const cfg = configFor(ctx.cwd);
+        message = JSON.stringify({
+          enabled: cfg.enabled !== false,
+          strict: cfg.strict ?? false,
+          blockUnboundedReturns: cfg.strict === true || cfg.blockUnboundedReturns === true,
+          maxReturnTokens: cfg.maxReturnTokens ?? 4000,
+          readOffloadThreshold: cfg.readOffloadThreshold ?? READ_OFFLOAD_THRESHOLD,
+          nestedResultThreshold: cfg.nestedResultThreshold ?? cfg.readOffloadThreshold ?? READ_OFFLOAD_THRESHOLD,
+          runtimeAdvisoryThreshold: cfg.runtimeAdvisoryThreshold ?? 0,
+          offloadPreviewBytes: Math.max(256, Math.min(4096, cfg.offloadPreviewBytes ?? PREVIEW_BYTES)),
+          compactStaleResults: cfg.compactStaleResults !== false,
+          notifyOnStart: cfg.notifyOnStart === true,
+          storeMaxBytes: Math.min(MAX_CONTEXT_STORE_BYTES, cfg.storeMaxBytes ?? MAX_CONTEXT_STORE_BYTES),
+          storeTtlMs: cfg.storeTtlMs ?? DEFAULT_CONTEXT_STORE_TTL_MS,
+        }, null, 2);
       } else if (command === "explain") {
+        const cfg = configFor(ctx.cwd);
+        const effectiveReadThreshold = cfg.readOffloadThreshold ?? READ_OFFLOAD_THRESHOLD;
         message = [
           "Context Engineer is the context governor above Fabric and Fovea.",
-          "The gate hard-blocks source-bearing returns without a provable context bound; transformations alone are not trusted.",
-          "Explicit scalar projections, bounded slices/selections, summaries, and offloads pass; 4KB+ gets a nudge and 8KB+ is auto-offloaded.",
+          `The default runtime guard executes statically uncertain programs, keeps small results, and offloads actual ${effectiveReadThreshold}-byte+ boundary payloads.`,
+          "Set strict=true or blockUnboundedReturns=true for fail-closed preflight. Explicit scalar projections, bounded selections, summaries, and offloads pass silently.",
+          "Addressable offload and ctx_read previews stay visible for one model call, then compact to a re-readable handle reference.",
           "extensions.ctx_status reports thresholds and savings; extensions.ce_exec pre-checks a program.",
           "Use /ce status, /ce trace, /ce settings, or /ce status --all.",
         ].join("\n");
@@ -808,11 +921,12 @@ export default function contextEngineer(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     fabricExecutions.clear();
+    exposedAddressableResults.clear();
     const cfg = configFor(ctx.cwd);
     if (cfg.enabled === false) return;
-    if (ctx.hasUI) {
+    if (ctx.hasUI && cfg.notifyOnStart === true) {
       ctx.ui.notify(
-        "context-engineer: active — taint gate, nested Fabric guard, Fovea-aware budgets, /ce status",
+        "context-engineer: active — runtime boundary guard, addressable context, /ce status",
         "info"
       );
     }

@@ -75,6 +75,8 @@ interface Flow {
   /** Upper bound on source retention; unbounded flows are always 1. */
   retention: number;
   operation: string;
+  /** Statically known numeric constants survive aliases and helper arguments. */
+  constantNumber?: number;
 }
 
 interface FunctionLike {
@@ -96,8 +98,8 @@ const FOVEA_TOOL = /^(?:fovea_(?:sketch|focus|dwell|impact)|extensions\.fovea_(?
 const UNSAFE_KINDS = new Set<TaintKind>(["raw", "encoded", "unknown"]);
 const REDUCING_KINDS = new Set<TaintKind>(["projected", "selected", "aggregated", "compressed", "offloaded"]);
 
-function cleanFlow(operation = "constant"): Flow {
-  return { kind: "clean", hasSource: false, bounded: true, meaningful: false, retention: 0, operation };
+function cleanFlow(operation = "constant", constantNumber?: number): Flow {
+  return { kind: "clean", hasSource: false, bounded: true, meaningful: false, retention: 0, operation, constantNumber };
 }
 
 function sourceFlow(kind: TaintKind = "raw", operation = "tool result", retention = 1): Flow {
@@ -192,9 +194,15 @@ function combine(flows: Flow[], operation: string): Flow {
   };
 }
 
+const SCALAR_RESULT_PROPERTIES = new Set([
+  "length", "size", "count", "lineCount", "byteLength", "bytes", "bytesRead", "totalBytes", "offset", "nextOffset",
+  "tokens", "totalTokens", "originalTokens", "estimatedTokens", "resultTokens", "summaryTokens",
+  "exitCode", "statusCode", "ok", "success", "failed", "blocked", "isError", "truncated", "cancelled",
+]);
+
 function propertyFlow(receiver: Flow, property: string): Flow {
   if (!receiver.hasSource) return cleanFlow(`property ${property}`);
-  if (["length", "size", "count", "byteLength", "estimatedTokens"].includes(property)) {
+  if (SCALAR_RESULT_PROPERTIES.has(property)) {
     return boundedFlow("projected", `scalar property ${property}`, 0.01);
   }
   if (["content", "data", "result", "stdout", "stderr", "text", "body", "value"].includes(property)) {
@@ -207,25 +215,43 @@ function propertyFlow(receiver: Flow, property: string): Flow {
 
 function elementFlow(receiver: Flow, index?: string): Flow {
   if (!receiver.hasSource) return cleanFlow("array element");
-  if (index === "length" || index === "size") return reducedFlow("projected", "scalar element", 0.01);
+  if (index === "length" || index === "size") return boundedFlow("projected", "scalar element", 0.01);
   return boundedFlow("selected", "select element", Math.min(receiver.retention, 0.25));
 }
 
-function literalNumber(expr: ts.Expression | undefined, sf: ts.SourceFile): number | undefined {
+function literalNumber(
+  expr: ts.Expression | undefined,
+  sf: ts.SourceFile,
+  env?: Map<string, Flow>,
+): number | undefined {
   if (!expr) return undefined;
   const value = unwrap(expr);
-  if (!ts.isNumericLiteral(value)) return undefined;
-  const number = Number(value.text);
-  return Number.isFinite(number) ? number : undefined;
+  if (ts.isNumericLiteral(value)) {
+    const number = Number(value.text);
+    return Number.isFinite(number) ? number : undefined;
+  }
+  if (ts.isPrefixUnaryExpression(value) && ts.isNumericLiteral(value.operand)) {
+    const number = Number(value.operand.text);
+    if (!Number.isFinite(number)) return undefined;
+    if (value.operator === ts.SyntaxKind.MinusToken) return -number;
+    if (value.operator === ts.SyntaxKind.PlusToken) return number;
+  }
+  if (ts.isIdentifier(value)) return env?.get(value.text)?.constantNumber;
+  return undefined;
 }
 
-function objectNumberArgument(call: ts.CallExpression, name: string, sf: ts.SourceFile): number | undefined {
+function objectNumberArgument(
+  call: ts.CallExpression,
+  name: string,
+  sf: ts.SourceFile,
+  env?: Map<string, Flow>,
+): number | undefined {
   const first = call.arguments[0];
   if (!first || !ts.isObjectLiteralExpression(first)) return undefined;
   for (const property of first.properties) {
     if (!ts.isPropertyAssignment(property)) continue;
     const key = property.name.getText(sf).replace(/["']/g, "");
-    if (key === name) return literalNumber(property.initializer, sf);
+    if (key === name) return literalNumber(property.initializer, sf, env);
   }
   return undefined;
 }
@@ -298,8 +324,8 @@ function evaluateMethodCall(
     case "substring":
     case "substr": {
       state.meaningfulTransformations++;
-      const start = literalNumber(call.arguments[0], sf);
-      const second = literalNumber(call.arguments[1], sf);
+      const start = literalNumber(call.arguments[0], sf, env);
+      const second = literalNumber(call.arguments[1], sf, env);
       // `slice(0, 10)`, `substring(0, 10)`, and `substr(0, 10)` have an
       // explicit output bound. A one-argument positive slice is a tail of
       // unbounded size and must not be treated as safe.
@@ -360,7 +386,7 @@ function evaluateCall(call: ts.CallExpression, env: Map<string, Flow>, state: Ev
     const source = args.some((flow) => flow.hasSource);
     if (/ctx_summarize|ce_summarize|summarize/.test(name)) {
       state.meaningfulTransformations++;
-      const maxTokens = objectNumberArgument(call, "maxTokens", sf);
+      const maxTokens = objectNumberArgument(call, "maxTokens", sf, env);
       return boundedFlow("compressed", "context summary", maxTokens ? Math.min(0.08, maxTokens / 10000) : 0.08);
     }
     if (/ctx_offload|ce_offload|offload/.test(name)) {
@@ -379,7 +405,7 @@ function evaluateCall(call: ts.CallExpression, env: Map<string, Flow>, state: Ev
   }
 
   if (isFoveaCall(call, sf)) {
-    const maxTokens = objectNumberArgument(call, "maxTokens", sf);
+    const maxTokens = objectNumberArgument(call, "maxTokens", sf, env);
     if (maxTokens !== undefined) {
       state.boundedSelectionCalls++;
       state.meaningfulTransformations++;
@@ -445,7 +471,13 @@ function evaluateExpression(expr: ts.Expression, env: Map<string, Flow>, state: 
 
   if (ts.isAwaitExpression(value)) return evaluateExpression(value.expression, env, state, sf);
   if (ts.isIdentifier(value)) return env.get(value.text) ?? cleanFlow(`identifier ${value.text}`);
-  if (ts.isStringLiteral(value) || ts.isNumericLiteral(value) || ts.isBigIntLiteral(value) || ts.isRegularExpressionLiteral(value)) return cleanFlow("literal");
+  if (ts.isNumericLiteral(value)) return cleanFlow("literal", Number(value.text));
+  if (ts.isPrefixUnaryExpression(value) && ts.isNumericLiteral(value.operand)) {
+    const number = Number(value.operand.text);
+    if (value.operator === ts.SyntaxKind.MinusToken) return cleanFlow("literal", -number);
+    if (value.operator === ts.SyntaxKind.PlusToken) return cleanFlow("literal", number);
+  }
+  if (ts.isStringLiteral(value) || ts.isBigIntLiteral(value) || ts.isRegularExpressionLiteral(value)) return cleanFlow("literal");
   if (value.kind === ts.SyntaxKind.TrueKeyword || value.kind === ts.SyntaxKind.FalseKeyword || value.kind === ts.SyntaxKind.NullKeyword) return cleanFlow("literal");
 
   if (ts.isTemplateExpression(value)) {

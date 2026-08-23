@@ -48,6 +48,8 @@ export interface ReadOptions {
   query?: string;
   /** Lines of context around each query match. */
   contextLines?: number;
+  /** Maximum matching windows to format while still counting every match. */
+  maxMatches?: number;
 }
 
 export interface ReadResult {
@@ -55,8 +57,14 @@ export interface ReadResult {
   totalBytes: number;
   totalTokens: number;
   bytesRead: number;
+  /** Actual byte offset used for a ranged read. */
+  offset?: number;
+  /** Copyable next byte offset when more ranged content remains. */
+  nextOffset?: number;
   content: string;
   matchedLines?: number[];
+  /** Total query matches when matchedLines is later metadata-capped. */
+  totalMatches?: number;
   truncated: boolean;
 }
 
@@ -142,21 +150,27 @@ export class ContextStore {
     const { data } = entry;
 
     if (opts.query) {
-      const contextLines = opts.contextLines ?? DEFAULT_CONTEXT_LINES;
+      const contextLines = Math.max(0, opts.contextLines ?? DEFAULT_CONTEXT_LINES);
+      const maxMatches = Math.max(1, opts.maxMatches ?? Number.MAX_SAFE_INTEGER);
       const lines = data.split("\n");
       const matches: number[] = [];
       const result: string[] = [];
+      let totalMatches = 0;
       for (let i = 0; i < lines.length; i++) {
         if (!lines[i].includes(opts.query)) continue;
+        totalMatches++;
+        if (matches.length >= maxMatches) continue;
         matches.push(i + 1);
         const start = Math.max(0, i - contextLines);
         const end = Math.min(lines.length - 1, i + contextLines);
         for (let j = start; j <= end; j++) result.push(`${j === i ? ">>" : "  "} ${j + 1}: ${lines[j]}`);
         result.push("");
       }
-      const content = matches.length === 0
+      const omitted = Math.max(0, totalMatches - matches.length);
+      const content = totalMatches === 0
         ? `No matches for "${opts.query}" in ${entry.key} (${entry.bytes} bytes).`
-        : `${matches.length} match(es) for "${opts.query}":\n${result.join("\n")}`;
+        : `${totalMatches} match(es) for "${opts.query}":\n${result.join("\n")}` +
+          (omitted > 0 ? `\n... [${omitted} additional matches counted but not formatted]` : "");
       return {
         id,
         totalBytes: entry.bytes,
@@ -164,7 +178,8 @@ export class ContextStore {
         bytesRead: Buffer.byteLength(content, "utf8"),
         content,
         matchedLines: matches,
-        truncated: false,
+        totalMatches,
+        truncated: omitted > 0,
       };
     }
 
@@ -180,7 +195,11 @@ export class ContextStore {
       totalBytes: entry.bytes,
       totalTokens: entry.estimatedTokens,
       bytesRead: Buffer.byteLength(slice, "utf8"),
-      content: truncated ? slice + `\n... [${remaining} more bytes, use ctx_read with offset to continue]` : slice,
+      offset,
+      nextOffset: truncated ? end : undefined,
+      content: truncated
+        ? slice + `\n... [${remaining} more bytes, use ctx_read with offset=${end} to continue]`
+        : slice,
       truncated,
     };
   }
