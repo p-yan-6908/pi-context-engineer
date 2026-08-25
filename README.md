@@ -71,7 +71,7 @@ contextEffectFor("extensions.ctx_summarize"); // COMPRESS bounded by maxTokens
 contextEffectFor("extensions.ctx_offload"); // OFFLOAD
 ```
 
-The registry is descriptive in this first milestone: analyzer behavior and v0.4 boundary policy remain unchanged. The analyzer now also reports `metrics.returnBound` and `metrics.returnProvenance` for literal bounds such as `4096 bytes` or `300 tokens`; aliases and arithmetic intentionally remain unknown. `explainProgram(source)` turns those fields into a structured `ProgramExplanation`, while `formatProgramExplanation(...)` provides deterministic human-readable output. The explanation distinguishes unbounded returns, bounded returns with an unknown exact maximum, and known `≤N <unit>` returns. Quantitative propagation beyond direct effects is the next v0.5 step.
+The registry is descriptive in this first milestone: analyzer behavior and v0.4 boundary policy remain unchanged. The analyzer now reports `metrics.returnBound` and `metrics.returnProvenance` for literal bounds such as `4096 bytes` or `300 tokens`; immutable numeric `const` aliases may resolve through lexical scopes, while mutable aliases, arithmetic, and dynamic expressions remain unknown. `explainProgram(source)` turns those fields into a structured `ProgramExplanation`, while `formatProgramExplanation(...)` provides deterministic human-readable output. The explanation distinguishes unbounded returns, bounded returns with an unknown exact maximum, and known `≤N <unit>` returns. Symbolic propagation beyond constant aliases is the next v0.5 step.
 
 ### Addressable context store
 

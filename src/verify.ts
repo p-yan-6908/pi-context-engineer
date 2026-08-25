@@ -10,6 +10,7 @@ import { contextEffectFor, contextEffects, isFoveaName } from "./context-effects
 import type { ResolvedBound } from "./context-effects.js";
 import { runV04Differential } from "./verify-differential.js";
 import { runExplanationChecks } from "./verify-explanation.js";
+import { runConstantAliasChecks } from "./verify-aliases.js";
 
 type TestCase = {
   name: string;
@@ -395,8 +396,8 @@ const quantitativeCases: Array<{
     effects: ["extensions.ctx_read:select"],
   },
   {
-    name: "ctx_read identifier remains unknown",
-    program: `const n = 4096; return extensions.ctx_read({ id: "handle", length: n });`,
+    name: "ctx_read mutable identifier remains unknown",
+    program: `let n = 4096; return extensions.ctx_read({ id: "handle", length: n });`,
     bound: { kind: "unknown", unit: "bytes" },
     effects: ["extensions.ctx_read:select"],
   },
@@ -500,6 +501,11 @@ console.log(`[${explanation.failed === 0 ? "ok" : "FAIL"}] explanation checks: $
 for (const failure of explanation.failures) console.log(`     ${failure}`);
 const explanationFailures = explanation.failed;
 
+const aliases = runConstantAliasChecks();
+console.log(`[${aliases.failed === 0 ? "ok" : "FAIL"}] constant alias checks: ${aliases.passed}/${aliases.passed + aliases.failed}`);
+for (const failure of aliases.failures) console.log(`     ${failure}`);
+const aliasFailures = aliases.failed;
+
 const scopes = new FabricExecutionScopes();
 scopes.start({ toolCallId: "fabric_a", workspaceRoot: "/tmp/a", startedAt: 1 });
 scopes.start({ toolCallId: "fabric_b", workspaceRoot: "/tmp/b", startedAt: 2 });
@@ -582,4 +588,4 @@ if (!delegateTool) {
   if (!delegateOk) toolFailures++;
 }
 console.log(`Tool checks: ${toolFailures === 0 ? "passed" : `${toolFailures} failed`}.`);
-process.exit(failed + wrapperFailures + toolFailures + scopeFailures + registryFailures + quantitativeFailures + differentialFailures + explanationFailures > 0 ? 1 : 0);
+process.exit(failed + wrapperFailures + toolFailures + scopeFailures + registryFailures + quantitativeFailures + differentialFailures + explanationFailures + aliasFailures > 0 ? 1 : 0);

@@ -106,6 +106,7 @@ interface EvalState {
   activeFunctions: Set<FunctionLike>;
   boundedSelectionCalls: number;
   meaningfulTransformations: number;
+  constantResolver: NumericConstantResolver;
 }
 
 const UNSAFE_KINDS = new Set<TaintKind>(["raw", "encoded", "unknown"]);
@@ -141,11 +142,12 @@ function effectStep(
   effect: ContextEffect["kind"],
   bound?: ResolvedBound,
   location?: ContextProvenanceLocation,
+  reason?: string,
 ): ContextProvenanceStep {
   return {
     operation,
     effect,
-    reason: effectReason(effect),
+    reason: reason ?? effectReason(effect),
     ...(bound === undefined ? {} : { bound }),
     ...(location === undefined ? {} : { location }),
   };
@@ -253,6 +255,120 @@ function unwrap(expr: ts.Expression): ts.Expression {
     current = current.expression;
   }
   return current;
+}
+
+interface ConstantScope {
+  parent?: ConstantScope;
+  bindings: Map<string, ConstantBinding>;
+}
+
+interface ConstantBinding {
+  mutable: boolean;
+  initializer?: ts.Expression;
+  scope: ConstantScope;
+}
+
+interface NumericConstantResolution {
+  value?: number;
+  chain: string[];
+}
+
+interface EffectBoundResolution {
+  bound?: ResolvedBound;
+  reason?: string;
+}
+
+function isLexicalScopeNode(node: ts.Node): boolean {
+  return ts.isSourceFile(node) ||
+    ts.isBlock(node) ||
+    isFunctionLikeNode(node) ||
+    ts.isForStatement(node) ||
+    ts.isForInStatement(node) ||
+    ts.isForOfStatement(node) ||
+    ts.isCatchClause(node);
+}
+
+class NumericConstantResolver {
+  private readonly scopes = new WeakMap<ts.Node, ConstantScope>();
+
+  constructor(sourceFile: ts.SourceFile) {
+    const root: ConstantScope = { bindings: new Map() };
+    this.visit(sourceFile, root, true);
+  }
+
+  resolve(expr: ts.Expression): number | undefined {
+    return this.resolveWithChain(expr).value;
+  }
+
+  resolveWithChain(expr: ts.Expression): NumericConstantResolution {
+    const scope = this.scopes.get(expr);
+    return scope ? this.resolveExpression(expr, scope, new Set<ConstantBinding>()) : { chain: [] };
+  }
+
+  private visit(node: ts.Node, parent: ConstantScope, useParent = false): void {
+    const scope = useParent ? parent : isLexicalScopeNode(node) ? { parent, bindings: new Map() } : parent;
+    this.scopes.set(node, scope);
+    if (ts.isFunctionLike(node)) {
+      this.addPattern(node.parameters[0]?.name, scope, true);
+      for (let index = 1; index < node.parameters.length; index++) this.addPattern(node.parameters[index].name, scope, true);
+    }
+    if (ts.isCatchClause(node) && node.variableDeclaration) this.addPattern(node.variableDeclaration.name, scope, true);
+    this.collectDirectDeclarations(node, scope);
+    ts.forEachChild(node, (child) => this.visit(child, scope));
+  }
+
+  private collectDirectDeclarations(node: ts.Node, scope: ConstantScope): void {
+    const collect = (current: ts.Node, isRoot: boolean): void => {
+      if (!isRoot && isLexicalScopeNode(current)) return;
+      if (ts.isVariableStatement(current)) this.addDeclarationList(current.declarationList, scope);
+      else if (ts.isVariableDeclarationList(current)) this.addDeclarationList(current, scope);
+      ts.forEachChild(current, (child) => collect(child, false));
+    };
+    collect(node, true);
+  }
+
+  private addDeclarationList(list: ts.VariableDeclarationList, scope: ConstantScope): void {
+    const mutable = (list.flags & ts.NodeFlags.Const) === 0;
+    for (const declaration of list.declarations) {
+      this.addPattern(declaration.name, scope, mutable, ts.isIdentifier(declaration.name) ? declaration.initializer : undefined);
+    }
+  }
+
+  private addPattern(pattern: ts.BindingName | undefined, scope: ConstantScope, mutable: boolean, initializer?: ts.Expression): void {
+    if (!pattern) return;
+    if (ts.isIdentifier(pattern)) {
+      scope.bindings.set(pattern.text, { mutable, initializer, scope });
+      return;
+    }
+    for (const element of pattern.elements) {
+      if (ts.isBindingElement(element)) this.addPattern(element.name, scope, true);
+    }
+  }
+
+  private resolveExpression(expr: ts.Expression, scope: ConstantScope, seen: Set<ConstantBinding>): NumericConstantResolution {
+    const value = unwrap(expr);
+    if (ts.isNumericLiteral(value)) {
+      const number = Number(value.text.replace(/_/g, ""));
+      return Number.isFinite(number) ? { value: number, chain: [] } : { chain: [] };
+    }
+    if (!ts.isIdentifier(value)) return { chain: [] };
+    const binding = this.lookup(scope, value.text);
+    if (!binding || binding.mutable || !binding.initializer || seen.has(binding)) return { chain: [] };
+    seen.add(binding);
+    const resolved = this.resolveExpression(binding.initializer, binding.scope, seen);
+    seen.delete(binding);
+    return resolved.value === undefined ? resolved : { value: resolved.value, chain: [value.text, ...resolved.chain] };
+  }
+
+  private lookup(scope: ConstantScope, name: string): ConstantBinding | undefined {
+    let current: ConstantScope | undefined = scope;
+    while (current) {
+      const binding = current.bindings.get(name);
+      if (binding) return binding;
+      current = current.parent;
+    }
+    return undefined;
+  }
 }
 
 function combine(flows: Flow[], operation: string, preserveSingleBound = false): Flow {
@@ -366,26 +482,32 @@ function objectLiteralNumberArgument(
   call: ts.CallExpression,
   name: string,
   sf: ts.SourceFile,
-): number | undefined {
+  resolver: NumericConstantResolver,
+): NumericConstantResolution {
   const first = call.arguments[0];
-  if (!first || !ts.isObjectLiteralExpression(first)) return undefined;
+  if (!first || !ts.isObjectLiteralExpression(first)) return { chain: [] };
   for (const property of first.properties) {
     if (!ts.isPropertyAssignment(property)) continue;
     const key = property.name.getText(sf).replace(/["']/g, "");
     if (key !== name) continue;
-    const value = unwrap(property.initializer);
-    if (!ts.isNumericLiteral(value)) return undefined;
-    const number = Number(value.text);
-    return Number.isFinite(number) ? number : undefined;
+    return resolver.resolveWithChain(property.initializer);
   }
-  return undefined;
+  return { chain: [] };
 }
 
-function resolveEffectBound(call: ts.CallExpression, effect: ContextEffect, sf: ts.SourceFile): ResolvedBound | undefined {
+function resolveEffectBound(call: ts.CallExpression, effect: ContextEffect, sf: ts.SourceFile, resolver: NumericConstantResolver): EffectBoundResolution {
   const declaration = effect.kind === "select" || effect.kind === "compress" ? effect.bound : undefined;
-  if (!declaration) return undefined;
-  const value = objectLiteralNumberArgument(call, declaration.name, sf);
-  return value === undefined ? unknownBound(declaration.unit) : constantBound(value, declaration.unit);
+  if (!declaration) return {};
+  const resolution = objectLiteralNumberArgument(call, declaration.name, sf, resolver);
+  const bound = resolution.value === undefined
+    ? unknownBound(declaration.unit)
+    : constantBound(resolution.value, declaration.unit);
+  const reason = resolution.value === undefined
+    ? `${declaration.name} has no provable numeric constant (${declaration.unit}).`
+    : resolution.chain.length > 0
+      ? `${declaration.name} resolves through ${resolution.chain.join(" → ")} = ${resolution.value} ${declaration.unit}.`
+      : `${declaration.name} resolves to literal ${resolution.value} ${declaration.unit}.`;
+  return { bound, reason };
 }
 
 function callArgs(call: ts.CallExpression, env: Map<string, Flow>, state: EvalState, sf: ts.SourceFile): Flow[] {
@@ -522,9 +644,10 @@ function evaluateCall(call: ts.CallExpression, env: Map<string, Flow>, state: Ev
   if (isContextHelperText(name)) {
     const args = callArgs(call, env, state, sf);
     const source = args.some((flow) => flow.hasSource);
-    const bound = resolveEffectBound(call, effect, sf);
+    const resolvedBound = resolveEffectBound(call, effect, sf, state.constantResolver);
+    const bound = resolvedBound.bound;
     const outputBound = effect.kind === "offload" ? unknownBound() : bound;
-    const provenance = [...mergeProvenance(args), effectStep(name, effect.kind, outputBound, nodeLocation(sf, call))];
+    const provenance = [...mergeProvenance(args), effectStep(name, effect.kind, outputBound, nodeLocation(sf, call), resolvedBound.reason)];
     if (effect.kind === "compress") {
       state.meaningfulTransformations++;
       const boundName = effect.bound?.name;
@@ -552,8 +675,9 @@ function evaluateCall(call: ts.CallExpression, env: Map<string, Flow>, state: Ev
   if (isFoveaCall(call, sf)) {
     const boundName = effect.kind === "select" ? effect.bound?.name : undefined;
     const maxTokens = boundName ? objectNumberArgument(call, boundName, sf, env) : undefined;
-    const bound = resolveEffectBound(call, effect, sf) ?? unknownBound("tokens");
-    const provenance = [effectStep(name, effect.kind, bound, nodeLocation(sf, call))];
+    const resolvedBound = resolveEffectBound(call, effect, sf, state.constantResolver);
+    const bound = resolvedBound.bound ?? unknownBound("tokens");
+    const provenance = [effectStep(name, effect.kind, bound, nodeLocation(sf, call), resolvedBound.reason)];
     if (maxTokens !== undefined) {
       state.boundedSelectionCalls++;
       state.meaningfulTransformations++;
@@ -843,6 +967,7 @@ export function analyzeProgram(source: string, opts: AnalyzerOptions = {}): Anal
     activeFunctions: new Set(),
     boundedSelectionCalls: 0,
     meaningfulTransformations: 0,
+    constantResolver: new NumericConstantResolver(sf),
   };
   collectFunctions(sf, state.functions);
   const env = new Map<string, Flow>();

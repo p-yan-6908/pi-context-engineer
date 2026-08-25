@@ -11,6 +11,8 @@
 - Added a permanent 12-case v0.4 differential suite covering allow/reject, taint, reduction, boundedness, and retention classifications.
 - Added deterministic structured explanations with classification, boundedness, final bounds, provenance reasons, optional source locations, and a human-readable formatter.
 - Added explanation checks for raw, scalar, select, compress, offload, unknown-bound, chained, and multi-source flows.
+- Added scope-aware immutable numeric `const` alias propagation with alias-chain reasons; mutable bindings, arithmetic, calls, conditionals, and cycles remain unknown.
+- Added a 45-check constant-alias suite covering lexical shadowing and all conservative fallback cases.
 
 ## 0.4.0
 
