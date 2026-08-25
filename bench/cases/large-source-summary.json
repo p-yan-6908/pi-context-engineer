@@ -1,0 +1,11 @@
+{
+  "id": "large-source-summary",
+  "title": "Hierarchical summary of a large source file",
+  "kind": "summary",
+  "targetBytes": 180000,
+  "marker": "TARGET_EXPORT_88",
+  "summaryMode": "model",
+  "maxTokens": 180,
+  "maxInputTokens": 512,
+  "task": "Summarize the source structure under a bounded child-model input budget."
+}

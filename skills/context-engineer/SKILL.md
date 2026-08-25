@@ -23,7 +23,7 @@ For local development, install a checkout instead:
 pi install /path/to/pi-context-engineer
 ```
 
-The extension requires the Fabric `fabric_exec` tool for static interception, but the standalone `ctx_*` tools also work in ordinary Pi sessions.
+When the Fabric `fabric_exec` tool is installed, the extension adds static interception and nested-result guarding; the standalone `ctx_*` tools also work in ordinary Pi sessions. Fabric is an optional peer and official protocol helpers are used when available.
 
 ## Automatic policy
 
@@ -58,7 +58,7 @@ const result = await pi.grep({ pattern: "TODO", path: "src" });
 return extensions.ctx_summarize({ text: result, mode: "code", maxTokens: 300 });
 ```
 
-`ctx_summarize` supports three modes: `structural` (default deterministic extraction), `code` (deterministic code-aware extraction), and `model` (isolated semantic LLM compression). Unknown modes are rejected; use `code` or `structural` for source inspection to avoid an unnecessary model call.
+`ctx_summarize` supports three modes: `structural` (default deterministic extraction), `code` (deterministic code-aware extraction), and `model` (isolated semantic LLM compression). Model mode accepts `maxInputTokens` (default 32000 per child call) and uses hierarchical chunk/reduce summarization by default, so payload size does not become prompt size. Unknown modes are rejected; use `code` or `structural` for source inspection to avoid an unnecessary model call.
 
 
 For manual offloading:
@@ -89,8 +89,8 @@ A Fovea call with `maxTokens` is recognized as a budgeted selection. Context Eng
 ## Standalone tools
 
 - `ctx_read`: read a UTF-8 byte range or search literal matches; ranged results expose copyable `offset` / `nextOffset`, query mode defaults to 100 formatted windows (`maxMatches`, capped at 500) and reports sampled `matchedLines` plus exact `totalMatches`
-- `ctx_summarize`: deterministic structural/code compression or isolated no-tools model compression
-- `ctx_remember` / `ctx_recall`: durable project facts; recall is bounded by `limit` and `maxTokens`
+- `ctx_summarize`: deterministic structural/code compression or bounded isolated no-tools model compression
+- `ctx_remember` / `ctx_recall` / `ctx_forget`: persistent project facts with bounded recall, named upserts, and deletion
 - `ctx_delegate`: isolated child-Pi fallback with `maxTokens` and a nested-safe timeout
 - `ctx_offload`: manually write a payload and return a handle plus preview
 
@@ -135,13 +135,13 @@ Create `<repo>/.pi/context-engineer.json`:
 - `runtimeAdvisoryThreshold`: optional byte threshold for size nudges; `0` disables them
 - `compactStaleResults`: compact already-used addressable previews in later model contexts
 - `notifyOnStart`: opt into the session-start toast
-- `storeMaxBytes` / `storeTtlMs`: addressable-store limits; defaults are 500 MB and one week, and the storage budget cannot exceed 500 MB
+- `storeMaxBytes` / `storeTtlMs`: transient addressable-store limits; defaults are 500 MB and one week, and the storage budget cannot exceed 500 MB
 
-Project configuration is re-read when its modification time changes. By default, entries expire after one week. Cleanup is opportunistic during later store activity rather than a background daemon; reads remove an individual expired entry and writes enforce expiry plus the disk budget. `maxUnprocessedToolCalls` remains accepted for older configurations, but data-flow reduction and observed context cost are primary.
+Project configuration is re-read when its modification time changes. Transient entries expire after one week by default; remembered facts use a separate persistent namespace with no TTL and a 5 MB budget. Cleanup is opportunistic during later store activity rather than a background daemon; list/read paths prune expired or dangling records and writes enforce the disk budget. `maxUnprocessedToolCalls` remains accepted for older configurations, but data-flow reduction and observed context cost are primary.
 
 ## Storage and observability
 
-Payloads are stored as self-describing JSON files under `<workspace>/.pi/context-store/`; durable facts use `<workspace>/.pi/agent/context-store/`. Identical payloads deduplicate by content hash. Handles survive session restarts, subject to TTL or disk-budget cleanup.
+Transient payload metadata is stored in `<workspace>/.pi/context-store/index.json` and content-addressed blobs live under `blobs/`; durable facts use `<workspace>/.pi/agent/context-store/` with the same private metadata/blob layout. Directories use 0700, files use 0600, writes are atomic, and identical payloads deduplicate by hash. Handles survive session restarts, subject to transient TTL or disk-budget cleanup; remembered facts are persistent until forgotten or evicted by their 5 MB budget.
 
 Telemetry stores sizes and strategy names, never prompts or payloads, in `.pi/context-store/context-events.jsonl`.
 
@@ -155,3 +155,9 @@ Use:
 /ce settings
 /ce clear
 ```
+
+## Evaluation and analyzer policy
+
+The repository includes a deterministic proof harness at `bench/`. Run `npm run bench` to compare raw baseline results with CE addressable storage, bounded selection, and hierarchical compression. Reports include Main/tool-result tokens, child-model tokens, wall time, disk bytes, task correctness, quality-adjusted savings, and context efficiency.
+
+Static tool knowledge is expressed as data in `src/context-effects.ts`: source, scalar, select, compress, offload, and unknown effects. Generated adversarial transformations run as part of `npm test`; opt-in real Pi/Fabric smoke tests use `CE_RUN_E2E=1 npm run bench:e2e`.

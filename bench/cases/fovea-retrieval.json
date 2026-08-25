@@ -1,0 +1,9 @@
+{
+  "id": "fovea-retrieval",
+  "title": "Large source with one relevant code window",
+  "kind": "select",
+  "targetBytes": 130000,
+  "marker": "TARGET_HANDLER_77",
+  "query": "TARGET_HANDLER_77",
+  "task": "Retrieve the relevant source window instead of the entire source file."
+}

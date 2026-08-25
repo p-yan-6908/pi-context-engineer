@@ -96,9 +96,9 @@ return extensions.ctx_summarize({
 
 - `structural` (default) — free deterministic JSON/text extraction.
 - `code` — free deterministic code-aware extraction of imports, signatures, and head/tail windows.
-- `model` — isolated no-tools semantic summarization; use only when structural context is insufficient.
+- `model` — isolated no-tools semantic summarization; large inputs are chunked and reduced hierarchically.
 
-Unknown modes are rejected. `maxTokens` is an approximate UTF-8 budget and is clamped to a safe range. Prefer `code` or `structural` for source inspection because they avoid an extra model call.
+Unknown modes are rejected. `maxTokens` is an approximate UTF-8 budget and is clamped to a safe range. Model mode also accepts `maxInputTokens` (default 32000 per child-model call) and `strategy: "hierarchical" | "direct"`; hierarchical is the safe default. Prefer `code` or `structural` for source inspection because they avoid an extra model call.
 
 Offloaded results include a copyable `extensions.ctx_read({ id, offset, length })` example. Use `query` when you know a literal symbol or phrase.
 
@@ -122,7 +122,7 @@ The registered tools are callable directly by the model and inside Fabric throug
 
 - `ctx_read` — select a range or literal matches from a stored handle
 - `ctx_summarize` — free structural/code compression or isolated no-tools model compression
-- `ctx_remember` / `ctx_recall` — durable project facts with bounded recall
+- `ctx_remember` / `ctx_recall` / `ctx_forget` — persistent project facts with bounded recall, named upserts, and deletion
 - `ctx_delegate` — isolated child Pi fallback with bounded output and a nested-safe deadline
 - `ctx_offload` — manual Write operation
 - `ctx_status` — current policy thresholds and observed savings
@@ -158,7 +158,7 @@ Project configuration is re-read when the file's modification time changes, so t
 - `compactStaleResults` controls automatic compaction of already-used, addressable previews.
 - `notifyOnStart` controls the session-start toast, which is off by default.
 
-Unless overridden with a shorter TTL or lower budget, store defaults are one week (`604800000` ms) and 500 MB (`500000000` bytes). Configured storage budgets cannot exceed the 500 MB cap. Cleanup is not a background daemon; expired and over-budget entries are removed on later store writes, while reads remove an individual expired entry.
+Transient context-store entries default to one week (`604800000` ms) and 500 MB (`500000000` bytes). Remembered facts use a separate persistent store with no TTL and a 5 MB budget. Configured transient storage budgets cannot exceed the 500 MB cap. Payloads use a metadata index plus content-addressed private blobs; writes are atomic and cleanup removes expired, dangling, and over-budget entries.
 
 ## Install in Pi
 
@@ -218,6 +218,26 @@ The test suite includes more than 50 static data-flow cases plus live hook probe
 - automatic final offload, one-use addressable previews, stale-result context compaction, serialized `ctx_read` envelope caps, and bounded query work
 - runtime-first versus strict preflight, bounded delegation, and deterministic `ctx_summarize` modes
 - content deduplication, UTF-8 ranges, and ripgrep-only brace parse repair
+- generated adversarial transformations for aliases, destructuring, callbacks, async wrappers, computed access, loops, and Promise aggregates
+- the explicit `src/context-effects.ts` registry used by the analyzer for source/select/compress/offload policy metadata
+
+Run the generated adversarial suite directly with the normal `npm test` command. It fails closed when an unsafe transformation is classified as safe.
+
+## Benchmarking
+
+The deterministic proof harness compares raw baseline results with CE addressable storage, bounded selection, and hierarchical summarization:
+
+```sh
+npm run bench
+```
+
+It covers huge grep/JSON/build-log payloads, repeated reads, parallel provider-like results, Fovea-like source selection, large summaries, and nested-agent handoffs. The default one-warmup/three-iteration run reports median and p95 wall time to `.tmp/context-benchmark.json`; `bench/result.schema.json` defines retained release results with sourceCommit/runtime provenance and per-iteration samples. Metrics include Main-context exposure (not total token usage), Main input/output/injected tokens, child-model tokens, wall time, disk bytes, selected bytes retrieved, task correctness, quality-adjusted savings, and context efficiency.
+
+Opt-in real runtime smoke tests launch the local `pi` CLI with CE and Fabric extensions. They require a configured model and are intentionally separate from CI's deterministic suite:
+
+```sh
+CE_RUN_E2E=1 PI_MODEL=openai-codex/gpt-5.6-luna npm run bench:e2e
+```
 
 ## License
 

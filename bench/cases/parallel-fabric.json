@@ -1,0 +1,9 @@
+{
+  "id": "parallel-fabric",
+  "title": "Parallel provider payloads",
+  "kind": "parallel",
+  "targetBytes": 90000,
+  "count": 4,
+  "marker": "PROVIDER",
+  "task": "Combine four independent provider results while returning only bounded evidence."
+}

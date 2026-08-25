@@ -32,6 +32,7 @@ import { evaluateProgram, runtimeAdvisoryLine, type WrapperOptions } from "./wra
 import { runChildPi } from "./child.js";
 import { ContextTelemetry } from "./telemetry.js";
 import { FabricExecutionScopes } from "./execution-scope.js";
+import { readFabricToolResultProxy } from "./compat/fabric.js";
 
 // ---- Config ----
 
@@ -66,22 +67,8 @@ function loadConfig(cwd: string): CeConfig {
   }
 }
 
-interface FabricProxyResult {
-  kind: "pi-fabric.tool-result-proxy.v1";
-  ref: string;
-  result: unknown;
-}
-
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" ? value as Record<string, unknown> : undefined;
-}
-
-/** Avoid a hard dependency while still consuming Fabric's documented proxy envelope. */
-function readFabricProxy(toolCallId: string, toolName: string, details: unknown): FabricProxyResult | undefined {
-  if (!toolCallId.startsWith("fabric_")) return undefined;
-  const record = asRecord(details);
-  if (record?.kind !== "pi-fabric.tool-result-proxy.v1" || record.ref !== toolName || !("result" in record)) return undefined;
-  return record as unknown as FabricProxyResult;
 }
 
 function serializeResult(value: unknown): string {
@@ -141,9 +128,16 @@ function strategyForTool(toolName: string): "WRITE" | "SELECT" | "COMPRESS" | "I
   return "PASS";
 }
 
+function utf8Preview(text: string, maxBytes: number): string {
+  const raw = Buffer.from(text, "utf8");
+  let end = Math.max(0, Math.min(raw.length, Math.floor(maxBytes)));
+  while (end > 0 && (raw[end] & 0xc0) === 0x80) end--;
+  return raw.subarray(0, end).toString("utf8");
+}
+
 function formatHandleText(id: string, bytes: number, estimatedTokens: number, text: string, previewBytes: number): string {
   const raw = Buffer.from(text, "utf8");
-  const preview = raw.subarray(0, previewBytes).toString("utf8");
+  const preview = utf8Preview(text, previewBytes);
   const truncated = raw.length > previewBytes;
   const handle =
     `[offloaded to handle "${id}" — ${bytes} bytes, ~${estimatedTokens} tokens]\n` +
@@ -435,7 +429,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     // active; ordinary non-prefixed calls stay model-boundary results.
     const isFabricExecResult = event.toolName === "fabric_exec";
     if (isFabricExecResult) fabricExecutions.finish(event.toolCallId);
-    const fabricProxy = readFabricProxy(event.toolCallId, event.toolName, event.details);
+    const fabricProxy = readFabricToolResultProxy(event.toolCallId, event.toolName, event.details);
     const isIntermediate = !isFabricExecResult && (
       fabricProxy !== undefined || fabricExecutions.isNestedToolResult(event.toolCallId)
     );
@@ -489,7 +483,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         handle: offloaded.id,
         originalBytes: offloaded.bytes,
         originalTokens: offloaded.estimatedTokens,
-        preview: Buffer.from(serialized, "utf8").subarray(0, previewBytes).toString("utf8"),
+        preview: utf8Preview(serialized, previewBytes),
       };
       const nestedText = formatHandleText(offloaded.id, offloaded.bytes, offloaded.estimatedTokens, serialized, previewBytes);
       telemetry.record(ctx.cwd, {

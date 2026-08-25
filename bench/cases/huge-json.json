@@ -1,0 +1,9 @@
+{
+  "id": "huge-json",
+  "title": "Huge JSON records with one relevant object",
+  "kind": "json-query",
+  "targetBytes": 140000,
+  "marker": "ORDER-JSON-1842",
+  "query": "ORDER-JSON-1842",
+  "task": "Locate the matching JSON record and report its identifier."
+}

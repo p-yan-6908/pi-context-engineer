@@ -1,0 +1,9 @@
+{
+  "id": "nested-agent",
+  "title": "Nested agent payload handoff",
+  "kind": "nested",
+  "targetBytes": 110000,
+  "marker": "AGENT-FINDING-19",
+  "query": "AGENT-FINDING-19",
+  "task": "Return a concise child-agent finding while keeping the inspected payload addressable."
+}

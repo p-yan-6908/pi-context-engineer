@@ -4,9 +4,10 @@
  */
 
 import contextEngineer, { repairGrepInput, isLikelyRegexParseError } from "./index.js";
-import { ContextStore, DEFAULT_CONTEXT_STORE_TTL_MS, MAX_CONTEXT_STORE_BYTES } from "./store.js";
+import { ContextStore, DEFAULT_CONTEXT_STORE_TTL_MS, DEFAULT_MEMORY_STORE_MAX_BYTES, MAX_CONTEXT_STORE_BYTES } from "./store.js";
+import { ceToolMap } from "./tools.js";
 import { ContextTelemetry } from "./telemetry.js";
-import { mkdirSync, writeFileSync, utimesSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 
@@ -505,6 +506,79 @@ checkCtl("identical payloads deduplicate by content hash", duplicate.id === offl
 const unicode = store.write("unicode", "read", "λ𐍈\nsecond line");
 const unicodePrefix = store.read(unicode.id, { offset: 0, length: Buffer.byteLength("λ𐍈", "utf8") });
 checkCtl("UTF-8 byte ranges do not split a code point", unicodePrefix.content === "λ𐍈" || unicodePrefix.content.startsWith("λ𐍈"));
+const unicodeEdges = store.write("unicode-edges", "read", "λ𐍈abc");
+for (const [offset, length] of [[0, 1], [0, 2], [0, 3], [1, 1], [2, 1]]) {
+  const ranged = store.read(unicodeEdges.id, { offset, length });
+  checkCtl(
+    `arbitrary UTF-8 range ${offset}:${length} is boundary-safe`,
+    !ranged.content.includes("�") && (!ranged.truncated || ranged.nextOffset !== undefined) &&
+      ranged.bytesRead === Buffer.byteLength(ranged.content.split("\n... [")[0], "utf8"),
+  );
+}
+
+const expiryCwd = "/tmp/pi-ce-expiry-" + Date.now();
+const expiryStore = new ContextStore(expiryCwd, ".pi/context-store", { ttlMs: 0 });
+const expired = expiryStore.write("expired", "test", "expired fact", { expiresAt: new Date(Date.now() - 1000).toISOString() });
+checkCtl("list prunes explicitly expired entries", !expiryStore.list().some((entry) => entry.id === expired.id));
+checkCtl("expired reads return an error rather than payload", expiryStore.read(expired.id).content.startsWith("Error:"));
+
+const layoutCwd = "/tmp/pi-ce-layout-" + Date.now();
+const layoutStore = new ContextStore(layoutCwd);
+const layoutEntry = layoutStore.write("layout", "test", "private payload");
+const layoutDir = join(layoutCwd, ".pi/context-store");
+const blobDir = join(layoutDir, "blobs");
+const indexRecord = JSON.parse(readFileSync(join(layoutDir, "index.json"), "utf8")) as { entries: Array<Record<string, unknown>> };
+const blobName = readdirSync(blobDir)[0];
+checkCtl(
+  "store uses metadata-only index and content-addressed blob",
+  indexRecord.entries.some((entry) => entry.id === layoutEntry.id && !("data" in entry) && typeof entry.blobPath === "string") && Boolean(blobName) && layoutStore.read(layoutEntry.id).content.includes("private payload"),
+);
+checkCtl(
+  "store files use private permissions",
+  (statSync(layoutDir).mode & 0o777) === 0o700 &&
+    (statSync(blobDir).mode & 0o777) === 0o700 &&
+    (statSync(join(layoutDir, "index.json")).mode & 0o777) === 0o600 &&
+    (statSync(join(blobDir, blobName),).mode & 0o777) === 0o600,
+);
+
+const memoryCwd = "/tmp/pi-ce-memory-" + Date.now();
+const memoryContext: any = {
+  workspaceRoot: memoryCwd,
+  store: new ContextStore(memoryCwd),
+  callTool: async () => undefined,
+  spawnAgent: async () => "",
+  modelCall: async () => "",
+};
+const rememberDef = ceToolMap.get("ctx_remember");
+const recallDef = ceToolMap.get("ctx_recall");
+const forgetDef = ceToolMap.get("ctx_forget");
+checkCtl("ctx_forget is registered", Boolean(forgetDef));
+if (rememberDef && recallDef && forgetDef) {
+  const firstMemory = await rememberDef.handler({ fact: "first", key: "decision" }, memoryContext) as { id?: string };
+  const secondMemory = await rememberDef.handler({ fact: "second", key: "decision" }, memoryContext) as { id?: string };
+  const recalled = await recallDef.handler({}, memoryContext) as { facts: string[]; count: number };
+  const reopenedBeforeForget = new ContextStore(memoryCwd, ".pi/agent/context-store", { ttlMs: 0, maxBytes: DEFAULT_MEMORY_STORE_MAX_BYTES });
+  checkCtl("remembered facts persist with no TTL and named writes upsert", firstMemory.id !== secondMemory.id && recalled.count === 1 && recalled.facts[0] === "second" && reopenedBeforeForget.list().length === 1 && reopenedBeforeForget.list()[0].updatedAt !== undefined);
+  const forgotten = await forgetDef.handler({ key: "decision" }, memoryContext) as { count: number };
+  const reopenedAfterForget = new ContextStore(memoryCwd, ".pi/agent/context-store", { ttlMs: 0, maxBytes: DEFAULT_MEMORY_STORE_MAX_BYTES });
+  checkCtl("ctx_forget removes named remembered facts", forgotten.count === 1 && reopenedAfterForget.list().length === 0);
+}
+
+const summaryDef = ceToolMap.get("ctx_summarize");
+if (summaryDef) {
+  const prompts: string[] = [];
+  const summary = await summaryDef.handler({ text: "x".repeat(12000), mode: "model", maxTokens: 128, maxInputTokens: 1024 }, {
+    ...memoryContext,
+    modelCall: async (prompt: string) => { prompts.push(prompt); return "bounded summary"; },
+  }) as { chunks: number; maxInputTokens: number; strategy: string };
+  checkCtl(
+    "model summarization declares and honors an input budget",
+    summary.strategy === "hierarchical" && summary.chunks > 1 && summary.maxInputTokens === 1024 &&
+      prompts.every((prompt) => Buffer.byteLength(prompt, "utf8") <= 4096),
+    `prompts=${prompts.length}, maxPromptBytes=${Math.max(...prompts.map((prompt) => Buffer.byteLength(prompt, "utf8")), 0)}`,
+  );
+}
+
 const budgetStore = new ContextStore("/tmp/pi-ce-budget-" + Date.now(), ".pi/context-store", { maxBytes: 10 });
 const retained = budgetStore.write("retained", "bash", "payload larger than budget");
 checkCtl("newest handle remains valid under a tiny disk budget", budgetStore.has(retained.id));

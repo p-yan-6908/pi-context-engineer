@@ -12,7 +12,7 @@
  * programs through the `extensions.*` provider.
  */
 
-import { ContextStore } from "./store.js";
+import { ContextStore, DEFAULT_MEMORY_STORE_MAX_BYTES } from "./store.js";
 
 // ---- Types ----
 
@@ -21,17 +21,41 @@ const RESULT_ENVELOPE_SLACK_BYTES = 1024;
 /** Default ceiling for one CE tool result; mirrors index.ts's offload threshold. */
 const DEFAULT_MAX_RETURN_BYTES = 8192;
 type SummaryMode = "structural" | "code" | "model";
+type SummaryStrategy = "hierarchical" | "direct";
 const DEFAULT_SUMMARY_TOKENS = 500;
 const MIN_SUMMARY_TOKENS = 64;
 const MAX_SUMMARY_TOKENS = 4000;
+const DEFAULT_MAX_INPUT_TOKENS = 32_000;
+const MIN_MAX_INPUT_TOKENS = 1_024;
+const MAX_MAX_INPUT_TOKENS = 128_000;
 function normalizeSummaryMode(value: unknown): SummaryMode | null {
   const mode = value == null ? "structural" : String(value);
   return mode === "structural" || mode === "code" || mode === "model" ? mode : null;
+}
+function normalizeSummaryStrategy(value: unknown): SummaryStrategy | null {
+  const strategy = value == null ? "hierarchical" : String(value);
+  return strategy === "hierarchical" || strategy === "direct" ? strategy : null;
 }
 function normalizeSummaryTokens(value: unknown): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return DEFAULT_SUMMARY_TOKENS;
   return Math.max(MIN_SUMMARY_TOKENS, Math.min(MAX_SUMMARY_TOKENS, Math.floor(parsed)));
+}
+function normalizeMaxInputTokens(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return DEFAULT_MAX_INPUT_TOKENS;
+  return Math.max(MIN_MAX_INPUT_TOKENS, Math.min(MAX_MAX_INPUT_TOKENS, Math.floor(parsed)));
+}
+
+const MEMORY_STORE_OPTIONS = { ttlMs: 0, maxBytes: DEFAULT_MEMORY_STORE_MAX_BYTES } as const;
+function memoryStore(ctx: ToolContext): ContextStore {
+  return new ContextStore(ctx.workspaceRoot, ".pi/agent/context-store", MEMORY_STORE_OPTIONS);
+}
+function normalizeMemoryKey(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const key = value.trim();
+  if (key.length === 0) return undefined;
+  return key.startsWith("memory:") ? key : `memory:${key}`;
 }
 
 
@@ -149,7 +173,7 @@ function capContent<T extends {
   const capNote = `\n... [ctx_read output capped to stay out of the offload path — ${hint}]`;
 
   const candidate = (bytes: number): T => {
-    const prefix = source.subarray(0, bytes).toString("utf8");
+    const prefix = utf8SafePrefix(source.toString("utf8"), bytes);
     const visibleBytes = Buffer.byteLength(prefix, "utf8");
     return {
       ...normalized,
@@ -185,7 +209,7 @@ const ctxSummarize: ToolDef = {
   description:
     "Compress a stored payload or inline text into a small structured summary. " +
     "Structural mode (default) is free and deterministic: extracts keys, counts, signatures, first/last N lines. " +
-    "Model mode uses an isolated no-tools Pi process (the current model by default) for semantic summarization. " +
+    "Model mode uses bounded hierarchical chunk summaries so a large payload never enters one child-model prompt. " +
     "Always prefer structural mode unless you need semantic understanding.",
   inputSchema: {
     type: "object",
@@ -195,9 +219,11 @@ const ctxSummarize: ToolDef = {
       mode: {
         type: "string",
         enum: ["structural", "code", "model"],
-        description: "structural = free general extraction. code = free code-aware extraction. model = isolated LLM summarization. Default: structural.",
+        description: "structural = free general extraction. code = free code-aware extraction. model = bounded isolated LLM summarization. Default: structural.",
       },
       maxTokens: { type: "integer", description: "Target max tokens for the summary. Default 500." },
+      maxInputTokens: { type: "integer", description: "Maximum approximate input tokens per child-model call. Default 32000." },
+      strategy: { type: "string", description: "Model strategy: hierarchical (default) or direct (first bounded chunk only)." },
     },
   },
   async handler(args, ctx) {
@@ -205,33 +231,181 @@ const ctxSummarize: ToolDef = {
     if (!mode) return { error: "Unknown summary mode. Use structural, code, or model.", code: "invalid_summary_mode", allowedModes: ["structural", "code", "model"] };
     const maxTokens = normalizeSummaryTokens(args.maxTokens);
 
-    let data: string;
+    let data: string | undefined;
     let source: string;
+    let storedId: string | undefined;
 
     if (args.id) {
-      const entry = ctx.store.read(args.id as string, { length: Number.MAX_SAFE_INTEGER });
-      data = entry.content;
-      source = `stored:${args.id}`;
-    } else if (args.text) {
-      data = args.text as string;
+      storedId = args.id as string;
+      source = `stored:${storedId}`;
+    } else if (args.text !== undefined) {
+      data = String(args.text);
       source = "inline";
     } else {
       return { error: "Provide either id (stored payload) or text (inline)." };
     }
 
     if (mode === "structural" || mode === "code") {
-      return capSummary(structuralSummary(data, source, maxTokens, mode), maxTokens);
+      if (storedId) {
+        const entry = ctx.store.read(storedId, { length: Number.MAX_SAFE_INTEGER });
+        if (entry.content.startsWith("Error:")) return { error: entry.content, source };
+        data = entry.content;
+      }
+      return capSummary(structuralSummary(data ?? "", source, maxTokens, mode), maxTokens);
     }
 
-    // Model mode
-    const prompt = `Summarize the following content in under ${maxTokens} tokens. ` +
-      `Preserve: key facts, identifiers, errors, decisions, and any data structures. ` +
-      `Drop: redundant examples, verbose descriptions, formatting noise.\n\n---\n${data}`;
-    const summary = await ctx.modelCall(prompt, maxTokens);
-    const boundedSummary = capText(summary, maxTokens * 4);
-    return { source, mode: "model", summary: boundedSummary, originalTokens: Math.ceil(Buffer.byteLength(data, "utf8") / 4), summaryTokens: Math.ceil(Buffer.byteLength(boundedSummary, "utf8") / 4), truncated: boundedSummary.length < summary.length };
+    const maxInputTokens = normalizeMaxInputTokens(args.maxInputTokens);
+    const strategy = normalizeSummaryStrategy(args.strategy);
+    if (!strategy) return { error: "Unknown summary strategy. Use hierarchical or direct.", code: "invalid_summary_strategy", allowedStrategies: ["hierarchical", "direct"] };
+    const maxInputBytes = Math.max(1024, maxInputTokens * 4 - 2048);
+    const chunks = storedId
+      ? readStoredChunks(ctx.store, storedId, maxInputBytes)
+      : { chunks: splitUtf8Chunks(data ?? "", maxInputBytes), totalBytes: Buffer.byteLength(data ?? "", "utf8") };
+    if (chunks.error) return { error: chunks.error, source };
+
+    const modelResult = await summarizeModelChunks(chunks.chunks, ctx, maxTokens, maxInputTokens, strategy);
+    const boundedSummary = capText(modelResult.summary, maxTokens * 4);
+    return {
+      source,
+      mode: "model",
+      strategy,
+      maxInputTokens,
+      chunks: chunks.chunks.length,
+      inputTruncated: strategy === "direct" && chunks.chunks.length > 1,
+      summary: boundedSummary,
+      originalTokens: Math.ceil(chunks.totalBytes / 4),
+      summaryTokens: Math.ceil(Buffer.byteLength(boundedSummary, "utf8") / 4),
+      truncated: boundedSummary.length < modelResult.summary.length,
+    };
   },
 };
+
+interface ChunkReadResult {
+  chunks: string[];
+  totalBytes: number;
+  error?: string;
+}
+
+function isContinuationByte(value: number | undefined): boolean {
+  return value !== undefined && (value & 0xc0) === 0x80;
+}
+
+function splitUtf8Chunks(data: string, maxBytes: number): string[] {
+  const buffer = Buffer.from(data, "utf8");
+  if (buffer.length === 0) return [""];
+  const chunks: string[] = [];
+  let offset = 0;
+  while (offset < buffer.length) {
+    let end = Math.min(buffer.length, offset + maxBytes);
+    while (end < buffer.length && isContinuationByte(buffer[end])) end++;
+    if (end <= offset) end = Math.min(buffer.length, offset + maxBytes);
+    chunks.push(buffer.subarray(offset, end).toString("utf8"));
+    offset = end;
+  }
+  return chunks;
+}
+
+function readStoredChunks(store: ContextStore, id: string, maxBytes: number): ChunkReadResult {
+  const probe = store.read(id, { offset: 0, length: 0 });
+  if (probe.content.startsWith("Error:")) return { chunks: [], totalBytes: 0, error: probe.content };
+  if (probe.totalBytes === 0) return { chunks: [""], totalBytes: 0 };
+
+  const chunks: string[] = [];
+  let offset = 0;
+  while (offset < probe.totalBytes) {
+    const result = store.read(id, { offset, length: maxBytes });
+    if (result.content.startsWith("Error:")) return { chunks: [], totalBytes: 0, error: result.content };
+    const payloadBytes = result.truncated ? result.bytesRead : Buffer.byteLength(result.content, "utf8");
+    const payload = Buffer.from(result.content, "utf8").subarray(0, payloadBytes).toString("utf8");
+    if (payload.length > 0) chunks.push(payload);
+    if (!result.truncated || result.nextOffset === undefined) break;
+    if (result.nextOffset <= offset) return { chunks: [], totalBytes: 0, error: `Error: unable to advance while reading stored result "${id}".` };
+    offset = result.nextOffset;
+  }
+  return { chunks, totalBytes: probe.totalBytes };
+}
+
+function modelPrompt(stage: string, maxTokens: number, content: string): string {
+  return `${stage} the following context in under ${maxTokens} tokens. ` +
+    `Preserve key facts, identifiers, errors, decisions, and data structures; ` +
+    `remove repetition and formatting noise.\n\n---\n${content}`;
+}
+
+async function callBoundedModel(
+  content: string,
+  stage: string,
+  ctx: ToolContext,
+  maxTokens: number,
+  maxInputTokens: number,
+): Promise<string> {
+  const inputBudget = Math.max(1024, maxInputTokens * 4 - 2048);
+  const boundedContent = splitUtf8Chunks(content, inputBudget)[0] ?? "";
+  const prompt = modelPrompt(stage, maxTokens, boundedContent);
+  const summary = await ctx.modelCall(prompt, maxTokens);
+  return capText(summary, maxTokens * 4);
+}
+
+function groupSummaryChunks(chunks: string[], maxBytes: number): string[][] {
+  const groups: string[][] = [];
+  let group: string[] = [];
+  let bytes = 0;
+  for (const chunk of chunks) {
+    const chunkBytes = Buffer.byteLength(chunk, "utf8");
+    if (group.length > 0 && bytes + chunkBytes + 2 > maxBytes) {
+      groups.push(group);
+      group = [];
+      bytes = 0;
+    }
+    if (chunkBytes > maxBytes) {
+      const split = splitUtf8Chunks(chunk, maxBytes);
+      if (group.length > 0) {
+        groups.push(group);
+        group = [];
+        bytes = 0;
+      }
+      groups.push(...split.map((part) => [part]));
+      continue;
+    }
+    group.push(chunk);
+    bytes += chunkBytes + 2;
+  }
+  if (group.length > 0) groups.push(group);
+  return groups;
+}
+
+async function summarizeModelChunks(
+  chunks: string[],
+  ctx: ToolContext,
+  maxTokens: number,
+  maxInputTokens: number,
+  strategy: SummaryStrategy,
+): Promise<{ summary: string }> {
+  const inputBudget = Math.max(1024, maxInputTokens * 4 - 2048);
+  if (strategy === "direct") {
+    return { summary: await callBoundedModel(chunks[0] ?? "", "Summarize", ctx, maxTokens, maxInputTokens) };
+  }
+  if (chunks.length <= 1) {
+    return { summary: await callBoundedModel(chunks[0] ?? "", "Summarize", ctx, maxTokens, maxInputTokens) };
+  }
+
+  const leafTokens = Math.max(64, Math.min(maxTokens, Math.max(128, Math.floor(maxTokens * 0.75))));
+  let partials: string[] = [];
+  for (const chunk of chunks) {
+    partials.push(await callBoundedModel(chunk, "Summarize this chunk", ctx, leafTokens, maxInputTokens));
+  }
+
+  let level = 1;
+  while (partials.length > 1) {
+    const groups = groupSummaryChunks(partials, inputBudget);
+    const next: string[] = [];
+    for (const group of groups) {
+      next.push(await callBoundedModel(group.join("\n\n"), `Combine partial summaries (level ${level})`, ctx, maxTokens, maxInputTokens));
+    }
+    partials = next;
+    level++;
+  }
+  return { summary: await callBoundedModel(partials[0] ?? "", "Produce the final summary", ctx, maxTokens, maxInputTokens) };
+}
 
 // ---- ctx_remember: persist a fact to long-term memory ----
 
@@ -240,20 +414,28 @@ const ctxRemember: ToolDef = {
   description:
     "Persist a fact or preference to long-term memory that survives across sessions. " +
     "Use for: user preferences, project conventions, key decisions. " +
+    "An optional key makes the fact addressable and repeated writes update it. " +
     "Do NOT use for: secrets, temporary task state, or facts already in project docs.",
   inputSchema: {
     type: "object",
     properties: {
       fact: { type: "string", description: "The exact fact to remember." },
+      key: { type: "string", description: "Optional stable name; writing the same name upserts the remembered fact." },
     },
     required: ["fact"],
   },
   async handler(args, ctx) {
-    // Keep durable facts in a separate project-local namespace rather than
-    // mixing them with transient context-store payloads.
-    const memStore = new ContextStore(ctx.workspaceRoot, ".pi/agent/context-store");
-    const result = memStore.write("memory", "remember", args.fact as string);
-    return { saved: true, id: result.id, fact: args.fact };
+    const namedKey = normalizeMemoryKey(args.key);
+    if (args.key !== undefined && !namedKey) return { error: "Memory key must be a non-empty string." };
+    const key = namedKey ?? "memory";
+    const fact = String(args.fact ?? "");
+    if (fact.length === 0) return { error: "Fact must be a non-empty string." };
+    const result = memoryStore(ctx).write(key, "remember", fact, {
+      upsert: Boolean(namedKey),
+      deduplicate: !namedKey,
+      contentType: "text",
+    });
+    return { saved: true, id: result.id, key, fact: args.fact, persistent: true };
   },
 };
 
@@ -263,7 +445,7 @@ const ctxRecall: ToolDef = {
   name: "ctx_recall",
   description:
     "Retrieve persisted facts from long-term memory. " +
-    "Returns all saved facts, or only those matching a query.",
+    "Returns all saved facts, or only those matching a query. Expired entries are pruned before recall.",
   inputSchema: {
     type: "object",
     properties: {
@@ -273,7 +455,7 @@ const ctxRecall: ToolDef = {
     },
   },
   async handler(args, ctx) {
-    const memStore = new ContextStore(ctx.workspaceRoot, ".pi/agent/context-store");
+    const memStore = memoryStore(ctx);
     const entries = memStore.list();
     const facts: string[] = [];
     const limit = Math.max(1, Math.min((args.limit as number | undefined) ?? 20, 100));
@@ -282,8 +464,11 @@ const ctxRecall: ToolDef = {
     let truncated = false;
 
     for (const entry of entries) {
-      if (entry.key !== "memory") continue;
+      if (entry.key !== "memory" && !entry.key.startsWith("memory:")) continue;
       const full = memStore.read(entry.id, { length: Number.MAX_SAFE_INTEGER });
+      // list() prunes expiry, but retain this guard for races/corrupt records so
+      // an error string can never be returned as if it were a remembered fact.
+      if (full.content.startsWith("Error:")) continue;
       if (args.query && !full.content.includes(args.query as string)) continue;
       const factTokens = Math.ceil(Buffer.byteLength(full.content, "utf8") / 4);
       if (facts.length >= limit || usedTokens + factTokens > maxTokens) {
@@ -295,6 +480,35 @@ const ctxRecall: ToolDef = {
     }
 
     return { count: facts.length, facts, truncated, estimatedTokens: usedTokens };
+  },
+};
+
+// ---- ctx_forget: remove persisted facts ----
+
+const ctxForget: ToolDef = {
+  name: "ctx_forget",
+  description: "Remove a remembered fact by id or by its optional named key.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      id: { type: "string", description: "Exact id returned by ctx_remember." },
+      key: { type: "string", description: "Named key previously passed to ctx_remember." },
+    },
+  },
+  async handler(args, ctx) {
+    const memStore = memoryStore(ctx);
+    const id = typeof args.id === "string" && args.id.length > 0 ? args.id : undefined;
+    const key = normalizeMemoryKey(args.key);
+    if (args.key !== undefined && !key) return { error: "Memory key must be a non-empty string." };
+    if (!id && !key) return { error: "Provide either id or key." };
+
+    const ids = id
+      ? [id]
+      : memStore.list()
+        .filter((entry) => entry.key === key)
+        .map((entry) => entry.id);
+    const forgotten = ids.filter((entryId) => memStore.delete(entryId));
+    return { forgotten: forgotten.length > 0, count: forgotten.length, ids: forgotten };
   },
 };
 
@@ -344,6 +558,7 @@ export const ceTools: ToolDef[] = [
   ctxSummarize,
   ctxRemember,
   ctxRecall,
+  ctxForget,
   ctxDelegate,
 ];
 
@@ -351,9 +566,16 @@ export const ceToolMap = new Map(ceTools.map((t) => [t.name, t]));
 
 // ---- Structural summary implementation ----
 
+function utf8SafePrefix(text: string, maxBytes: number): string {
+  const buffer = Buffer.from(text, "utf8");
+  let end = Math.max(0, Math.min(buffer.length, Math.floor(maxBytes)));
+  while (end > 0 && isContinuationByte(buffer[end])) end--;
+  return buffer.subarray(0, end).toString("utf8");
+}
+
 function capText(text: string, maxBytes: number): string {
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-  return Buffer.from(text, "utf8").subarray(0, Math.max(64, maxBytes - 80)).toString("utf8") + "\n... [summary capped]";
+  return utf8SafePrefix(text, Math.max(64, maxBytes - 80)) + "\n... [summary capped]";
 }
 
 function capSummary(summary: unknown, maxTokens: number): unknown {

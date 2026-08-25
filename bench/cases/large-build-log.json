@@ -1,0 +1,9 @@
+{
+  "id": "large-build-log",
+  "title": "Large build log with sparse errors",
+  "kind": "query",
+  "targetBytes": 160000,
+  "marker": "BUILD-ERROR-17",
+  "query": "BUILD-ERROR-17",
+  "task": "Identify the build error while keeping routine log lines out of Main."
+}

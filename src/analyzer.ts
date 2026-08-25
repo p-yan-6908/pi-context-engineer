@@ -8,6 +8,7 @@
  */
 
 import ts from "typescript";
+import { contextEffectFor, isContextHelperName, isFoveaName } from "./context-effects.js";
 
 export type TaintKind =
   | "clean"
@@ -90,11 +91,6 @@ interface EvalState {
   meaningfulTransformations: number;
 }
 
-const DATA_PREFIX = /^(?:tools|pi|fabric|mcp|extensions)\./;
-const DIRECT_DATA_TOOL = /^(?:read|write|edit|bash|grep|glob|list|ls|find|search|fetch|vision|subagent|delegate)(?:$|\.)/;
-const CONTEXT_HELPER = /^(?:ce|ctx)\.|^(?:ce|ctx)_(?:[a-z0-9_]+)$|^extensions\.(?:ctx_|ce_)/;
-const FOVEA_TOOL = /^(?:fovea_(?:sketch|focus|dwell|impact)|extensions\.fovea_(?:sketch|focus|dwell|impact))$/;
-
 const UNSAFE_KINDS = new Set<TaintKind>(["raw", "encoded", "unknown"]);
 const REDUCING_KINDS = new Set<TaintKind>(["projected", "selected", "aggregated", "compressed", "offloaded"]);
 
@@ -127,16 +123,16 @@ function getCalleeText(expr: ts.Expression, sf: ts.SourceFile): string {
 }
 
 function isContextHelperText(text: string): boolean {
-  return CONTEXT_HELPER.test(text);
+  return isContextHelperName(text);
 }
 
 function isFoveaText(text: string): boolean {
-  return FOVEA_TOOL.test(text);
+  return isFoveaName(text);
 }
 
 function isDataToolText(text: string): boolean {
-  if (isContextHelperText(text)) return false;
-  return DATA_PREFIX.test(text) || DIRECT_DATA_TOOL.test(text) || isFoveaText(text);
+  const effect = contextEffectFor(text);
+  return effect.kind === "source" || isFoveaText(text);
 }
 
 function isDataToolCall(node: ts.CallExpression, sf: ts.SourceFile): boolean {
@@ -216,6 +212,10 @@ function propertyFlow(receiver: Flow, property: string): Flow {
 function elementFlow(receiver: Flow, index?: string): Flow {
   if (!receiver.hasSource) return cleanFlow("array element");
   if (index === "length" || index === "size") return boundedFlow("projected", "scalar element", 0.01);
+  // Selecting one container element does not bound the size of that element;
+  // `[raw][0]`, `Promise.all([raw])[0]`, and computed properties can still be
+  // the complete source payload.
+  if (UNSAFE_KINDS.has(receiver.kind)) return { ...receiver, operation: "select source element" };
   return boundedFlow("selected", "select element", Math.min(receiver.retention, 0.25));
 }
 
@@ -381,25 +381,25 @@ function evaluateMethodCall(
 
 function evaluateCall(call: ts.CallExpression, env: Map<string, Flow>, state: EvalState, sf: ts.SourceFile): Flow {
   const name = getCalleeText(call.expression, sf);
+  const effect = contextEffectFor(name);
   if (isContextHelperText(name)) {
     const args = callArgs(call, env, state, sf);
     const source = args.some((flow) => flow.hasSource);
-    if (/ctx_summarize|ce_summarize|summarize/.test(name)) {
+    if (effect.kind === "compress") {
       state.meaningfulTransformations++;
-      const maxTokens = objectNumberArgument(call, "maxTokens", sf, env);
+      const maxTokens = objectNumberArgument(call, effect.boundFrom ?? "maxTokens", sf, env);
       return boundedFlow("compressed", "context summary", maxTokens ? Math.min(0.08, maxTokens / 10000) : 0.08);
     }
-    if (/ctx_offload|ce_offload|offload/.test(name)) {
+    if (effect.kind === "offload") {
       state.meaningfulTransformations++;
       return boundedFlow("offloaded", "context offload", 0);
     }
-    if (/ctx_read|ce_read|read/.test(name)) {
+    if (effect.kind === "select") {
       state.meaningfulTransformations++;
-      return boundedFlow("selected", "context slice", 0.25);
+      return boundedFlow("selected", "context selection", 0.25);
     }
-    if (/ctx_delegate|ce_delegate|delegate/.test(name)) {
-      state.meaningfulTransformations++;
-      return boundedFlow("compressed", "isolated delegation", 0.05);
+    if (effect.kind === "scalar") {
+      return source ? boundedFlow("projected", "context scalar", 0.01) : cleanFlow("context scalar");
     }
     return source ? reducedFlow("selected", "context helper", 0.25) : cleanFlow("context helper");
   }
@@ -414,7 +414,7 @@ function evaluateCall(call: ts.CallExpression, env: Map<string, Flow>, state: Ev
     return sourceFlow("unknown", "unbounded Fovea selection");
   }
 
-  if (isDataToolCall(call, sf)) return sourceFlow("raw", `data source ${name}`);
+  if (effect.kind === "source" || isDataToolCall(call, sf)) return sourceFlow("raw", `data source ${name}`);
 
   const args = callArgs(call, env, state, sf);
   const sourced = args.some((flow) => flow.hasSource);
@@ -442,6 +442,9 @@ function evaluateCall(call: ts.CallExpression, env: Map<string, Flow>, state: Ev
   }
   if (["Math.abs", "Math.ceil", "Math.floor", "Math.round", "Number", "Boolean", "parseInt", "parseFloat"].includes(name)) {
     return sourced ? boundedFlow("projected", `${name} scalar projection`, 0.01) : cleanFlow(name);
+  }
+  if (/^Promise\.(?:resolve|reject)$/.test(name)) {
+    return combine(args, `${name} preserves source`);
   }
   if (/^Promise\.(?:all|allSettled|race|any)$/.test(name)) {
     return combine(args, `${name} aggregate`);
@@ -570,6 +573,20 @@ function visitBindings(node: ts.Node, env: Map<string, Flow>, state: EvalState, 
   }
   if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(node.left)) {
     env.set(node.left.text, evaluateExpression(node.right, env, state, sf));
+  }
+  if (ts.isForOfStatement(node) || ts.isForInStatement(node)) {
+    const iterable = evaluateExpression(node.expression, env, state, sf);
+    const item = ts.isForOfStatement(node)
+      ? (iterable.hasSource ? { ...iterable, operation: "loop item" } : cleanFlow("loop item"))
+      : (iterable.hasSource ? sourceFlow("unknown", "loop key") : cleanFlow("loop key"));
+    if (ts.isVariableDeclarationList(node.initializer)) {
+      const declaration = node.initializer.declarations[0];
+      if (declaration) bindPattern(declaration.name, item, env, state, sf);
+    } else if (ts.isIdentifier(node.initializer)) {
+      env.set(node.initializer.text, item);
+    }
+    visitBindings(node.statement, env, state, sf);
+    return;
   }
   ts.forEachChild(node, (child) => visitBindings(child, env, state, sf));
 }

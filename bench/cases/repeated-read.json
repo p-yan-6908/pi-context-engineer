@@ -1,0 +1,9 @@
+{
+  "id": "repeated-read",
+  "title": "Repeated reads of one offloaded payload",
+  "kind": "repeated",
+  "targetBytes": 100000,
+  "marker": "SECTION",
+  "segments": ["SECTION-A", "SECTION-B", "SECTION-C"],
+  "task": "Inspect three separate sections without copying the complete payload three times."
+}

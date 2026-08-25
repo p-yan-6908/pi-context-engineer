@@ -1,0 +1,9 @@
+{
+  "id": "huge-grep",
+  "title": "Huge grep with a narrow needle",
+  "kind": "query",
+  "targetBytes": 120000,
+  "marker": "NEEDLE-GREP-042",
+  "query": "NEEDLE-GREP-042",
+  "task": "Find the matching diagnostic line without returning the complete grep result."
+}

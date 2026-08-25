@@ -7,7 +7,8 @@
  * global depth counter.
  */
 
-export const FABRIC_NESTED_TOOL_CALL_ID_PREFIX = "fabric_";
+import { FABRIC_NESTED_TOOL_CALL_ID_PREFIX } from "./compat/fabric.js";
+export { FABRIC_NESTED_TOOL_CALL_ID_PREFIX };
 
 export interface FabricExecutionScope {
   toolCallId: string;

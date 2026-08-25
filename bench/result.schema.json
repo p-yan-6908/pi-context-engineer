@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/p-yan-6908/pi-context-engineer/blob/main/bench/result.schema.json",
+  "title": "Context Engineer benchmark result",
+  "type": "object",
+  "required": ["generatedAt", "environment", "cases", "correct", "mainContextBaseline", "mainContextWithCE", "reductionPercent", "rows"],
+  "properties": {
+    "generatedAt": { "type": "string", "format": "date-time" },
+    "environment": { "$ref": "#/$defs/environment" },
+    "cases": { "type": "integer", "minimum": 0 },
+    "correct": { "type": "integer", "minimum": 0 },
+    "mainContextBaseline": { "type": "number", "minimum": 0 },
+    "mainContextWithCE": { "type": "number", "minimum": 0 },
+    "reductionPercent": { "type": "number" },
+    "rows": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "title", "task", "baseline", "ce", "samples"],
+        "properties": {
+          "id": { "type": "string" },
+          "title": { "type": "string" },
+          "task": { "type": "string" },
+          "baseline": { "$ref": "#/$defs/metrics" },
+          "ce": { "$ref": "#/$defs/metrics" },
+          "samples": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["iteration", "baseline", "ce"],
+              "properties": {
+                "iteration": { "type": "integer", "minimum": 1 },
+                "baseline": { "$ref": "#/$defs/metrics" },
+                "ce": { "$ref": "#/$defs/metrics" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "environment": {
+      "type": "object",
+      "required": ["sourceCommit", "dirty", "nodeVersion", "piVersion", "fabricVersion", "model", "provider", "iterations", "warmupIterations"],
+      "properties": {
+        "sourceCommit": { "type": "string" },
+        "dirty": { "type": "boolean" },
+        "nodeVersion": { "type": "string" },
+        "piVersion": { "type": ["string", "null"] },
+        "fabricVersion": { "type": ["string", "null"] },
+        "model": { "type": ["string", "null"] },
+        "provider": { "type": ["string", "null"] },
+        "iterations": { "type": "integer", "minimum": 1 },
+        "warmupIterations": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "required": ["mode", "mainContextTokens", "mainContextInputTokens", "mainContextOutputTokens", "mainContextInjectedTokens", "toolResultTokens", "childModelTokens", "internalWorkTokens", "wallTimeMs", "wallTimeP95Ms", "diskBytesWritten", "bytesOffloaded", "ctxReadBytesRetrieved", "finalAnswerCorrect", "taskCompleted", "mainTokensPrevented", "extraInternalTokens", "mainTokensInjected", "contextEfficiency", "qualityAdjustedSavings"],
+      "properties": {
+        "mode": { "enum": ["baseline", "ce"] },
+        "mainContextTokens": { "type": "number", "minimum": 0 },
+        "mainContextInputTokens": { "type": "number", "minimum": 0 },
+        "mainContextOutputTokens": { "type": "number", "minimum": 0 },
+        "mainContextInjectedTokens": { "type": "number", "minimum": 0 },
+        "toolResultTokens": { "type": "number", "minimum": 0 },
+        "childModelTokens": { "type": "number", "minimum": 0 },
+        "internalWorkTokens": { "type": "number", "minimum": 0 },
+        "wallTimeMs": { "type": "number", "minimum": 0 },
+        "wallTimeP95Ms": { "type": "number", "minimum": 0 },
+        "diskBytesWritten": { "type": "number", "minimum": 0 },
+        "bytesOffloaded": { "type": "number", "minimum": 0 },
+        "ctxReadBytesRetrieved": { "type": "number", "minimum": 0 },
+        "finalAnswerCorrect": { "type": "boolean" },
+        "taskCompleted": { "type": "boolean" },
+        "mainTokensPrevented": { "type": "number", "minimum": 0 },
+        "extraInternalTokens": { "type": "number", "minimum": 0 },
+        "mainTokensInjected": { "type": "number", "minimum": 0 },
+        "contextEfficiency": { "type": "number", "minimum": 0 },
+        "qualityAdjustedSavings": { "type": "number", "minimum": 0 }
+      }
+    }
+  }
+}
