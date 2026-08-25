@@ -7,14 +7,15 @@
 - Added the exported `ContextEffect` vocabulary and registry for source, scalar, select, compress, offload, passthrough, and unknown calls.
 - Moved `ctx_*`, `ce_*`, and Fovea bound-argument definitions into registry metadata; analyzer behavior remains compatible with v0.4.0.
 - Added registry contract checks for byte/token bounds, aliases, source fallback, and conservative unknown-helper handling.
-- Added unit-aware literal `returnBound` results and structured `returnProvenance` traces; identifier aliases and arithmetic remain unknown by design.
+- Added unit-aware literal `returnBound` results and structured `returnProvenance` traces.
 - Added a permanent 12-case v0.4 differential suite covering allow/reject, taint, reduction, boundedness, and retention classifications.
 - Added deterministic structured explanations with classification, boundedness, final bounds, provenance reasons, optional source locations, and a human-readable formatter.
 - Added explanation checks for raw, scalar, select, compress, offload, unknown-bound, chained, and multi-source flows.
-- Added scope-aware immutable numeric `const` alias propagation with alias-chain reasons; mutable bindings, arithmetic, calls, conditionals, and cycles remain unknown.
+- Added scope-aware immutable numeric `const` alias propagation with alias-chain reasons; mutable bindings, calls, and cycles remain unknown.
 - Added a 45-check constant-alias suite covering lexical shadowing and all conservative fallback cases.
 - Split resolved bounds into `exact`, `upper`, and `unknown`; added safe-integer exact arithmetic and `Math.min` upper-bound derivation without changing policy decisions.
-- Added a 72-check symbolic-bound suite covering arithmetic, caps, invalid numeric values, dynamic operands, and unsupported operations.
+- Added expression-level conditional joins with structured branch provenance and bounded `Math.max` evaluation; both require conservative finite inputs.
+- Expanded the symbolic-bound suite to 117 checks covering arithmetic, caps, joins, invalid numeric values, dynamic operands, and unsupported operations.
 
 ## 0.4.0
 

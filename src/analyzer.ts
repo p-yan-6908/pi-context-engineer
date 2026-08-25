@@ -279,6 +279,14 @@ interface NumericConstantResolution {
   value?: number;
   chain: string[];
   expression?: string;
+  derivation?: NumericResolutionDerivation;
+}
+
+interface NumericResolutionDerivation {
+  kind: "conditional" | "max";
+  expression: string;
+  branches?: Array<{ label: "true" | "false"; resolution: NumericConstantResolution }>;
+  operands?: NumericConstantResolution[];
 }
 
 interface EffectBoundResolution {
@@ -296,12 +304,46 @@ function isLexicalScopeNode(node: ts.Node): boolean {
     ts.isCatchClause(node);
 }
 
-function unknownNumericResolution(): NumericConstantResolution {
-  return { kind: "unknown", chain: [] };
+function unknownNumericResolution(derivation?: NumericResolutionDerivation): NumericConstantResolution {
+  return derivation ? { kind: "unknown", chain: [], derivation } : { kind: "unknown", chain: [] };
 }
 
 function safeInteger(value: number): boolean {
   return Number.isSafeInteger(value);
+}
+
+function joinConditionalResolution(
+  expression: string,
+  trueBranch: NumericConstantResolution,
+  falseBranch: NumericConstantResolution,
+): NumericConstantResolution {
+  const derivation: NumericResolutionDerivation = {
+    kind: "conditional",
+    expression,
+    branches: [
+      { label: "true", resolution: trueBranch },
+      { label: "false", resolution: falseBranch },
+    ],
+  };
+  if (trueBranch.kind === "unknown" || falseBranch.kind === "unknown") return unknownNumericResolution(derivation);
+  if (trueBranch.value === undefined || falseBranch.value === undefined) return unknownNumericResolution(derivation);
+  const value = Math.max(trueBranch.value, falseBranch.value);
+  if (!safeInteger(value)) return unknownNumericResolution(derivation);
+  const exact = trueBranch.kind === "exact" && falseBranch.kind === "exact" && trueBranch.value === falseBranch.value;
+  return { kind: exact ? "exact" : "upper", value, chain: [], expression, derivation };
+}
+
+function joinMaxResolution(expression: string, operands: NumericConstantResolution[]): NumericConstantResolution {
+  const derivation: NumericResolutionDerivation = { kind: "max", expression, operands };
+  if (operands.length === 0 || operands.some((operand) => operand.kind === "unknown" || operand.value === undefined)) {
+    return unknownNumericResolution(derivation);
+  }
+  const value = Math.max(...operands.map((operand) => operand.value!));
+  if (!safeInteger(value)) return unknownNumericResolution(derivation);
+  const exact = operands.every((operand) => operand.kind === "exact");
+  const winners = operands.filter((operand) => operand.value === value);
+  const chain = [...new Set(winners.flatMap((operand) => operand.chain))];
+  return { kind: exact ? "exact" : "upper", value, chain, expression, derivation };
 }
 
 class NumericConstantResolver {
@@ -386,6 +428,11 @@ class NumericConstantResolver {
       seen.delete(binding);
       return resolved.kind === "exact" ? { ...resolved, chain: [value.text, ...resolved.chain] } : resolved;
     }
+    if (ts.isConditionalExpression(value)) {
+      const trueBranch = this.resolveExactExpression(value.whenTrue, scope, seen);
+      const falseBranch = this.resolveExactExpression(value.whenFalse, scope, seen);
+      return joinConditionalResolution(value.getText(), trueBranch, falseBranch);
+    }
     if (!ts.isBinaryExpression(value)) return unknownNumericResolution();
     const operator = ts.tokenToString(value.operatorToken.kind);
     if (operator !== "+" && operator !== "-" && operator !== "*") return unknownNumericResolution();
@@ -410,11 +457,17 @@ class NumericConstantResolver {
       seen.delete(binding);
       return resolved.kind === "unknown" ? resolved : { ...resolved, chain: [value.text, ...resolved.chain] };
     }
-    if (!ts.isCallExpression(value) || !ts.isPropertyAccessExpression(value.expression) || value.expression.getText() !== "Math.min") {
-      return unknownNumericResolution();
+    if (ts.isConditionalExpression(value)) {
+      const trueBranch = this.resolveUpperExpression(value.whenTrue, scope, new Set(seen));
+      const falseBranch = this.resolveUpperExpression(value.whenFalse, scope, new Set(seen));
+      return joinConditionalResolution(value.getText(), trueBranch, falseBranch);
     }
+    if (!ts.isCallExpression(value) || !ts.isPropertyAccessExpression(value.expression)) return unknownNumericResolution();
     if (value.arguments.length === 0) return unknownNumericResolution();
+    const functionName = value.expression.getText();
     const argumentsResolved = value.arguments.map((argument) => this.resolveUpperExpression(argument, scope, new Set(seen)));
+    if (functionName === "Math.max") return joinMaxResolution(value.getText(), argumentsResolved);
+    if (functionName !== "Math.min") return unknownNumericResolution();
     const known = argumentsResolved.filter((item) => item.kind !== "unknown" && item.value !== undefined);
     if (known.length === 0 || known.some((item) => !safeInteger(item.value!) || item.value! < 0)) return unknownNumericResolution();
     const upperValue = Math.min(...known.map((item) => item.value!));
@@ -564,6 +617,45 @@ function objectLiteralNumberArgument(
   return unknownNumericResolution();
 }
 
+function numericResolutionDetail(resolution: NumericConstantResolution): string {
+  if (resolution.kind === "unknown" || resolution.value === undefined) return "unknown";
+  const value = resolution.kind === "exact" ? `${resolution.value}` : `≤${resolution.value}`;
+  if (resolution.chain.length > 0) return `${resolution.chain.join(" → ")} → ${value}`;
+  const expression = resolution.expression?.trim();
+  if (expression && !/^[+-]?\d+(?:\.\d+)?$/.test(expression)) return `${expression} → ${value}`;
+  return value;
+}
+
+function derivedBoundReason(
+  name: string,
+  unit: BoundUnit,
+  resolution: NumericConstantResolution,
+  validValue: boolean,
+): string | undefined {
+  const derivation = resolution.derivation;
+  if (!derivation || (!validValue && resolution.kind !== "unknown")) return undefined;
+  if (derivation.kind === "conditional") {
+    const trueBranch = derivation.branches?.find((branch) => branch.label === "true")?.resolution ?? unknownNumericResolution();
+    const falseBranch = derivation.branches?.find((branch) => branch.label === "false")?.resolution ?? unknownNumericResolution();
+    const prefix = `${name} uses conditional expression.\n  true branch: ${numericResolutionDetail(trueBranch)}\n  false branch: ${numericResolutionDetail(falseBranch)}`;
+    if (resolution.kind === "unknown" || resolution.value === undefined) {
+      return `${prefix}\n  conditional join requires a finite upper bound for every branch; ${name} has no provable non-negative safe-integer bound (${unit}).`;
+    }
+    if (resolution.kind === "exact") return `${prefix}\n  join exact bound: ${resolution.value} ${unit}.`;
+    const values = [trueBranch.value, falseBranch.value].filter((value): value is number => value !== undefined);
+    return `${prefix}\n  join upper bound: max(${values.join(", ")}) = ${resolution.value} ${unit}.`;
+  }
+
+  const operands = derivation.operands ?? [];
+  const prefix = `${name} uses Math.max expression.\n${operands.map((operand, index) => `  operand ${index + 1}: ${numericResolutionDetail(operand)}`).join("\n")}`;
+  if (resolution.kind === "unknown" || resolution.value === undefined) {
+    return `${prefix}\n  max join requires a finite upper bound for every operand; ${name} has no provable non-negative safe-integer bound (${unit}).`;
+  }
+  const values = operands.map((operand) => operand.value!).join(", ");
+  const label = resolution.kind === "exact" ? "exact" : "upper";
+  return `${prefix}\n  max join ${label} bound: max(${values}) = ${resolution.value} ${unit}.`;
+}
+
 function resolveEffectBound(call: ts.CallExpression, effect: ContextEffect, sf: ts.SourceFile, resolver: NumericConstantResolver): EffectBoundResolution {
   const declaration = effect.kind === "select" || effect.kind === "compress" ? effect.bound : undefined;
   if (!declaration) return {};
@@ -574,13 +666,15 @@ function resolveEffectBound(call: ts.CallExpression, effect: ContextEffect, sf: 
     : resolution.kind === "upper"
       ? upperBound(resolution.value!, declaration.unit)
       : exactBound(resolution.value!, declaration.unit);
-  const reason = !validValue
-    ? `${declaration.name} has no provable non-negative safe-integer bound (${declaration.unit}).`
-    : resolution.kind === "upper"
-      ? `${declaration.name} is upper-bounded by ${resolution.value} ${declaration.unit}${resolution.expression ? ` via ${resolution.expression}` : ""}${resolution.chain.length > 0 ? ` through ${resolution.chain.join(" → ")}` : ""}.`
-      : resolution.chain.length > 0
-        ? `${declaration.name} resolves through ${resolution.chain.join(" → ")} = ${resolution.value} ${declaration.unit}.`
-        : `${declaration.name} resolves to exact ${resolution.value} ${declaration.unit}.`;
+  const reason = derivedBoundReason(declaration.name, declaration.unit, resolution, validValue) ?? (
+    !validValue
+      ? `${declaration.name} has no provable non-negative safe-integer bound (${declaration.unit}).`
+      : resolution.kind === "upper"
+        ? `${declaration.name} is upper-bounded by ${resolution.value} ${declaration.unit}${resolution.expression ? ` via ${resolution.expression}` : ""}${resolution.chain.length > 0 ? ` through ${resolution.chain.join(" → ")}` : ""}.`
+        : resolution.chain.length > 0
+          ? `${declaration.name} resolves through ${resolution.chain.join(" → ")} = ${resolution.value} ${declaration.unit}.`
+          : `${declaration.name} resolves to exact ${resolution.value} ${declaration.unit}.`
+  );
   return { bound, reason };
 }
 

@@ -88,8 +88,8 @@ const cases: readonly AliasCase[] = [
     reasonIncludes: "length has no provable non-negative safe-integer bound (bytes).",
   },
   {
-    name: "conditional initializer remains unknown",
-    program: `const LIMIT = condition ? 4096 : 8192; return extensions.ctx_read({ id: "h", length: LIMIT });`,
+    name: "conditional dynamic initializer remains unknown",
+    program: `const LIMIT = condition ? 4096 : requested; return extensions.ctx_read({ id: "h", length: LIMIT });`,
     expected: { kind: "unknown", unit: "bytes" },
     reasonIncludes: "length has no provable non-negative safe-integer bound (bytes).",
   },
