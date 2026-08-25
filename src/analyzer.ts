@@ -8,7 +8,15 @@
  */
 
 import ts from "typescript";
-import { contextEffectFor, isContextHelperName, isFoveaName } from "./context-effects.js";
+import {
+  contextEffectFor,
+  isContextHelperName,
+  isFoveaName,
+  type BoundUnit,
+  type ContextEffect,
+  type ContextProvenanceStep,
+  type ResolvedBound,
+} from "./context-effects.js";
 
 export type TaintKind =
   | "clean"
@@ -57,6 +65,10 @@ export interface ProgramMetrics {
   estimatedRetentionRatio: number | null;
   /** 0..1 estimate of source payload removed before return. */
   estimatedReductionRatio: number | null;
+  /** Quantitative result bound; unknown means no literal numeric bound was resolved. */
+  returnBound?: ResolvedBound;
+  /** Structured source/effect history for the final returned flow. */
+  returnProvenance: ContextProvenanceStep[];
 }
 
 export interface AnalyzerOptions {
@@ -78,6 +90,10 @@ interface Flow {
   operation: string;
   /** Statically known numeric constants survive aliases and helper arguments. */
   constantNumber?: number;
+  /** Quantitative output bound, independent from the policy bounded flag. */
+  bound?: ResolvedBound;
+  /** Structured source/effect history for this value. */
+  provenance: ContextProvenanceStep[];
 }
 
 interface FunctionLike {
@@ -94,15 +110,57 @@ interface EvalState {
 const UNSAFE_KINDS = new Set<TaintKind>(["raw", "encoded", "unknown"]);
 const REDUCING_KINDS = new Set<TaintKind>(["projected", "selected", "aggregated", "compressed", "offloaded"]);
 
-function cleanFlow(operation = "constant", constantNumber?: number): Flow {
-  return { kind: "clean", hasSource: false, bounded: true, meaningful: false, retention: 0, operation, constantNumber };
+function unknownBound(unit?: BoundUnit): ResolvedBound {
+  return unit ? { kind: "unknown", unit } : { kind: "unknown" };
 }
 
-function sourceFlow(kind: TaintKind = "raw", operation = "tool result", retention = 1): Flow {
-  return { kind, hasSource: true, bounded: false, meaningful: false, retention: Math.max(0, Math.min(1, retention)), operation };
+function constantBound(value: number, unit: BoundUnit): ResolvedBound {
+  return { kind: "constant", value, unit };
 }
 
-function reducedFlow(kind: TaintKind, operation: string, retention: number, bounded = false): Flow {
+function effectStep(operation: string, effect: ContextEffect["kind"], bound?: ResolvedBound): ContextProvenanceStep {
+  return bound === undefined ? { operation, effect } : { operation, effect, bound };
+}
+
+function mergeProvenance(flows: Flow[]): ContextProvenanceStep[] {
+  return flows.flatMap((flow) => flow.provenance);
+}
+
+function withUnknownBound(flow: Flow, operation = flow.operation): Flow {
+  return { ...flow, operation, bound: unknownBound() };
+}
+
+function cleanFlow(operation = "constant", constantNumber?: number, provenance: ContextProvenanceStep[] = []): Flow {
+  return { kind: "clean", hasSource: false, bounded: true, meaningful: false, retention: 0, operation, constantNumber, provenance };
+}
+
+function sourceFlow(
+  kind: TaintKind = "raw",
+  operation = "tool result",
+  retention = 1,
+  provenance: ContextProvenanceStep[] = [],
+  bound: ResolvedBound = unknownBound(),
+): Flow {
+  return {
+    kind,
+    hasSource: true,
+    bounded: false,
+    meaningful: false,
+    retention: Math.max(0, Math.min(1, retention)),
+    operation,
+    provenance,
+    bound,
+  };
+}
+
+function reducedFlow(
+  kind: TaintKind,
+  operation: string,
+  retention: number,
+  bounded = false,
+  provenance: ContextProvenanceStep[] = [],
+  bound: ResolvedBound = unknownBound(),
+): Flow {
   return {
     kind,
     hasSource: true,
@@ -111,11 +169,19 @@ function reducedFlow(kind: TaintKind, operation: string, retention: number, boun
     // If the operation is dynamically sized, it may retain the entire source.
     retention: bounded ? Math.max(0, Math.min(1, retention)) : 1,
     operation,
+    provenance,
+    bound,
   };
 }
 
-function boundedFlow(kind: TaintKind, operation: string, retention: number): Flow {
-  return reducedFlow(kind, operation, retention, true);
+function boundedFlow(
+  kind: TaintKind,
+  operation: string,
+  retention: number,
+  provenance: ContextProvenanceStep[] = [],
+  bound: ResolvedBound = unknownBound(),
+): Flow {
+  return reducedFlow(kind, operation, retention, true, provenance, bound);
 }
 
 function getCalleeText(expr: ts.Expression, sf: ts.SourceFile): string {
@@ -160,16 +226,18 @@ function unwrap(expr: ts.Expression): ts.Expression {
   return current;
 }
 
-function combine(flows: Flow[], operation: string): Flow {
+function combine(flows: Flow[], operation: string, preserveSingleBound = false): Flow {
   const sourced = flows.filter((flow) => flow.hasSource);
   if (sourced.length === 0) return cleanFlow(operation);
+  const provenance = mergeProvenance(sourced);
+  const combinedBound = preserveSingleBound && sourced.length === 1 ? sourced[0].bound : unknownBound();
 
   const firstUnsafe = sourced.find((flow) => flow.kind === "raw");
-  if (firstUnsafe) return { ...firstUnsafe, operation };
+  if (firstUnsafe) return { ...firstUnsafe, operation, provenance, bound: unknownBound() };
   const encoded = sourced.find((flow) => flow.kind === "encoded");
-  if (encoded) return { ...encoded, operation };
+  if (encoded) return { ...encoded, operation, provenance, bound: unknownBound() };
   const unknown = sourced.find((flow) => flow.kind === "unknown");
-  if (unknown) return { ...unknown, operation };
+  if (unknown) return { ...unknown, operation, provenance, bound: unknownBound() };
 
   const kind = sourced.some((flow) => flow.kind === "offloaded")
     ? "offloaded"
@@ -187,6 +255,8 @@ function combine(flows: Flow[], operation: string): Flow {
     meaningful: sourced.some((flow) => flow.meaningful),
     retention: Math.max(...sourced.map((flow) => flow.retention)),
     operation,
+    provenance,
+    bound: combinedBound,
   };
 }
 
@@ -199,24 +269,30 @@ const SCALAR_RESULT_PROPERTIES = new Set([
 function propertyFlow(receiver: Flow, property: string): Flow {
   if (!receiver.hasSource) return cleanFlow(`property ${property}`);
   if (SCALAR_RESULT_PROPERTIES.has(property)) {
-    return boundedFlow("projected", `scalar property ${property}`, 0.01);
+    return boundedFlow("projected", `scalar property ${property}`, 0.01, [
+      ...receiver.provenance,
+      effectStep(property, "scalar", unknownBound()),
+    ]);
   }
   if (["content", "data", "result", "stdout", "stderr", "text", "body", "value"].includes(property)) {
-    return { ...receiver, operation: `raw property ${property}` };
+    return withUnknownBound({ ...receiver, operation: `raw property ${property}` });
   }
   // A property projection is structurally smaller but the property itself can
   // still contain the whole source. It is therefore not a proof of a bound.
-  return reducedFlow("projected", `project property ${property}`, Math.min(receiver.retention, 0.5));
+  return reducedFlow("projected", `project property ${property}`, Math.min(receiver.retention, 0.5), false, receiver.provenance);
 }
 
 function elementFlow(receiver: Flow, index?: string): Flow {
   if (!receiver.hasSource) return cleanFlow("array element");
-  if (index === "length" || index === "size") return boundedFlow("projected", "scalar element", 0.01);
+  if (index === "length" || index === "size") return boundedFlow("projected", "scalar element", 0.01, [
+    ...receiver.provenance,
+    effectStep(index, "scalar", unknownBound()),
+  ]);
   // Selecting one container element does not bound the size of that element;
   // `[raw][0]`, `Promise.all([raw])[0]`, and computed properties can still be
   // the complete source payload.
-  if (UNSAFE_KINDS.has(receiver.kind)) return { ...receiver, operation: "select source element" };
-  return boundedFlow("selected", "select element", Math.min(receiver.retention, 0.25));
+  if (UNSAFE_KINDS.has(receiver.kind)) return withUnknownBound({ ...receiver, operation: "select source element" });
+  return boundedFlow("selected", "select element", Math.min(receiver.retention, 0.25), receiver.provenance);
 }
 
 function literalNumber(
@@ -256,6 +332,33 @@ function objectNumberArgument(
   return undefined;
 }
 
+/** Quantitative resolution is deliberately stricter than policy resolution. */
+function objectLiteralNumberArgument(
+  call: ts.CallExpression,
+  name: string,
+  sf: ts.SourceFile,
+): number | undefined {
+  const first = call.arguments[0];
+  if (!first || !ts.isObjectLiteralExpression(first)) return undefined;
+  for (const property of first.properties) {
+    if (!ts.isPropertyAssignment(property)) continue;
+    const key = property.name.getText(sf).replace(/["']/g, "");
+    if (key !== name) continue;
+    const value = unwrap(property.initializer);
+    if (!ts.isNumericLiteral(value)) return undefined;
+    const number = Number(value.text);
+    return Number.isFinite(number) ? number : undefined;
+  }
+  return undefined;
+}
+
+function resolveEffectBound(call: ts.CallExpression, effect: ContextEffect, sf: ts.SourceFile): ResolvedBound | undefined {
+  const declaration = effect.kind === "select" || effect.kind === "compress" ? effect.bound : undefined;
+  if (!declaration) return undefined;
+  const value = objectLiteralNumberArgument(call, declaration.name, sf);
+  return value === undefined ? unknownBound(declaration.unit) : constantBound(value, declaration.unit);
+}
+
 function callArgs(call: ts.CallExpression, env: Map<string, Flow>, state: EvalState, sf: ts.SourceFile): Flow[] {
   return call.arguments
     .filter((arg) => !ts.isArrowFunction(arg) && !ts.isFunctionExpression(arg))
@@ -270,18 +373,20 @@ function evaluateCallback(
   sf: ts.SourceFile,
 ): Flow {
   if (!callback || (!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback))) {
-    return sourceFlow("unknown", "unknown callback", receiver.retention);
+    return sourceFlow("unknown", "unknown callback", receiver.retention, receiver.provenance);
   }
 
   const local = new Map(env);
-  const item = receiver.hasSource ? sourceFlow(receiver.kind === "raw" ? "raw" : "projected", "collection item", receiver.retention) : cleanFlow("collection item");
+  const item = receiver.hasSource
+    ? sourceFlow(receiver.kind === "raw" ? "raw" : "projected", "collection item", receiver.retention, receiver.provenance)
+    : cleanFlow("collection item");
   if (callback.parameters[0]) bindPattern(callback.parameters[0].name, item, local, state, sf);
   if (callback.parameters[1]) bindPattern(callback.parameters[1].name, cleanFlow("index"), local, state, sf);
 
   if (ts.isBlock(callback.body)) {
     const returns: Flow[] = [];
     visitFunctionStatements(callback.body, local, state, sf, returns);
-    return returns.length > 0 ? combine(returns, "callback return") : cleanFlow("callback");
+    return returns.length > 0 ? combine(returns, "callback return", true) : cleanFlow("callback");
   }
   return evaluateExpression(callback.body, local, state, sf);
 }
@@ -303,23 +408,23 @@ function evaluateMethodCall(
     case "flatMap": {
       const mapped = evaluateCallback(callback, receiver, env, state, sf);
       if (!mapped.hasSource) return cleanFlow(`${method} scalar projection`);
-      if (UNSAFE_KINDS.has(mapped.kind)) return { ...mapped, operation: `${method} preserves source` };
+      if (UNSAFE_KINDS.has(mapped.kind)) return withUnknownBound({ ...mapped, operation: `${method} preserves source` });
       state.meaningfulTransformations++;
       // map/flatMap can emit one item per input (or more), so field mapping
       // is not a proof that the total result is context-bounded.
-      return reducedFlow(mapped.kind === "aggregated" ? "aggregated" : "projected", `${method} projection`, Math.min(receiver.retention, mapped.retention, 0.5));
+      return reducedFlow(mapped.kind === "aggregated" ? "aggregated" : "projected", `${method} projection`, Math.min(receiver.retention, mapped.retention, 0.5), false, mapped.provenance);
     }
     case "filter":
       state.meaningfulTransformations++;
-      return reducedFlow("selected", "filter collection", Math.min(receiver.retention, 0.5));
+      return reducedFlow("selected", "filter collection", Math.min(receiver.retention, 0.5), false, receiver.provenance);
     case "find":
     case "findLast":
       state.meaningfulTransformations++;
-      return boundedFlow("selected", `select ${method} item`, Math.min(receiver.retention, 0.15));
+      return boundedFlow("selected", `select ${method} item`, Math.min(receiver.retention, 0.15), receiver.provenance);
     case "reduce":
     case "reduceRight":
       state.meaningfulTransformations++;
-      return reducedFlow("aggregated", `${method} aggregation`, Math.min(receiver.retention, 0.15));
+      return reducedFlow("aggregated", `${method} aggregation`, Math.min(receiver.retention, 0.15), false, receiver.provenance);
     case "slice":
     case "substring":
     case "substr": {
@@ -335,13 +440,13 @@ function evaluateMethodCall(
           ? Math.abs(start)
           : undefined;
       return limit !== undefined
-        ? boundedFlow("selected", `${method} bounded selection`, Math.min(receiver.retention, Math.max(0.02, limit / 1000)))
-        : reducedFlow("selected", `${method} unbounded selection`, receiver.retention);
+        ? boundedFlow("selected", `${method} bounded selection`, Math.min(receiver.retention, Math.max(0.02, limit / 1000)), receiver.provenance)
+        : reducedFlow("selected", `${method} unbounded selection`, receiver.retention, false, receiver.provenance);
     }
     case "match":
     case "matchAll":
       state.meaningfulTransformations++;
-      return reducedFlow("selected", `${method} selection`, Math.min(receiver.retention, 0.25));
+      return reducedFlow("selected", `${method} selection`, Math.min(receiver.retention, 0.25), false, receiver.provenance);
     case "includes":
     case "startsWith":
     case "endsWith":
@@ -351,17 +456,20 @@ function evaluateMethodCall(
     case "every":
     case "has":
       state.meaningfulTransformations++;
-      return boundedFlow("projected", `${method} scalar predicate`, 0.01);
+      return boundedFlow("projected", `${method} scalar predicate`, 0.01, [
+        ...receiver.provenance,
+        effectStep(method, "scalar", unknownBound()),
+      ]);
     case "join":
       if (UNSAFE_KINDS.has(receiver.kind)) {
-        return { ...receiver, operation: "join preserves source" };
+        return withUnknownBound({ ...receiver, operation: "join preserves source" });
       }
       state.meaningfulTransformations++;
-      return reducedFlow("selected", "join projected values", receiver.retention, receiver.bounded);
+      return reducedFlow("selected", "join projected values", receiver.retention, receiver.bounded, receiver.provenance);
     case "split":
       // Splitting alone does not reduce data; `.length`, `.filter`, etc. do.
       // Preserve the receiver's taint instead of escalating it.
-      return { ...receiver, operation: "split without reduction" };
+      return withUnknownBound({ ...receiver, operation: "split without reduction" });
     case "trim":
     case "replace":
     case "replaceAll":
@@ -370,12 +478,12 @@ function evaluateMethodCall(
       // Normalization does not prove any context bound. Preserve the receiver's
       // taint and let the final bound check reject raw-preserving transforms.
       state.meaningfulTransformations++;
-      return { ...receiver, operation: `${method} preserves source` };
+      return withUnknownBound({ ...receiver, operation: `${method} preserves source` });
     case "sort":
     case "reverse":
-      return { ...receiver, operation: `${method} reorders source` };
+      return withUnknownBound({ ...receiver, operation: `${method} reorders source` });
     default:
-      return { ...receiver, kind: "unknown", operation: `unknown method ${method}` };
+      return withUnknownBound({ ...receiver, kind: "unknown", operation: `unknown method ${method}` });
   }
 }
 
@@ -385,68 +493,85 @@ function evaluateCall(call: ts.CallExpression, env: Map<string, Flow>, state: Ev
   if (isContextHelperText(name)) {
     const args = callArgs(call, env, state, sf);
     const source = args.some((flow) => flow.hasSource);
+    const bound = resolveEffectBound(call, effect, sf);
+    const outputBound = effect.kind === "offload" ? unknownBound() : bound;
+    const provenance = [...mergeProvenance(args), effectStep(name, effect.kind, outputBound)];
     if (effect.kind === "compress") {
       state.meaningfulTransformations++;
       const boundName = effect.bound?.name;
       const maxTokens = boundName ? objectNumberArgument(call, boundName, sf, env) : undefined;
-      return boundedFlow("compressed", "context summary", maxTokens ? Math.min(0.08, maxTokens / 10000) : 0.08);
+      return boundedFlow("compressed", "context summary", maxTokens ? Math.min(0.08, maxTokens / 10000) : 0.08, provenance, outputBound);
     }
     if (effect.kind === "offload") {
       state.meaningfulTransformations++;
-      return boundedFlow("offloaded", "context offload", 0);
+      return boundedFlow("offloaded", "context offload", 0, provenance, outputBound);
     }
     if (effect.kind === "select") {
       state.meaningfulTransformations++;
-      return boundedFlow("selected", "context selection", 0.25);
+      return boundedFlow("selected", "context selection", 0.25, provenance, outputBound);
     }
     if (effect.kind === "scalar") {
-      return source ? boundedFlow("projected", "context scalar", 0.01) : cleanFlow("context scalar");
+      return source
+        ? boundedFlow("projected", "context scalar", 0.01, provenance)
+        : cleanFlow("context scalar", undefined, provenance);
     }
-    return source ? reducedFlow("selected", "context helper", 0.25) : cleanFlow("context helper");
+    return source
+      ? reducedFlow("selected", "context helper", 0.25, false, provenance)
+      : cleanFlow("context helper", undefined, provenance);
   }
 
   if (isFoveaCall(call, sf)) {
     const boundName = effect.kind === "select" ? effect.bound?.name : undefined;
     const maxTokens = boundName ? objectNumberArgument(call, boundName, sf, env) : undefined;
+    const bound = resolveEffectBound(call, effect, sf) ?? unknownBound("tokens");
+    const provenance = [effectStep(name, effect.kind, bound)];
     if (maxTokens !== undefined) {
       state.boundedSelectionCalls++;
       state.meaningfulTransformations++;
-      return boundedFlow("selected", "Fovea budgeted selection", Math.min(0.25, maxTokens / 10000));
+      return boundedFlow("selected", "Fovea budgeted selection", Math.min(0.25, maxTokens / 10000), provenance, bound);
     }
-    return sourceFlow("unknown", "unbounded Fovea selection");
+    return sourceFlow("unknown", "unbounded Fovea selection", 1, provenance, bound);
   }
 
-  if (effect.kind === "source" || isDataToolCall(call, sf)) return sourceFlow("raw", `data source ${name}`);
+  if (effect.kind === "source" || isDataToolCall(call, sf)) {
+    return sourceFlow("raw", `data source ${name}`, 1, [effectStep(name, "source")]);
+  }
 
   const args = callArgs(call, env, state, sf);
   const sourced = args.some((flow) => flow.hasSource);
+  const sourceProvenance = mergeProvenance(args);
   const simpleName = name.replace(/^.*\./, "");
 
   if (["String", "JSON.stringify", "encodeURIComponent", "btoa", "Buffer.from"].includes(name) || ["Stringify", "toString"].includes(simpleName)) {
     const flow = args.find((item) => item.hasSource);
-    return flow ? { ...flow, kind: "encoded", meaningful: false, operation: `${name} preserves source` } : cleanFlow(name);
+    return flow ? withUnknownBound({ ...flow, kind: "encoded", meaningful: false, operation: `${name} preserves source` }) : cleanFlow(name);
   }
   if (name === "JSON.parse") {
     const flow = args.find((item) => item.hasSource);
-    return flow ? { ...flow, kind: "unknown", meaningful: false, operation: "JSON.parse preserves source" } : cleanFlow(name);
+    return flow ? withUnknownBound({ ...flow, kind: "unknown", meaningful: false, operation: "JSON.parse preserves source" }) : cleanFlow(name);
   }
   if (name === "Object.fromEntries") {
-    return sourced ? reducedFlow("projected", "Object.fromEntries projection", 0.25) : cleanFlow(name);
+    return sourced ? reducedFlow("projected", "Object.fromEntries projection", 0.25, false, sourceProvenance) : cleanFlow(name);
   }
   if (name === "Array.from" || name === "Array.of") {
-    return sourced ? reducedFlow("projected", `${name} projection`, 0.5) : cleanFlow(name);
+    return sourced ? reducedFlow("projected", `${name} projection`, 0.5, false, sourceProvenance) : cleanFlow(name);
   }
   if (["Object.keys", "Object.entries"].includes(name)) {
-    return sourced ? reducedFlow("projected", `${name} dynamically sized projection`, 0.25) : cleanFlow(name);
+    return sourced ? reducedFlow("projected", `${name} dynamically sized projection`, 0.25, false, sourceProvenance) : cleanFlow(name);
   }
   if (name === "Object.values") {
-    return sourced ? reducedFlow("selected", "Object.values dynamically sized selection", 0.5) : cleanFlow(name);
+    return sourced ? reducedFlow("selected", "Object.values dynamically sized selection", 0.5, false, sourceProvenance) : cleanFlow(name);
   }
   if (["Math.abs", "Math.ceil", "Math.floor", "Math.round", "Number", "Boolean", "parseInt", "parseFloat"].includes(name)) {
-    return sourced ? boundedFlow("projected", `${name} scalar projection`, 0.01) : cleanFlow(name);
+    return sourced
+      ? boundedFlow("projected", `${name} scalar projection`, 0.01, [
+          ...sourceProvenance,
+          effectStep(name, "scalar", unknownBound()),
+        ])
+      : cleanFlow(name);
   }
   if (/^Promise\.(?:resolve|reject)$/.test(name)) {
-    return combine(args, `${name} preserves source`);
+    return combine(args, `${name} preserves source`, true);
   }
   if (/^Promise\.(?:all|allSettled|race|any)$/.test(name)) {
     return combine(args, `${name} aggregate`);
@@ -468,7 +593,7 @@ function evaluateCall(call: ts.CallExpression, env: Map<string, Flow>, state: Ev
   }
 
   // Unknown functions receiving source data are not assumed to compress it.
-  return sourced ? sourceFlow("unknown", `unknown function ${name}`) : cleanFlow(`call ${name}`);
+  return sourced ? sourceFlow("unknown", `unknown function ${name}`, 1, sourceProvenance) : cleanFlow(`call ${name}`);
 }
 
 function evaluateExpression(expr: ts.Expression, env: Map<string, Flow>, state: EvalState, sf: ts.SourceFile): Flow {
@@ -490,7 +615,7 @@ function evaluateExpression(expr: ts.Expression, env: Map<string, Flow>, state: 
     const flow = combine(expressions, "template interpolation");
     // Interpolation is bounded composition, not data amplification: keep the
     // worst source kind but do not escalate to "encoded".
-    return flow.hasSource ? { ...flow, operation: "template interpolation" } : cleanFlow("template");
+    return flow.hasSource ? withUnknownBound({ ...flow, operation: "template interpolation" }) : cleanFlow("template");
   }
   if (ts.isPropertyAccessExpression(value)) return propertyFlow(evaluateExpression(value.expression, env, state, sf), value.name.text);
   if (ts.isElementAccessExpression(value)) {
@@ -531,7 +656,7 @@ function evaluateExpression(expr: ts.Expression, env: Map<string, Flow>, state: 
       return combine([left, right], `short-circuit ${operation}`);
     }
     const flow = combine([left, right], operation);
-    return flow.hasSource ? { ...flow, operation: `${operation} combines source` } : flow;
+    return flow.hasSource ? withUnknownBound({ ...flow, operation: `${operation} combines source` }) : flow;
   }
   if (ts.isParenthesizedExpression(value)) return evaluateExpression(value.expression, env, state, sf);
 
@@ -622,7 +747,7 @@ function evaluateFunction(
   if (!ts.isBlock(fn.body)) return evaluateExpression(fn.body, env, state, sf);
   const returns: Flow[] = [];
   visitFunctionStatements(fn.body, env, state, sf, returns);
-  return returns.length > 0 ? combine(returns, "function return") : cleanFlow("function");
+  return returns.length > 0 ? combine(returns, "function return", true) : cleanFlow("function");
 }
 
 function collectProgramMetrics(sf: ts.SourceFile, metrics: ProgramMetrics): void {
@@ -674,6 +799,7 @@ export function analyzeProgram(source: string, opts: AnalyzerOptions = {}): Anal
     estimatedSourceTokens: null,
     estimatedRetentionRatio: null,
     estimatedReductionRatio: null,
+    returnProvenance: [],
   };
 
   const sourceText = source.trim();
@@ -693,7 +819,7 @@ export function analyzeProgram(source: string, opts: AnalyzerOptions = {}): Anal
   const env = new Map<string, Flow>();
   visitBindings(sf, env, state, sf);
   const returns = topLevelReturns(sf, env, state);
-  const returned = returns.length > 0 ? combine(returns, "program return") : cleanFlow("no return");
+  const returned = returns.length > 0 ? combine(returns, "program return", true) : cleanFlow("no return");
 
   metrics.boundedSelectionCalls = state.boundedSelectionCalls;
   metrics.meaningfulTransformations = state.meaningfulTransformations;
@@ -706,6 +832,8 @@ export function analyzeProgram(source: string, opts: AnalyzerOptions = {}): Anal
   metrics.hasProcessingBetweenToolAndReturn = returned.hasSource && (returned.meaningful || REDUCING_KINDS.has(returned.kind));
   metrics.estimatedRetentionRatio = returned.hasSource ? returned.retention : null;
   metrics.estimatedReductionRatio = returned.hasSource ? Math.max(0, 1 - returned.retention) : null;
+  metrics.returnBound = returned.bound;
+  metrics.returnProvenance = returned.provenance;
 
   for (const node of returns) {
     // This is deliberately only a source-size estimate for static returns;

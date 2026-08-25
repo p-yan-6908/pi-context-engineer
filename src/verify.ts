@@ -7,6 +7,8 @@ import { evaluateProgram } from "./wrapper.js";
 import { ceToolMap } from "./tools.js";
 import { FabricExecutionScopes } from "./execution-scope.js";
 import { contextEffectFor, contextEffects, isFoveaName } from "./context-effects.js";
+import type { ResolvedBound } from "./context-effects.js";
+import { runV04Differential } from "./verify-differential.js";
 
 type TestCase = {
   name: string;
@@ -366,6 +368,132 @@ if (!sourceFallbackOk) registryFailures++;
 if (!unknownHelperOk) registryFailures++;
 if (!foveaIdentityOk) registryFailures++;
 
+const quantitativeCases: Array<{
+  name: string;
+  program: string;
+  bound: ResolvedBound;
+  effects: string[];
+  expectBlock?: boolean;
+}> = [
+  {
+    name: "ctx_read literal 4096 bytes",
+    program: `return extensions.ctx_read({ id: "handle", length: 4096 });`,
+    bound: { kind: "constant", value: 4096, unit: "bytes" },
+    effects: ["extensions.ctx_read:select"],
+  },
+  {
+    name: "ctx_read literal zero bytes",
+    program: `return extensions.ctx_read({ id: "handle", length: 0 });`,
+    bound: { kind: "constant", value: 0, unit: "bytes" },
+    effects: ["extensions.ctx_read:select"],
+  },
+  {
+    name: "ctx_read literal one byte",
+    program: `return extensions.ctx_read({ id: "handle", length: 1 });`,
+    bound: { kind: "constant", value: 1, unit: "bytes" },
+    effects: ["extensions.ctx_read:select"],
+  },
+  {
+    name: "ctx_read identifier remains unknown",
+    program: `const n = 4096; return extensions.ctx_read({ id: "handle", length: n });`,
+    bound: { kind: "unknown", unit: "bytes" },
+    effects: ["extensions.ctx_read:select"],
+  },
+  {
+    name: "ctx_read arithmetic remains unknown",
+    program: `return extensions.ctx_read({ id: "handle", length: 2 * 2048 });`,
+    bound: { kind: "unknown", unit: "bytes" },
+    effects: ["extensions.ctx_read:select"],
+  },
+  {
+    name: "ctx_summarize literal 300 tokens",
+    program: `return extensions.ctx_summarize({ text: "x", maxTokens: 300 });`,
+    bound: { kind: "constant", value: 300, unit: "tokens" },
+    effects: ["extensions.ctx_summarize:compress"],
+  },
+  {
+    name: "ctx_delegate literal 500 tokens",
+    program: `return ctx_delegate({ prompt: "x", maxTokens: 500 });`,
+    bound: { kind: "constant", value: 500, unit: "tokens" },
+    effects: ["ctx_delegate:compress"],
+  },
+  {
+    name: "Fovea literal 1000 tokens",
+    program: `return extensions.fovea_focus({ query: "x", maxTokens: 1000 });`,
+    bound: { kind: "constant", value: 1000, unit: "tokens" },
+    effects: ["extensions.fovea_focus:select"],
+  },
+  {
+    name: "raw source is unknown and unbounded",
+    program: `return pi.read({ path: "x" });`,
+    bound: { kind: "unknown" },
+    effects: ["pi.read:source"],
+    expectBlock: true,
+  },
+  {
+    name: "offload retains source and offload provenance",
+    program: `return extensions.ctx_offload({ key: "x", source: "read", data: pi.read({ path: "x" }) });`,
+    bound: { kind: "unknown" },
+    effects: ["pi.read:source", "extensions.ctx_offload:offload"],
+  },
+  {
+    name: "source to ctx_read preserves trace",
+    program: `const raw = await pi.read({ path: "x" }); return extensions.ctx_read({ id: raw, length: 4096 });`,
+    bound: { kind: "constant", value: 4096, unit: "bytes" },
+    effects: ["pi.read:source", "extensions.ctx_read:select"],
+  },
+  {
+    name: "source to select to compress preserves trace",
+    program: `const raw = await pi.read({ path: "x" }); const page = await extensions.ctx_read({ id: raw, length: 4096 }); return extensions.ctx_summarize({ text: page, maxTokens: 300 });`,
+    bound: { kind: "constant", value: 300, unit: "tokens" },
+    effects: ["pi.read:source", "extensions.ctx_read:select", "extensions.ctx_summarize:compress"],
+  },
+  {
+    name: "scalar projection has no payload unit",
+    program: `const raw = await pi.read({ path: "x" }); return raw.length;`,
+    bound: { kind: "unknown" },
+    effects: ["pi.read:source", "length:scalar"],
+  },
+  {
+    name: "ctx_read string argument remains unknown",
+    program: `return extensions.ctx_read({ id: "handle", length: "4096" });`,
+    bound: { kind: "unknown", unit: "bytes" },
+    effects: ["extensions.ctx_read:select"],
+  },
+  {
+    name: "ctx_summarize zero tokens is literal",
+    program: `return extensions.ctx_summarize({ text: "x", maxTokens: 0 });`,
+    bound: { kind: "constant", value: 0, unit: "tokens" },
+    effects: ["extensions.ctx_summarize:compress"],
+  },
+];
+let quantitativeFailures = 0;
+const sameBound = (actual: ResolvedBound | undefined, expected: ResolvedBound): boolean => JSON.stringify(actual) === JSON.stringify(expected);
+for (const test of quantitativeCases) {
+  const result = analyzeProgram(test.program);
+  const effects = result.metrics.returnProvenance.map((step) => `${step.operation}:${step.effect}`);
+  const matched = sameBound(result.metrics.returnBound, test.bound) &&
+    JSON.stringify(effects) === JSON.stringify(test.effects) &&
+    (test.expectBlock === undefined || result.hardBlock === test.expectBlock);
+  console.log(`${matched ? "[ok]" : "[FAIL]"} quantitative ${test.name}`);
+  if (!matched) quantitativeFailures++;
+}
+const bytesBound = analyzeProgram(`return extensions.ctx_read({ id: "h", length: 4096 });`).metrics.returnBound;
+const tokensBound = analyzeProgram(`return extensions.ctx_summarize({ text: "x", maxTokens: 4096 });`).metrics.returnBound;
+const unitsStayDistinct =
+  bytesBound?.kind === "constant" && tokensBound?.kind === "constant" &&
+  bytesBound.unit === "bytes" && tokensBound.unit === "tokens" &&
+  JSON.stringify(bytesBound) !== JSON.stringify(tokensBound);
+console.log(`${unitsStayDistinct ? "[ok]" : "[FAIL]"} quantitative bounds do not conflate bytes and tokens`);
+if (!unitsStayDistinct) quantitativeFailures++;
+
+const differential = runV04Differential();
+console.log(`[${differential.failed === 0 ? "ok" : "FAIL"}] v0.4 differential: ${differential.passed}/${differential.passed + differential.failed} classifications preserved`);
+for (const failure of differential.failures) {
+  console.log(`     ${failure.name}: expected ${JSON.stringify(failure.expected)}, got ${JSON.stringify(failure.actual)}`);
+}
+const differentialFailures = differential.failed;
+
 const scopes = new FabricExecutionScopes();
 scopes.start({ toolCallId: "fabric_a", workspaceRoot: "/tmp/a", startedAt: 1 });
 scopes.start({ toolCallId: "fabric_b", workspaceRoot: "/tmp/b", startedAt: 2 });
@@ -448,4 +576,4 @@ if (!delegateTool) {
   if (!delegateOk) toolFailures++;
 }
 console.log(`Tool checks: ${toolFailures === 0 ? "passed" : `${toolFailures} failed`}.`);
-process.exit(failed + wrapperFailures + toolFailures + scopeFailures + registryFailures > 0 ? 1 : 0);
+process.exit(failed + wrapperFailures + toolFailures + scopeFailures + registryFailures + quantitativeFailures + differentialFailures > 0 ? 1 : 0);

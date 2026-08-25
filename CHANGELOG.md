@@ -7,6 +7,8 @@
 - Added the exported `ContextEffect` vocabulary and registry for source, scalar, select, compress, offload, passthrough, and unknown calls.
 - Moved `ctx_*`, `ce_*`, and Fovea bound-argument definitions into registry metadata; analyzer behavior remains compatible with v0.4.0.
 - Added registry contract checks for byte/token bounds, aliases, source fallback, and conservative unknown-helper handling.
+- Added unit-aware literal `returnBound` results and structured `returnProvenance` traces; identifier aliases and arithmetic remain unknown by design.
+- Added a permanent 12-case v0.4 differential suite covering allow/reject, taint, reduction, boundedness, and retention classifications.
 
 ## 0.4.0
 

@@ -71,7 +71,7 @@ contextEffectFor("extensions.ctx_summarize"); // COMPRESS bounded by maxTokens
 contextEffectFor("extensions.ctx_offload"); // OFFLOAD
 ```
 
-The registry is descriptive in this first milestone: analyzer behavior and v0.4 boundary policy remain unchanged. Quantitative propagation of byte, element, and token bounds is the next v0.5 step.
+The registry is descriptive in this first milestone: analyzer behavior and v0.4 boundary policy remain unchanged. The analyzer now also reports `metrics.returnBound` and `metrics.returnProvenance` for literal bounds such as `4096 bytes` or `300 tokens`; aliases and arithmetic intentionally remain unknown. Quantitative propagation beyond direct effects is the next v0.5 step.
 
 ### Addressable context store
 

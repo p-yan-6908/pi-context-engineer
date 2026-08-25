@@ -42,7 +42,14 @@ export {
   isFoveaName,
   normalizeCalleeName,
 } from "./context-effects.js";
-export type { BoundExpression, BoundUnit, ContextEffect, ContextEffectKind } from "./context-effects.js";
+export type {
+  BoundExpression,
+  BoundUnit,
+  ContextEffect,
+  ContextEffectKind,
+  ContextProvenanceStep,
+  ResolvedBound,
+} from "./context-effects.js";
 
 // ---- Config ----
 

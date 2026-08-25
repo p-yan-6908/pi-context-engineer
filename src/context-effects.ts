@@ -7,13 +7,24 @@
  * concerns so this refactor does not change v0.4 behavior.
  */
 
-export type BoundUnit = "bytes" | "tokens" | "elements";
+export type BoundUnit = "bytes" | "tokens" | "elements" | "characters" | "records";
 
 export interface BoundExpression {
   readonly kind: "argument";
   readonly name: string;
   readonly unit: BoundUnit;
 }
+
+export type ResolvedBound =
+  | {
+      readonly kind: "constant";
+      readonly value: number;
+      readonly unit: BoundUnit;
+    }
+  | {
+      readonly kind: "unknown";
+      readonly unit?: BoundUnit;
+    };
 
 export type ContextEffect =
   | { readonly kind: "source" }
@@ -25,6 +36,12 @@ export type ContextEffect =
   | { readonly kind: "unknown" };
 
 export type ContextEffectKind = ContextEffect["kind"];
+
+export interface ContextProvenanceStep {
+  readonly operation: string;
+  readonly effect: ContextEffectKind;
+  readonly bound?: ResolvedBound;
+}
 
 const argumentBound = (name: string, unit: BoundUnit): BoundExpression =>
   Object.freeze({ kind: "argument", name, unit });
