@@ -47,9 +47,12 @@ export type {
   BoundUnit,
   ContextEffect,
   ContextEffectKind,
+  ContextProvenanceLocation,
   ContextProvenanceStep,
   ResolvedBound,
 } from "./context-effects.js";
+export { explainProgram, explanationFromAnalysis, formatProgramExplanation } from "./explanation.js";
+export type { ProgramExplanation } from "./explanation.js";
 
 // ---- Config ----
 

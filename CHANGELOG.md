@@ -9,6 +9,8 @@
 - Added registry contract checks for byte/token bounds, aliases, source fallback, and conservative unknown-helper handling.
 - Added unit-aware literal `returnBound` results and structured `returnProvenance` traces; identifier aliases and arithmetic remain unknown by design.
 - Added a permanent 12-case v0.4 differential suite covering allow/reject, taint, reduction, boundedness, and retention classifications.
+- Added deterministic structured explanations with classification, boundedness, final bounds, provenance reasons, optional source locations, and a human-readable formatter.
+- Added explanation checks for raw, scalar, select, compress, offload, unknown-bound, chained, and multi-source flows.
 
 ## 0.4.0
 

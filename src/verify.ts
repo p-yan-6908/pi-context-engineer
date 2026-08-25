@@ -9,6 +9,7 @@ import { FabricExecutionScopes } from "./execution-scope.js";
 import { contextEffectFor, contextEffects, isFoveaName } from "./context-effects.js";
 import type { ResolvedBound } from "./context-effects.js";
 import { runV04Differential } from "./verify-differential.js";
+import { runExplanationChecks } from "./verify-explanation.js";
 
 type TestCase = {
   name: string;
@@ -494,6 +495,11 @@ for (const failure of differential.failures) {
 }
 const differentialFailures = differential.failed;
 
+const explanation = runExplanationChecks();
+console.log(`[${explanation.failed === 0 ? "ok" : "FAIL"}] explanation checks: ${explanation.passed}/${explanation.passed + explanation.failed}`);
+for (const failure of explanation.failures) console.log(`     ${failure}`);
+const explanationFailures = explanation.failed;
+
 const scopes = new FabricExecutionScopes();
 scopes.start({ toolCallId: "fabric_a", workspaceRoot: "/tmp/a", startedAt: 1 });
 scopes.start({ toolCallId: "fabric_b", workspaceRoot: "/tmp/b", startedAt: 2 });
@@ -576,4 +582,4 @@ if (!delegateTool) {
   if (!delegateOk) toolFailures++;
 }
 console.log(`Tool checks: ${toolFailures === 0 ? "passed" : `${toolFailures} failed`}.`);
-process.exit(failed + wrapperFailures + toolFailures + scopeFailures + registryFailures + quantitativeFailures + differentialFailures > 0 ? 1 : 0);
+process.exit(failed + wrapperFailures + toolFailures + scopeFailures + registryFailures + quantitativeFailures + differentialFailures + explanationFailures > 0 ? 1 : 0);

@@ -37,10 +37,17 @@ export type ContextEffect =
 
 export type ContextEffectKind = ContextEffect["kind"];
 
+export interface ContextProvenanceLocation {
+  readonly line: number;
+  readonly column: number;
+}
+
 export interface ContextProvenanceStep {
   readonly operation: string;
   readonly effect: ContextEffectKind;
   readonly bound?: ResolvedBound;
+  readonly reason?: string;
+  readonly location?: ContextProvenanceLocation;
 }
 
 const argumentBound = (name: string, unit: BoundUnit): BoundExpression =>

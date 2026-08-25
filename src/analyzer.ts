@@ -14,6 +14,7 @@ import {
   isFoveaName,
   type BoundUnit,
   type ContextEffect,
+  type ContextProvenanceLocation,
   type ContextProvenanceStep,
   type ResolvedBound,
 } from "./context-effects.js";
@@ -118,8 +119,36 @@ function constantBound(value: number, unit: BoundUnit): ResolvedBound {
   return { kind: "constant", value, unit };
 }
 
-function effectStep(operation: string, effect: ContextEffect["kind"], bound?: ResolvedBound): ContextProvenanceStep {
-  return bound === undefined ? { operation, effect } : { operation, effect, bound };
+function effectReason(effect: ContextEffect["kind"]): string {
+  switch (effect) {
+    case "source": return "Tool-originated data enters the flow.";
+    case "select": return "The registry declares a selection effect.";
+    case "compress": return "The registry declares a compression effect.";
+    case "offload": return "The registry declares an offload effect.";
+    case "scalar": return "The operation projects a scalar result.";
+    case "passthrough": return "The operation preserves the source shape.";
+    case "unknown": return "The effect is unknown, so analysis stays conservative.";
+  }
+}
+
+function nodeLocation(sf: ts.SourceFile, node: ts.Node): ContextProvenanceLocation {
+  const position = sf.getLineAndCharacterOfPosition(node.getStart(sf));
+  return { line: position.line + 1, column: position.character + 1 };
+}
+
+function effectStep(
+  operation: string,
+  effect: ContextEffect["kind"],
+  bound?: ResolvedBound,
+  location?: ContextProvenanceLocation,
+): ContextProvenanceStep {
+  return {
+    operation,
+    effect,
+    reason: effectReason(effect),
+    ...(bound === undefined ? {} : { bound }),
+    ...(location === undefined ? {} : { location }),
+  };
 }
 
 function mergeProvenance(flows: Flow[]): ContextProvenanceStep[] {
@@ -458,7 +487,7 @@ function evaluateMethodCall(
       state.meaningfulTransformations++;
       return boundedFlow("projected", `${method} scalar predicate`, 0.01, [
         ...receiver.provenance,
-        effectStep(method, "scalar", unknownBound()),
+        effectStep(method, "scalar", unknownBound(), nodeLocation(sf, call)),
       ]);
     case "join":
       if (UNSAFE_KINDS.has(receiver.kind)) {
@@ -495,7 +524,7 @@ function evaluateCall(call: ts.CallExpression, env: Map<string, Flow>, state: Ev
     const source = args.some((flow) => flow.hasSource);
     const bound = resolveEffectBound(call, effect, sf);
     const outputBound = effect.kind === "offload" ? unknownBound() : bound;
-    const provenance = [...mergeProvenance(args), effectStep(name, effect.kind, outputBound)];
+    const provenance = [...mergeProvenance(args), effectStep(name, effect.kind, outputBound, nodeLocation(sf, call))];
     if (effect.kind === "compress") {
       state.meaningfulTransformations++;
       const boundName = effect.bound?.name;
@@ -524,7 +553,7 @@ function evaluateCall(call: ts.CallExpression, env: Map<string, Flow>, state: Ev
     const boundName = effect.kind === "select" ? effect.bound?.name : undefined;
     const maxTokens = boundName ? objectNumberArgument(call, boundName, sf, env) : undefined;
     const bound = resolveEffectBound(call, effect, sf) ?? unknownBound("tokens");
-    const provenance = [effectStep(name, effect.kind, bound)];
+    const provenance = [effectStep(name, effect.kind, bound, nodeLocation(sf, call))];
     if (maxTokens !== undefined) {
       state.boundedSelectionCalls++;
       state.meaningfulTransformations++;
@@ -534,7 +563,7 @@ function evaluateCall(call: ts.CallExpression, env: Map<string, Flow>, state: Ev
   }
 
   if (effect.kind === "source" || isDataToolCall(call, sf)) {
-    return sourceFlow("raw", `data source ${name}`, 1, [effectStep(name, "source")]);
+    return sourceFlow("raw", `data source ${name}`, 1, [effectStep(name, "source", undefined, nodeLocation(sf, call))]);
   }
 
   const args = callArgs(call, env, state, sf);
@@ -566,7 +595,7 @@ function evaluateCall(call: ts.CallExpression, env: Map<string, Flow>, state: Ev
     return sourced
       ? boundedFlow("projected", `${name} scalar projection`, 0.01, [
           ...sourceProvenance,
-          effectStep(name, "scalar", unknownBound()),
+          effectStep(name, "scalar", unknownBound(), nodeLocation(sf, call)),
         ])
       : cleanFlow(name);
   }
