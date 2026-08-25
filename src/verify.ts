@@ -11,6 +11,7 @@ import type { ResolvedBound } from "./context-effects.js";
 import { runV04Differential } from "./verify-differential.js";
 import { runExplanationChecks } from "./verify-explanation.js";
 import { runConstantAliasChecks } from "./verify-aliases.js";
+import { runSymbolicChecks } from "./verify-symbolic.js";
 
 type TestCase = {
   name: string;
@@ -380,19 +381,19 @@ const quantitativeCases: Array<{
   {
     name: "ctx_read literal 4096 bytes",
     program: `return extensions.ctx_read({ id: "handle", length: 4096 });`,
-    bound: { kind: "constant", value: 4096, unit: "bytes" },
+    bound: { kind: "exact", value: 4096, unit: "bytes" },
     effects: ["extensions.ctx_read:select"],
   },
   {
     name: "ctx_read literal zero bytes",
     program: `return extensions.ctx_read({ id: "handle", length: 0 });`,
-    bound: { kind: "constant", value: 0, unit: "bytes" },
+    bound: { kind: "exact", value: 0, unit: "bytes" },
     effects: ["extensions.ctx_read:select"],
   },
   {
     name: "ctx_read literal one byte",
     program: `return extensions.ctx_read({ id: "handle", length: 1 });`,
-    bound: { kind: "constant", value: 1, unit: "bytes" },
+    bound: { kind: "exact", value: 1, unit: "bytes" },
     effects: ["extensions.ctx_read:select"],
   },
   {
@@ -402,27 +403,27 @@ const quantitativeCases: Array<{
     effects: ["extensions.ctx_read:select"],
   },
   {
-    name: "ctx_read arithmetic remains unknown",
+    name: "ctx_read exact arithmetic",
     program: `return extensions.ctx_read({ id: "handle", length: 2 * 2048 });`,
-    bound: { kind: "unknown", unit: "bytes" },
+    bound: { kind: "exact", value: 4096, unit: "bytes" },
     effects: ["extensions.ctx_read:select"],
   },
   {
     name: "ctx_summarize literal 300 tokens",
     program: `return extensions.ctx_summarize({ text: "x", maxTokens: 300 });`,
-    bound: { kind: "constant", value: 300, unit: "tokens" },
+    bound: { kind: "exact", value: 300, unit: "tokens" },
     effects: ["extensions.ctx_summarize:compress"],
   },
   {
     name: "ctx_delegate literal 500 tokens",
     program: `return ctx_delegate({ prompt: "x", maxTokens: 500 });`,
-    bound: { kind: "constant", value: 500, unit: "tokens" },
+    bound: { kind: "exact", value: 500, unit: "tokens" },
     effects: ["ctx_delegate:compress"],
   },
   {
     name: "Fovea literal 1000 tokens",
     program: `return extensions.fovea_focus({ query: "x", maxTokens: 1000 });`,
-    bound: { kind: "constant", value: 1000, unit: "tokens" },
+    bound: { kind: "exact", value: 1000, unit: "tokens" },
     effects: ["extensions.fovea_focus:select"],
   },
   {
@@ -441,13 +442,13 @@ const quantitativeCases: Array<{
   {
     name: "source to ctx_read preserves trace",
     program: `const raw = await pi.read({ path: "x" }); return extensions.ctx_read({ id: raw, length: 4096 });`,
-    bound: { kind: "constant", value: 4096, unit: "bytes" },
+    bound: { kind: "exact", value: 4096, unit: "bytes" },
     effects: ["pi.read:source", "extensions.ctx_read:select"],
   },
   {
     name: "source to select to compress preserves trace",
     program: `const raw = await pi.read({ path: "x" }); const page = await extensions.ctx_read({ id: raw, length: 4096 }); return extensions.ctx_summarize({ text: page, maxTokens: 300 });`,
-    bound: { kind: "constant", value: 300, unit: "tokens" },
+    bound: { kind: "exact", value: 300, unit: "tokens" },
     effects: ["pi.read:source", "extensions.ctx_read:select", "extensions.ctx_summarize:compress"],
   },
   {
@@ -465,7 +466,7 @@ const quantitativeCases: Array<{
   {
     name: "ctx_summarize zero tokens is literal",
     program: `return extensions.ctx_summarize({ text: "x", maxTokens: 0 });`,
-    bound: { kind: "constant", value: 0, unit: "tokens" },
+    bound: { kind: "exact", value: 0, unit: "tokens" },
     effects: ["extensions.ctx_summarize:compress"],
   },
 ];
@@ -483,7 +484,7 @@ for (const test of quantitativeCases) {
 const bytesBound = analyzeProgram(`return extensions.ctx_read({ id: "h", length: 4096 });`).metrics.returnBound;
 const tokensBound = analyzeProgram(`return extensions.ctx_summarize({ text: "x", maxTokens: 4096 });`).metrics.returnBound;
 const unitsStayDistinct =
-  bytesBound?.kind === "constant" && tokensBound?.kind === "constant" &&
+  bytesBound?.kind === "exact" && tokensBound?.kind === "exact" &&
   bytesBound.unit === "bytes" && tokensBound.unit === "tokens" &&
   JSON.stringify(bytesBound) !== JSON.stringify(tokensBound);
 console.log(`${unitsStayDistinct ? "[ok]" : "[FAIL]"} quantitative bounds do not conflate bytes and tokens`);
@@ -505,6 +506,11 @@ const aliases = runConstantAliasChecks();
 console.log(`[${aliases.failed === 0 ? "ok" : "FAIL"}] constant alias checks: ${aliases.passed}/${aliases.passed + aliases.failed}`);
 for (const failure of aliases.failures) console.log(`     ${failure}`);
 const aliasFailures = aliases.failed;
+
+const symbolic = runSymbolicChecks();
+console.log(`[${symbolic.failed === 0 ? "ok" : "FAIL"}] symbolic bound checks: ${symbolic.passed}/${symbolic.passed + symbolic.failed}`);
+for (const failure of symbolic.failures) console.log(`     ${failure}`);
+const symbolicFailures = symbolic.failed;
 
 const scopes = new FabricExecutionScopes();
 scopes.start({ toolCallId: "fabric_a", workspaceRoot: "/tmp/a", startedAt: 1 });
@@ -588,4 +594,4 @@ if (!delegateTool) {
   if (!delegateOk) toolFailures++;
 }
 console.log(`Tool checks: ${toolFailures === 0 ? "passed" : `${toolFailures} failed`}.`);
-process.exit(failed + wrapperFailures + toolFailures + scopeFailures + registryFailures + quantitativeFailures + differentialFailures + explanationFailures + aliasFailures > 0 ? 1 : 0);
+process.exit(failed + wrapperFailures + toolFailures + scopeFailures + registryFailures + quantitativeFailures + differentialFailures + explanationFailures + aliasFailures + symbolicFailures > 0 ? 1 : 0);

@@ -116,8 +116,12 @@ function unknownBound(unit?: BoundUnit): ResolvedBound {
   return unit ? { kind: "unknown", unit } : { kind: "unknown" };
 }
 
-function constantBound(value: number, unit: BoundUnit): ResolvedBound {
-  return { kind: "constant", value, unit };
+function exactBound(value: number, unit: BoundUnit): ResolvedBound {
+  return { kind: "exact", value, unit };
+}
+
+function upperBound(value: number, unit: BoundUnit): ResolvedBound {
+  return { kind: "upper", value, unit };
 }
 
 function effectReason(effect: ContextEffect["kind"]): string {
@@ -268,9 +272,13 @@ interface ConstantBinding {
   scope: ConstantScope;
 }
 
+type NumericResolutionKind = "exact" | "upper" | "unknown";
+
 interface NumericConstantResolution {
+  kind: NumericResolutionKind;
   value?: number;
   chain: string[];
+  expression?: string;
 }
 
 interface EffectBoundResolution {
@@ -288,6 +296,14 @@ function isLexicalScopeNode(node: ts.Node): boolean {
     ts.isCatchClause(node);
 }
 
+function unknownNumericResolution(): NumericConstantResolution {
+  return { kind: "unknown", chain: [] };
+}
+
+function safeInteger(value: number): boolean {
+  return Number.isSafeInteger(value);
+}
+
 class NumericConstantResolver {
   private readonly scopes = new WeakMap<ts.Node, ConstantScope>();
 
@@ -297,12 +313,18 @@ class NumericConstantResolver {
   }
 
   resolve(expr: ts.Expression): number | undefined {
-    return this.resolveWithChain(expr).value;
+    const result = this.resolveWithChain(expr);
+    return result.kind === "exact" ? result.value : undefined;
   }
 
   resolveWithChain(expr: ts.Expression): NumericConstantResolution {
     const scope = this.scopes.get(expr);
-    return scope ? this.resolveExpression(expr, scope, new Set<ConstantBinding>()) : { chain: [] };
+    return scope ? this.resolveExactExpression(expr, scope, new Set<ConstantBinding>()) : unknownNumericResolution();
+  }
+
+  resolveUpperBound(expr: ts.Expression): NumericConstantResolution {
+    const scope = this.scopes.get(expr);
+    return scope ? this.resolveUpperExpression(expr, scope, new Set<ConstantBinding>()) : unknownNumericResolution();
   }
 
   private visit(node: ts.Node, parent: ConstantScope, useParent = false): void {
@@ -345,19 +367,66 @@ class NumericConstantResolver {
     }
   }
 
-  private resolveExpression(expr: ts.Expression, scope: ConstantScope, seen: Set<ConstantBinding>): NumericConstantResolution {
+  private resolveExactExpression(expr: ts.Expression, scope: ConstantScope, seen: Set<ConstantBinding>): NumericConstantResolution {
     const value = unwrap(expr);
     if (ts.isNumericLiteral(value)) {
       const number = Number(value.text.replace(/_/g, ""));
-      return Number.isFinite(number) ? { value: number, chain: [] } : { chain: [] };
+      return safeInteger(number) ? { kind: "exact", value: number, chain: [], expression: value.getText() } : unknownNumericResolution();
     }
-    if (!ts.isIdentifier(value)) return { chain: [] };
-    const binding = this.lookup(scope, value.text);
-    if (!binding || binding.mutable || !binding.initializer || seen.has(binding)) return { chain: [] };
-    seen.add(binding);
-    const resolved = this.resolveExpression(binding.initializer, binding.scope, seen);
-    seen.delete(binding);
-    return resolved.value === undefined ? resolved : { value: resolved.value, chain: [value.text, ...resolved.chain] };
+    if (ts.isPrefixUnaryExpression(value) && ts.isNumericLiteral(value.operand)) {
+      const number = Number(value.operand.text.replace(/_/g, ""));
+      const signed = value.operator === ts.SyntaxKind.MinusToken ? -number : value.operator === ts.SyntaxKind.PlusToken ? number : NaN;
+      return safeInteger(signed) ? { kind: "exact", value: signed, chain: [], expression: value.getText() } : unknownNumericResolution();
+    }
+    if (ts.isIdentifier(value)) {
+      const binding = this.lookup(scope, value.text);
+      if (!binding || binding.mutable || !binding.initializer || seen.has(binding)) return unknownNumericResolution();
+      seen.add(binding);
+      const resolved = this.resolveExactExpression(binding.initializer, binding.scope, seen);
+      seen.delete(binding);
+      return resolved.kind === "exact" ? { ...resolved, chain: [value.text, ...resolved.chain] } : resolved;
+    }
+    if (!ts.isBinaryExpression(value)) return unknownNumericResolution();
+    const operator = ts.tokenToString(value.operatorToken.kind);
+    if (operator !== "+" && operator !== "-" && operator !== "*") return unknownNumericResolution();
+    const left = this.resolveExactExpression(value.left, scope, seen);
+    const right = this.resolveExactExpression(value.right, scope, seen);
+    if (left.kind !== "exact" || right.kind !== "exact") return unknownNumericResolution();
+    const result = operator === "+" ? left.value! + right.value! : operator === "-" ? left.value! - right.value! : left.value! * right.value!;
+    return safeInteger(result)
+      ? { kind: "exact", value: result, chain: [...left.chain, ...right.chain], expression: value.getText() }
+      : unknownNumericResolution();
+  }
+
+  private resolveUpperExpression(expr: ts.Expression, scope: ConstantScope, seen: Set<ConstantBinding>): NumericConstantResolution {
+    const exact = this.resolveExactExpression(expr, scope, new Set(seen));
+    if (exact.kind === "exact") return exact;
+    const value = unwrap(expr);
+    if (ts.isIdentifier(value)) {
+      const binding = this.lookup(scope, value.text);
+      if (!binding || binding.mutable || !binding.initializer || seen.has(binding)) return unknownNumericResolution();
+      seen.add(binding);
+      const resolved = this.resolveUpperExpression(binding.initializer, binding.scope, seen);
+      seen.delete(binding);
+      return resolved.kind === "unknown" ? resolved : { ...resolved, chain: [value.text, ...resolved.chain] };
+    }
+    if (!ts.isCallExpression(value) || !ts.isPropertyAccessExpression(value.expression) || value.expression.getText() !== "Math.min") {
+      return unknownNumericResolution();
+    }
+    if (value.arguments.length === 0) return unknownNumericResolution();
+    const argumentsResolved = value.arguments.map((argument) => this.resolveUpperExpression(argument, scope, new Set(seen)));
+    const known = argumentsResolved.filter((item) => item.kind !== "unknown" && item.value !== undefined);
+    if (known.length === 0 || known.some((item) => !safeInteger(item.value!) || item.value! < 0)) return unknownNumericResolution();
+    const upperValue = Math.min(...known.map((item) => item.value!));
+    const winners = known.filter((item) => item.value === upperValue);
+    const chain = [...new Set(winners.flatMap((item) => item.chain))];
+    const allExact = known.length === argumentsResolved.length && known.every((item) => item.kind === "exact");
+    return {
+      kind: allExact ? "exact" : "upper",
+      value: upperValue,
+      chain,
+      expression: value.getText(),
+    };
   }
 
   private lookup(scope: ConstantScope, name: string): ConstantBinding | undefined {
@@ -485,28 +554,33 @@ function objectLiteralNumberArgument(
   resolver: NumericConstantResolver,
 ): NumericConstantResolution {
   const first = call.arguments[0];
-  if (!first || !ts.isObjectLiteralExpression(first)) return { chain: [] };
+  if (!first || !ts.isObjectLiteralExpression(first)) return unknownNumericResolution();
   for (const property of first.properties) {
     if (!ts.isPropertyAssignment(property)) continue;
     const key = property.name.getText(sf).replace(/["']/g, "");
     if (key !== name) continue;
-    return resolver.resolveWithChain(property.initializer);
+    return resolver.resolveUpperBound(property.initializer);
   }
-  return { chain: [] };
+  return unknownNumericResolution();
 }
 
 function resolveEffectBound(call: ts.CallExpression, effect: ContextEffect, sf: ts.SourceFile, resolver: NumericConstantResolver): EffectBoundResolution {
   const declaration = effect.kind === "select" || effect.kind === "compress" ? effect.bound : undefined;
   if (!declaration) return {};
   const resolution = objectLiteralNumberArgument(call, declaration.name, sf, resolver);
-  const bound = resolution.value === undefined
+  const validValue = resolution.value !== undefined && safeInteger(resolution.value) && resolution.value >= 0 && resolution.kind !== "unknown";
+  const bound = !validValue
     ? unknownBound(declaration.unit)
-    : constantBound(resolution.value, declaration.unit);
-  const reason = resolution.value === undefined
-    ? `${declaration.name} has no provable numeric constant (${declaration.unit}).`
-    : resolution.chain.length > 0
-      ? `${declaration.name} resolves through ${resolution.chain.join(" → ")} = ${resolution.value} ${declaration.unit}.`
-      : `${declaration.name} resolves to literal ${resolution.value} ${declaration.unit}.`;
+    : resolution.kind === "upper"
+      ? upperBound(resolution.value!, declaration.unit)
+      : exactBound(resolution.value!, declaration.unit);
+  const reason = !validValue
+    ? `${declaration.name} has no provable non-negative safe-integer bound (${declaration.unit}).`
+    : resolution.kind === "upper"
+      ? `${declaration.name} is upper-bounded by ${resolution.value} ${declaration.unit}${resolution.expression ? ` via ${resolution.expression}` : ""}${resolution.chain.length > 0 ? ` through ${resolution.chain.join(" → ")}` : ""}.`
+      : resolution.chain.length > 0
+        ? `${declaration.name} resolves through ${resolution.chain.join(" → ")} = ${resolution.value} ${declaration.unit}.`
+        : `${declaration.name} resolves to exact ${resolution.value} ${declaration.unit}.`;
   return { bound, reason };
 }
 

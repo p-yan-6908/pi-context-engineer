@@ -13,6 +13,8 @@
 - Added explanation checks for raw, scalar, select, compress, offload, unknown-bound, chained, and multi-source flows.
 - Added scope-aware immutable numeric `const` alias propagation with alias-chain reasons; mutable bindings, arithmetic, calls, conditionals, and cycles remain unknown.
 - Added a 45-check constant-alias suite covering lexical shadowing and all conservative fallback cases.
+- Split resolved bounds into `exact`, `upper`, and `unknown`; added safe-integer exact arithmetic and `Math.min` upper-bound derivation without changing policy decisions.
+- Added a 72-check symbolic-bound suite covering arithmetic, caps, invalid numeric values, dynamic operands, and unsupported operations.
 
 ## 0.4.0
 

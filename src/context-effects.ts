@@ -17,7 +17,12 @@ export interface BoundExpression {
 
 export type ResolvedBound =
   | {
-      readonly kind: "constant";
+      readonly kind: "exact";
+      readonly value: number;
+      readonly unit: BoundUnit;
+    }
+  | {
+      readonly kind: "upper";
       readonly value: number;
       readonly unit: BoundUnit;
     }

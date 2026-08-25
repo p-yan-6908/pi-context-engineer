@@ -33,7 +33,7 @@ const cases: readonly ExplanationCase[] = [
     program: `return extensions.ctx_read({ id: "h", length: 4096 });`,
     classification: "safe",
     bounded: true,
-    bound: { kind: "constant", value: 4096, unit: "bytes" },
+    bound: { kind: "exact", value: 4096, unit: "bytes" },
     effects: ["select"],
   },
   {
@@ -49,7 +49,7 @@ const cases: readonly ExplanationCase[] = [
     program: `return extensions.ctx_summarize({ text: "x", maxTokens: 300 });`,
     classification: "safe",
     bounded: true,
-    bound: { kind: "constant", value: 300, unit: "tokens" },
+    bound: { kind: "exact", value: 300, unit: "tokens" },
     effects: ["compress"],
   },
   {
@@ -57,7 +57,7 @@ const cases: readonly ExplanationCase[] = [
     program: `const raw = await pi.read({path:"x"}); const page = await extensions.ctx_read({id:raw,length:4096}); return extensions.ctx_summarize({text:page,maxTokens:300});`,
     classification: "safe",
     bounded: true,
-    bound: { kind: "constant", value: 300, unit: "tokens" },
+    bound: { kind: "exact", value: 300, unit: "tokens" },
     effects: ["source", "select", "compress"],
   },
   {

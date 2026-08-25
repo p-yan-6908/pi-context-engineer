@@ -12,7 +12,7 @@ export interface ProgramExplanation {
 
 function boundText(bound: ResolvedBound | undefined): string {
   if (!bound) return "bounded, exact maximum unknown";
-  if (bound.kind === "constant") return `≤ ${bound.value} ${bound.unit}`;
+  if (bound.kind === "exact" || bound.kind === "upper") return `≤ ${bound.value} ${bound.unit}`;
   return bound.unit ? `bounded, exact maximum unknown (${bound.unit})` : "bounded, exact maximum unknown";
 }
 
@@ -24,7 +24,7 @@ function stepText(step: ContextProvenanceStep): string {
   const effect = step.effect.toUpperCase();
   if (step.effect === "source") return `${effect} · unbounded · bound unknown`;
   if (step.effect === "scalar") return `${effect} · scalar projection · quantitative bound unknown`;
-  if (step.bound?.kind === "constant") return `${effect} · ${boundText(step.bound)}`;
+  if (step.bound?.kind === "exact" || step.bound?.kind === "upper") return `${effect} · ${boundText(step.bound)}`;
   if (step.bound?.kind === "unknown") return `${effect} · ${boundText(step.bound)}`;
   if (step.effect === "unknown") return `${effect} · effect unknown · bound unknown`;
   return `${effect} · bounded, exact bound unknown`;
