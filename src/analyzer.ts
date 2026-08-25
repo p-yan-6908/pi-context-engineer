@@ -387,7 +387,8 @@ function evaluateCall(call: ts.CallExpression, env: Map<string, Flow>, state: Ev
     const source = args.some((flow) => flow.hasSource);
     if (effect.kind === "compress") {
       state.meaningfulTransformations++;
-      const maxTokens = objectNumberArgument(call, effect.boundFrom ?? "maxTokens", sf, env);
+      const boundName = effect.bound?.name;
+      const maxTokens = boundName ? objectNumberArgument(call, boundName, sf, env) : undefined;
       return boundedFlow("compressed", "context summary", maxTokens ? Math.min(0.08, maxTokens / 10000) : 0.08);
     }
     if (effect.kind === "offload") {
@@ -405,7 +406,8 @@ function evaluateCall(call: ts.CallExpression, env: Map<string, Flow>, state: Ev
   }
 
   if (isFoveaCall(call, sf)) {
-    const maxTokens = objectNumberArgument(call, "maxTokens", sf, env);
+    const boundName = effect.kind === "select" ? effect.bound?.name : undefined;
+    const maxTokens = boundName ? objectNumberArgument(call, boundName, sf, env) : undefined;
     if (maxTokens !== undefined) {
       state.boundedSelectionCalls++;
       state.meaningfulTransformations++;

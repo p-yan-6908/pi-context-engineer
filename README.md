@@ -58,6 +58,21 @@ return extensions.ctx_summarize({
 
 A Fovea call with `maxTokens` is classified as a budgeted `SELECT` operation. Context Engineer does not reproduce Fovea's code graph.
 
+### Context-effect registry (v0.5)
+
+The analyzer consumes a small exported registry describing how calls affect context:
+
+```ts
+import { contextEffectFor } from "pi-context-engineer";
+
+contextEffectFor("pi.read"); // { kind: "source" }
+contextEffectFor("extensions.ctx_read"); // SELECT bounded by length bytes
+contextEffectFor("extensions.ctx_summarize"); // COMPRESS bounded by maxTokens
+contextEffectFor("extensions.ctx_offload"); // OFFLOAD
+```
+
+The registry is descriptive in this first milestone: analyzer behavior and v0.4 boundary policy remain unchanged. Quantitative propagation of byte, element, and token bounds is the next v0.5 step.
+
 ### Addressable context store
 
 Stored payloads include content hashes, provenance/source, content type, creation/access timestamps, estimated tokens, and expiry. Identical payloads deduplicate. `ctx_read` supports UTF-8 byte ranges and literal line queries. Ranged results expose copyable `offset` / `nextOffset`; query mode formats at most 100 match windows by default (`maxMatches`, capped at 500), samples `matchedLines`, and preserves the exact `totalMatches`. The complete serialized result—not only its text field—is budgeted below the recursive-offload threshold. An offload or `ctx_read` preview remains intact for the first model call that needs it; on later calls, the non-destructive `context` hook replaces that repeated text with a one-line handle recipe. The full payload remains re-readable, and session history is never rewritten. By default, entries expire after one week and the store is capped at 500 MB; cleanup runs opportunistically during store activity.

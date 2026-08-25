@@ -6,6 +6,7 @@ import { analyzeProgram, type AnalyzerOptions } from "./analyzer.js";
 import { evaluateProgram } from "./wrapper.js";
 import { ceToolMap } from "./tools.js";
 import { FabricExecutionScopes } from "./execution-scope.js";
+import { contextEffectFor, contextEffects, isFoveaName } from "./context-effects.js";
 
 type TestCase = {
   name: string;
@@ -331,6 +332,40 @@ let wrapperFailures = wrapperOk ? 0 : 1;
 
 console.log("---");
 console.log(`Results: ${passed} passed, ${failed} failed out of ${tests.length} tests.`);
+
+const registryExpectations = [
+  ["extensions.ctx_read", "select", "length", "bytes"],
+  ["extensions.ctx_summarize", "compress", "maxTokens", "tokens"],
+  ["extensions.ctx_offload", "offload", undefined, undefined],
+  ["extensions.fovea_focus", "select", "maxTokens", "tokens"],
+  ["ctx_recall", "select", "maxTokens", "tokens"],
+  ["ctx_status", "scalar", undefined, undefined],
+] as const;
+let registryFailures = 0;
+for (const [name, kind, boundName, unit] of registryExpectations) {
+  const effect = contextEffectFor(name);
+  const bound = effect.kind === "select" || effect.kind === "compress" ? effect.bound : undefined;
+  const matched =
+    name in contextEffects &&
+    effect.kind === kind &&
+    bound?.name === boundName &&
+    bound?.unit === unit;
+  console.log(`${matched ? "[ok]" : "[FAIL]"} registry ${name} -> ${kind}${boundName ? ` <= ${boundName} ${unit}` : ""}`);
+  if (!matched) registryFailures++;
+}
+const aliasOk = contextEffectFor("extensions.ctx.read") === contextEffectFor("extensions.ctx_read");
+const sourceFallbackOk = contextEffectFor("pi.read").kind === "source";
+const unknownHelperOk = contextEffectFor("extensions.ctx_future").kind === "unknown";
+const foveaIdentityOk = isFoveaName("fovea_focus") && !isFoveaName("ctx_recall");
+console.log(`${aliasOk ? "[ok]" : "[FAIL]"} registry dotted helper alias resolves to the same effect`);
+console.log(`${sourceFallbackOk ? "[ok]" : "[FAIL]"} unregistered Pi tool remains a source effect`);
+console.log(`${unknownHelperOk ? "[ok]" : "[FAIL]"} unregistered context helper remains unknown`);
+console.log(`${foveaIdentityOk ? "[ok]" : "[FAIL]"} Fovea selection is identified by its registry definition`);
+if (!aliasOk) registryFailures++;
+if (!sourceFallbackOk) registryFailures++;
+if (!unknownHelperOk) registryFailures++;
+if (!foveaIdentityOk) registryFailures++;
+
 const scopes = new FabricExecutionScopes();
 scopes.start({ toolCallId: "fabric_a", workspaceRoot: "/tmp/a", startedAt: 1 });
 scopes.start({ toolCallId: "fabric_b", workspaceRoot: "/tmp/b", startedAt: 2 });
@@ -413,4 +448,4 @@ if (!delegateTool) {
   if (!delegateOk) toolFailures++;
 }
 console.log(`Tool checks: ${toolFailures === 0 ? "passed" : `${toolFailures} failed`}.`);
-process.exit(failed + wrapperFailures + toolFailures + scopeFailures > 0 ? 1 : 0);
+process.exit(failed + wrapperFailures + toolFailures + scopeFailures + registryFailures > 0 ? 1 : 0);

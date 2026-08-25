@@ -34,6 +34,16 @@ import { ContextTelemetry } from "./telemetry.js";
 import { FabricExecutionScopes } from "./execution-scope.js";
 import { readFabricToolResultProxy } from "./compat/fabric.js";
 
+export {
+  contextEffects,
+  contextEffectFor,
+  isBoundedContextEffect,
+  isContextHelperName,
+  isFoveaName,
+  normalizeCalleeName,
+} from "./context-effects.js";
+export type { BoundExpression, BoundUnit, ContextEffect, ContextEffectKind } from "./context-effects.js";
+
 // ---- Config ----
 
 interface CeConfig extends WrapperOptions {

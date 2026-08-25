@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased (v0.5.0)
+
+### Context effects
+
+- Added the exported `ContextEffect` vocabulary and registry for source, scalar, select, compress, offload, passthrough, and unknown calls.
+- Moved `ctx_*`, `ce_*`, and Fovea bound-argument definitions into registry metadata; analyzer behavior remains compatible with v0.4.0.
+- Added registry contract checks for byte/token bounds, aliases, source fallback, and conservative unknown-helper handling.
+
 ## 0.4.0
 
 ### Correctness
