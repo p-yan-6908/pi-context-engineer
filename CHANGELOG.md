@@ -19,6 +19,9 @@
 - Added an explicit quantitative policy with byte, token, and character budgets; element and record bounds are deliberately not comparable to context size.
 - Made within-budget proofs an additive policy override for legacy unbounded returns only; over-budget and unknown proofs remain blocked and legacy-safe paths remain unchanged.
 - Added policy-aware explanations and an auditable v0.4/v0.5 suite: 3 intentional changes, 5 parity cases, and 0 unexpected policy-case differences.
+- Added 62 policy-boundary checks for exact/upper edges, zero, invalid values, unsupported units, derived aliases/joins/caps, and strict configuration validation.
+- Added configurable `.pi/context-engineer.json` policy budgets with UTF-16-code-unit character semantics and a 1,000,000,000 maximum per budget.
+- Expanded Pi/Fabric E2E coverage to 4/4, including within-budget symbolic execution and over-budget blocking.
 
 ## 0.4.0
 

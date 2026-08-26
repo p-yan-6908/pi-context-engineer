@@ -31,6 +31,22 @@ export const DEFAULT_CONTEXT_BOUNDARY_POLICY: Required<ContextBoundaryPolicy> = 
   maxCharacters: 8192,
 });
 
+/** Prevent accidental configuration of effectively unbounded policy budgets. */
+export const MAX_CONTEXT_BOUNDARY_BUDGET = 1_000_000_000;
+
+export function validateContextBoundaryPolicy(policy: ContextBoundaryPolicy): string[] {
+  const errors: string[] = [];
+  for (const [key, value] of Object.entries(policy)) {
+    if (value === undefined) continue;
+    if (!Number.isSafeInteger(value) || value < 0) {
+      errors.push(`${key} must be a non-negative safe integer.`);
+    } else if (value > MAX_CONTEXT_BOUNDARY_BUDGET) {
+      errors.push(`${key} must not exceed ${MAX_CONTEXT_BOUNDARY_BUDGET}.`);
+    }
+  }
+  return errors;
+}
+
 const comparableLimits: Readonly<Record<"bytes" | "tokens" | "characters", keyof ContextBoundaryPolicy>> = {
   bytes: "maxBytes",
   tokens: "maxTokens",
@@ -38,7 +54,7 @@ const comparableLimits: Readonly<Record<"bytes" | "tokens" | "characters", keyof
 };
 
 function validLimit(limit: number | undefined): limit is number {
-  return limit !== undefined && Number.isFinite(limit) && limit >= 0;
+  return limit !== undefined && validateContextBoundaryPolicy({ maxBytes: limit }).length === 0;
 }
 
 export function evaluateReturnBudget(
@@ -59,8 +75,8 @@ export function evaluateReturnBudget(
   if (!validLimit(limit)) {
     return { kind: "not-comparable", reason: `No quantitative budget is configured for ${bound.unit}.` };
   }
-  if (!Number.isFinite(bound.value) || bound.value < 0) {
-    return { kind: "not-comparable", reason: `The ${bound.unit} bound is not a valid non-negative finite value.` };
+  if (!Number.isSafeInteger(bound.value) || bound.value < 0) {
+    return { kind: "not-comparable", reason: `The ${bound.unit} bound is not a valid non-negative safe integer.` };
   }
   return bound.value <= limit
     ? { kind: "within-budget", bound, limit, unit: bound.unit }

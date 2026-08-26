@@ -22,6 +22,18 @@ const scenarios: Scenario[] = [
     prompt: `Use fabric_exec exactly once. Inside Fabric create text beginning with E2E-SUMMARY-MARKER and then at least 120000 ASCII characters, and call extensions.ctx_summarize({ text, mode: "model", maxTokens: 120, maxInputTokens: 1024 }). Return only the summary object. The final answer must include E2E-SUMMARY-MARKER and report the bounded summary token count.`,
     assert: (output) => output.includes("E2E-SUMMARY-MARKER") && /120|summary/i.test(output),
   },
+  {
+    name: "quantitative symbolic cap is allowed",
+    marker: "E2E-POLICY-ALLOW",
+    prompt: `Use fabric_exec exactly once. Inside Fabric run exactly this shape: const extensions = { fovea_focus({ query, maxTokens }) { return { marker: "E2E-POLICY-ALLOW", query, maxTokens }; } }; const raw = await pi.bash({ cmd: "printf 100000" }); const limit = Math.min(raw, 3000); return extensions.fovea_focus({ query: "policy", maxTokens: limit }); The final answer must include E2E-POLICY-ALLOW, report maxTokens 3000, and state that the quantitatively bounded call executed successfully.`,
+    assert: (output) => output.includes("E2E-POLICY-ALLOW") && /3000/.test(output) && /execut|allow|within.?budget/i.test(output),
+  },
+  {
+    name: "quantitative over-budget cap remains blocked",
+    marker: "E2E-POLICY-BLOCK",
+    prompt: `Use fabric_exec exactly once. Inside Fabric run exactly this shape: const extensions = { fovea_focus({ query, maxTokens }) { return { marker: "E2E-POLICY-BLOCK", query, maxTokens }; } }; const raw = await pi.bash({ cmd: "printf 100000" }); const limit = Math.min(raw, 5000); return extensions.fovea_focus({ query: "policy", maxTokens: limit }); The final answer must state that the call was blocked because the proven 5000-token ceiling is over the 4000-token policy budget; do not claim that E2E-POLICY-BLOCK executed.`,
+    assert: (output) => /blocked|over.?budget|4000|5000/i.test(output) && /did not execute|not executed|was blocked/i.test(output),
+  },
 ];
 
 if (process.env.CE_RUN_E2E !== "1") {

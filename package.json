@@ -29,6 +29,7 @@
     "build:bench": "rm -rf .tmp/pi-ce-bench && tsc --outDir .tmp/pi-ce-bench --rootDir . --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck src/*.ts bench/*.ts",
     "verify": "npm run build && node .tmp/pi-ce-build/verify.js && node .tmp/pi-ce-build/verify-hooks.js && node .tmp/pi-ce-build/verify-adversarial.js",
     "bench": "npm run build:bench && node .tmp/pi-ce-bench/bench/runner.js",
+    "bench:policy": "npm run build:bench && node .tmp/pi-ce-bench/bench/policy.js",
     "bench:e2e": "npm run build && npm run build:bench && node .tmp/pi-ce-bench/bench/e2e.js",
     "test": "npm run verify"
   },

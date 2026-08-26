@@ -7,6 +7,7 @@
  * concerns so this refactor does not change v0.4 behavior.
  */
 
+/** `characters` means JavaScript UTF-16 code units, matching String.length. */
 export type BoundUnit = "bytes" | "tokens" | "elements" | "characters" | "records";
 
 export interface BoundExpression {

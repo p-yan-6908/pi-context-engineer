@@ -13,6 +13,7 @@ import { runExplanationChecks } from "./verify-explanation.js";
 import { runConstantAliasChecks } from "./verify-aliases.js";
 import { runSymbolicChecks } from "./verify-symbolic.js";
 import { runV05PolicyChecks } from "./verify-quantitative-policy.js";
+import { runPolicyBoundaryChecks } from "./verify-policy-boundaries.js";
 
 type TestCase = {
   name: string;
@@ -521,6 +522,11 @@ console.log(`     unexpected policy-case differences: ${(v05Policy.intentionalTo
 for (const failure of v05Policy.failures) console.log(`     ${failure}`);
 const v05PolicyFailures = v05Policy.failed;
 
+const policyBoundaries = runPolicyBoundaryChecks();
+console.log(`[${policyBoundaries.failed === 0 ? "ok" : "FAIL"}] policy boundary checks: ${policyBoundaries.passed}/${policyBoundaries.passed + policyBoundaries.failed}`);
+for (const failure of policyBoundaries.failures) console.log(`     ${failure}`);
+const policyBoundaryFailures = policyBoundaries.failed;
+
 const scopes = new FabricExecutionScopes();
 scopes.start({ toolCallId: "fabric_a", workspaceRoot: "/tmp/a", startedAt: 1 });
 scopes.start({ toolCallId: "fabric_b", workspaceRoot: "/tmp/b", startedAt: 2 });
@@ -603,4 +609,4 @@ if (!delegateTool) {
   if (!delegateOk) toolFailures++;
 }
 console.log(`Tool checks: ${toolFailures === 0 ? "passed" : `${toolFailures} failed`}.`);
-process.exit(failed + wrapperFailures + toolFailures + scopeFailures + registryFailures + quantitativeFailures + differentialFailures + explanationFailures + aliasFailures + symbolicFailures + v05PolicyFailures > 0 ? 1 : 0);
+process.exit(failed + wrapperFailures + toolFailures + scopeFailures + registryFailures + quantitativeFailures + differentialFailures + explanationFailures + aliasFailures + symbolicFailures + v05PolicyFailures + policyBoundaryFailures > 0 ? 1 : 0);

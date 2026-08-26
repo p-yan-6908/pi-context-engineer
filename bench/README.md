@@ -29,6 +29,14 @@ PI_MODEL=openai-codex/gpt-5.6-luna CE_BENCHMARK_WARMUP=1 CE_BENCHMARK_ITERATIONS
 
 The machine-readable contract is `bench/result.schema.json`. Results record sourceCommit/dirty state, Node/Pi/Fabric versions, model/provider, Main input/output/injected tokens, internal model tokens, logical offload bytes, selected bytes retrieved, wall time, correctness, and all per-iteration samples.
 
+The v0.5 static policy benchmark is separate from the frozen workload benchmark:
+
+```bash
+npm run bench:policy
+```
+
+It runs symbolic `Math.min`, alias, conditional, and `Math.max` caps plus unknown, over-budget, and legacy-safe parity cases. Its report separates expected v0.5 changes from legacy parity and writes `.tmp/policy-benchmark.json`; it does not replace or mutate the retained v0.4 workload artifact.
+
 ## Metrics
 
 Each row captures Main context tokens, tool-result tokens, child-model tokens, wall time, disk bytes, task correctness, and completion. Derived metrics are:

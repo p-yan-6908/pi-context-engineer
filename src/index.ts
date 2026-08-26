@@ -33,6 +33,7 @@ import { runChildPi } from "./child.js";
 import { ContextTelemetry } from "./telemetry.js";
 import { FabricExecutionScopes } from "./execution-scope.js";
 import { readFabricToolResultProxy } from "./compat/fabric.js";
+import { validateContextBoundaryPolicy, type ContextBoundaryPolicy } from "./quantitative-policy.js";
 
 export {
   contextEffects,
@@ -53,12 +54,14 @@ export type {
 } from "./context-effects.js";
 export { explainProgram, explanationFromAnalysis, formatProgramExplanation } from "./explanation.js";
 export type { ProgramExplanation } from "./explanation.js";
-export { DEFAULT_CONTEXT_BOUNDARY_POLICY, evaluateReturnBudget } from "./quantitative-policy.js";
+export { DEFAULT_CONTEXT_BOUNDARY_POLICY, evaluateReturnBudget, MAX_CONTEXT_BOUNDARY_BUDGET, validateContextBoundaryPolicy } from "./quantitative-policy.js";
 export type { ContextBoundaryPolicy, QuantitativeDecision } from "./quantitative-policy.js";
 
 // ---- Config ----
 
 interface CeConfig extends WrapperOptions {
+  /** User-facing alias for quantitativePolicy in context-engineer.json. */
+  policy?: ContextBoundaryPolicy;
   enabled?: boolean;
   /** UTF-8 bytes before text results are auto-offloaded. Default: 8192. */
   readOffloadThreshold?: number;
@@ -83,8 +86,16 @@ function loadConfig(cwd: string): CeConfig {
   const configPath = resolve(cwd, ".pi", "context-engineer.json");
   if (!existsSync(configPath)) return {};
   try {
-    return JSON.parse(readFileSync(configPath, "utf-8")) as CeConfig;
-  } catch {
+    const parsed = JSON.parse(readFileSync(configPath, "utf-8")) as CeConfig;
+    const configuredPolicy = parsed.policy ?? parsed.quantitativePolicy;
+    if (configuredPolicy !== undefined) {
+      if (!configuredPolicy || typeof configuredPolicy !== "object") throw new Error("Invalid context policy: policy must be an object");
+      const errors = validateContextBoundaryPolicy(configuredPolicy);
+      if (errors.length > 0) throw new Error(`Invalid context policy: ${errors.join(" ")}`);
+    }
+    return configuredPolicy === undefined ? parsed : { ...parsed, quantitativePolicy: configuredPolicy };
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("Invalid context policy")) throw error;
     return {};
   }
 }
