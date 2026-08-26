@@ -98,7 +98,12 @@ extensions.ctx_summarize
   COMPRESS · ≤ 300 tokens
     ↓
 return
-  BOUNDARY · ≤ 300 tokens`;
+  BOUNDARY · ≤ 300 tokens
+
+Policy
+  tokens budget: 4000
+  proven maximum: 300
+  result: WITHIN BUDGET`;
 
 export interface ExplanationCheckResult {
   passed: number;
@@ -128,5 +133,11 @@ export function runExplanationChecks(): ExplanationCheckResult {
   const bytes = explainProgram(`return extensions.ctx_read({id:"h",length:4096});`).returnBound;
   const tokens = explainProgram(`return extensions.ctx_summarize({text:"x",maxTokens:4096});`).returnBound;
   check("formatter/unit separation", JSON.stringify(bytes) !== JSON.stringify(tokens));
-  return { passed: cases.length * 8 + 2 - failures.length, failed: failures.length, failures };
+  const withinPolicy = explainProgram(`const limit = Math.min(requested, 3000); return extensions.fovea_focus({query:"x",maxTokens:limit});`);
+  check("quantitative policy decision", withinPolicy.quantitativeDecision?.kind === "within-budget");
+  check("quantitative policy formatter", formatProgramExplanation(withinPolicy).includes("result: WITHIN BUDGET"));
+  const overPolicy = explainProgram(`const limit = Math.min(requested, 4001); return extensions.fovea_focus({query:"x",maxTokens:limit});`);
+  check("over-budget decision", overPolicy.quantitativeDecision?.kind === "over-budget");
+  check("over-budget formatter", formatProgramExplanation(overPolicy).includes("result: OVER BUDGET") && formatProgramExplanation(overPolicy).includes("BOUNDARY · ≤ 4001 tokens"));
+  return { passed: cases.length * 8 + 6 - failures.length, failed: failures.length, failures };
 }

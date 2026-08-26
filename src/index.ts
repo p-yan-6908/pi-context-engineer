@@ -53,6 +53,8 @@ export type {
 } from "./context-effects.js";
 export { explainProgram, explanationFromAnalysis, formatProgramExplanation } from "./explanation.js";
 export type { ProgramExplanation } from "./explanation.js";
+export { DEFAULT_CONTEXT_BOUNDARY_POLICY, evaluateReturnBudget } from "./quantitative-policy.js";
+export type { ContextBoundaryPolicy, QuantitativeDecision } from "./quantitative-policy.js";
 
 // ---- Config ----
 

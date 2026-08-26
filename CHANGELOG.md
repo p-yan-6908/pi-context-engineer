@@ -16,6 +16,9 @@
 - Split resolved bounds into `exact`, `upper`, and `unknown`; added safe-integer exact arithmetic and `Math.min` upper-bound derivation without changing policy decisions.
 - Added expression-level conditional joins with structured branch provenance and bounded `Math.max` evaluation; both require conservative finite inputs.
 - Expanded the symbolic-bound suite to 117 checks covering arithmetic, caps, joins, invalid numeric values, dynamic operands, and unsupported operations.
+- Added an explicit quantitative policy with byte, token, and character budgets; element and record bounds are deliberately not comparable to context size.
+- Made within-budget proofs an additive policy override for legacy unbounded returns only; over-budget and unknown proofs remain blocked and legacy-safe paths remain unchanged.
+- Added policy-aware explanations and an auditable v0.4/v0.5 suite: 3 intentional changes, 5 parity cases, and 0 unexpected policy-case differences.
 
 ## 0.4.0
 

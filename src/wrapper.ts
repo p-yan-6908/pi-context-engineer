@@ -8,6 +8,7 @@
  */
 
 import { analyzeProgram, type AnalysisResult } from "./analyzer.js";
+import type { ContextBoundaryPolicy } from "./quantitative-policy.js";
 
 export interface WrapperOptions {
   /** When true, uncertain source returns and soft warnings are blocked. Default: false. */
@@ -22,6 +23,8 @@ export interface WrapperOptions {
    * if the actual result is large. `strict: true` always enables blocking.
    */
   blockUnboundedReturns?: boolean;
+  /** Optional quantitative budgets for additive v0.5 policy decisions. */
+  quantitativePolicy?: ContextBoundaryPolicy;
 }
 
 export interface ExecResult {
@@ -40,6 +43,7 @@ export function evaluateProgram(
   const analysis = analyzeProgram(program, {
     maxUnprocessedToolCalls: opts.maxUnprocessedToolCalls,
     maxReturnTokens: opts.maxReturnTokens,
+    quantitativePolicy: opts.quantitativePolicy,
   });
   const strict = opts.strict ?? false;
 
@@ -54,6 +58,7 @@ export function evaluateProgram(
       opts.blockUnboundedReturns !== true &&
       analysis.metrics.sourceCalls > 0 &&
       !analysis.metrics.provablyBounded &&
+      analysis.metrics.quantitativeDecision?.kind !== "over-budget" &&
       (analysis.metrics.estimatedReturnTokens === null ||
         analysis.metrics.estimatedReturnTokens <= (opts.maxReturnTokens ?? 4000));
 
@@ -95,6 +100,12 @@ export async function wrappedExec(
 }
 
 function metricLines(metrics: AnalysisResult["metrics"]): string[] {
+  const quantitative = metrics.quantitativeDecision;
+  const quantitativeLine = !quantitative
+    ? "  • quantitative policy: unavailable"
+    : quantitative.kind === "not-comparable"
+      ? `  • quantitative policy: not comparable (${quantitative.reason})`
+      : `  • quantitative policy: ${quantitative.kind} (${quantitative.bound.kind === "unknown" ? "unknown" : quantitative.bound.value} ${quantitative.unit} / ${quantitative.limit} ${quantitative.unit})`;
   return [
     `  • source/tool calls: ${metrics.sourceCalls}`,
     `  • return data-flow: ${metrics.returnTaint} (${metrics.returnOperation})`,
@@ -105,12 +116,13 @@ function metricLines(metrics: AnalysisResult["metrics"]): string[] {
     `  • return is unsafe/near-raw: ${metrics.returnIsRawToolResult}`,
     `  • estimated return tokens: ${metrics.estimatedReturnTokens ?? "unknown"}`,
     `  • estimated reduction: ${metrics.estimatedReductionRatio === null ? "unknown" : `${Math.round(metrics.estimatedReductionRatio * 100)}%`}`,
+    quantitativeLine,
   ];
 }
 
 function formatBlockGuidance(reasons: string[], metrics: AnalysisResult["metrics"]): string {
   return [
-    "fabric_exec BLOCKED by context-engineer — source-bearing return lacks a provable bound.",
+    "fabric_exec BLOCKED by context-engineer — return does not satisfy the configured context policy.",
     "",
     ...reasons.map((reason) => `  • ${reason}`),
     "",

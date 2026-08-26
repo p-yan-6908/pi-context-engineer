@@ -12,6 +12,7 @@ import { runV04Differential } from "./verify-differential.js";
 import { runExplanationChecks } from "./verify-explanation.js";
 import { runConstantAliasChecks } from "./verify-aliases.js";
 import { runSymbolicChecks } from "./verify-symbolic.js";
+import { runV05PolicyChecks } from "./verify-quantitative-policy.js";
 
 type TestCase = {
   name: string;
@@ -512,6 +513,14 @@ console.log(`[${symbolic.failed === 0 ? "ok" : "FAIL"}] symbolic bound checks: $
 for (const failure of symbolic.failures) console.log(`     ${failure}`);
 const symbolicFailures = symbolic.failed;
 
+const v05Policy = runV05PolicyChecks();
+console.log(`[${v05Policy.failed === 0 ? "ok" : "FAIL"}] v0.5 quantitative policy checks: ${v05Policy.passed}/${v05Policy.passed + v05Policy.failed}`);
+console.log(`     intentional v0.5 changes: ${v05Policy.intentionalPassed}/${v05Policy.intentionalTotal}`);
+console.log(`     legacy parity cases: ${v05Policy.parityPassed}/${v05Policy.parityTotal}`);
+console.log(`     unexpected policy-case differences: ${(v05Policy.intentionalTotal - v05Policy.intentionalPassed) + (v05Policy.parityTotal - v05Policy.parityPassed)}`);
+for (const failure of v05Policy.failures) console.log(`     ${failure}`);
+const v05PolicyFailures = v05Policy.failed;
+
 const scopes = new FabricExecutionScopes();
 scopes.start({ toolCallId: "fabric_a", workspaceRoot: "/tmp/a", startedAt: 1 });
 scopes.start({ toolCallId: "fabric_b", workspaceRoot: "/tmp/b", startedAt: 2 });
@@ -594,4 +603,4 @@ if (!delegateTool) {
   if (!delegateOk) toolFailures++;
 }
 console.log(`Tool checks: ${toolFailures === 0 ? "passed" : `${toolFailures} failed`}.`);
-process.exit(failed + wrapperFailures + toolFailures + scopeFailures + registryFailures + quantitativeFailures + differentialFailures + explanationFailures + aliasFailures + symbolicFailures > 0 ? 1 : 0);
+process.exit(failed + wrapperFailures + toolFailures + scopeFailures + registryFailures + quantitativeFailures + differentialFailures + explanationFailures + aliasFailures + symbolicFailures + v05PolicyFailures > 0 ? 1 : 0);

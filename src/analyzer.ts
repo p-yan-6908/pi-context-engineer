@@ -18,6 +18,7 @@ import {
   type ContextProvenanceStep,
   type ResolvedBound,
 } from "./context-effects.js";
+import { evaluateReturnBudget, type ContextBoundaryPolicy, type QuantitativeDecision } from "./quantitative-policy.js";
 
 export type TaintKind =
   | "clean"
@@ -70,6 +71,10 @@ export interface ProgramMetrics {
   returnBound?: ResolvedBound;
   /** Structured source/effect history for the final returned flow. */
   returnProvenance: ContextProvenanceStep[];
+  /** Independent size-policy result; legacy flow policy remains separately observable. */
+  quantitativeDecision?: QuantitativeDecision;
+  /** True when a within-budget proof removed only the legacy unbounded-return block. */
+  quantitativePolicyApplied: boolean;
 }
 
 export interface AnalyzerOptions {
@@ -77,6 +82,8 @@ export interface AnalyzerOptions {
   maxUnprocessedToolCalls?: number;
   /** Maximum estimated tokens for a literal/bounded return. */
   maxReturnTokens?: number;
+  /** Optional quantitative budgets consumed only when legacy policy is unsafe. */
+  quantitativePolicy?: ContextBoundaryPolicy;
 }
 
 interface Flow {
@@ -500,11 +507,11 @@ function combine(flows: Flow[], operation: string, preserveSingleBound = false):
   const combinedBound = preserveSingleBound && sourced.length === 1 ? sourced[0].bound : unknownBound();
 
   const firstUnsafe = sourced.find((flow) => flow.kind === "raw");
-  if (firstUnsafe) return { ...firstUnsafe, operation, provenance, bound: unknownBound() };
+  if (firstUnsafe) return { ...firstUnsafe, operation, provenance, bound: preserveSingleBound && sourced.length === 1 ? combinedBound : unknownBound() };
   const encoded = sourced.find((flow) => flow.kind === "encoded");
-  if (encoded) return { ...encoded, operation, provenance, bound: unknownBound() };
+  if (encoded) return { ...encoded, operation, provenance, bound: preserveSingleBound && sourced.length === 1 ? combinedBound : unknownBound() };
   const unknown = sourced.find((flow) => flow.kind === "unknown");
-  if (unknown) return { ...unknown, operation, provenance, bound: unknownBound() };
+  if (unknown) return { ...unknown, operation, provenance, bound: preserveSingleBound && sourced.length === 1 ? combinedBound : unknownBound() };
 
   const kind = sourced.some((flow) => flow.kind === "offloaded")
     ? "offloaded"
@@ -1121,6 +1128,7 @@ export function analyzeProgram(source: string, opts: AnalyzerOptions = {}): Anal
     estimatedRetentionRatio: null,
     estimatedReductionRatio: null,
     returnProvenance: [],
+    quantitativePolicyApplied: false,
   };
 
   const sourceText = source.trim();
@@ -1156,6 +1164,11 @@ export function analyzeProgram(source: string, opts: AnalyzerOptions = {}): Anal
   metrics.estimatedReductionRatio = returned.hasSource ? Math.max(0, 1 - returned.retention) : null;
   metrics.returnBound = returned.bound;
   metrics.returnProvenance = returned.provenance;
+  const quantitativePolicy: ContextBoundaryPolicy | undefined = opts.maxReturnTokens !== undefined && opts.quantitativePolicy?.maxTokens === undefined
+    ? { ...opts.quantitativePolicy, maxTokens: opts.maxReturnTokens }
+    : opts.quantitativePolicy;
+  const quantitativeDecision = evaluateReturnBudget(metrics.returnBound, quantitativePolicy);
+  metrics.quantitativeDecision = quantitativeDecision;
 
   for (const node of returns) {
     // This is deliberately only a source-size estimate for static returns;
@@ -1179,14 +1192,15 @@ export function analyzeProgram(source: string, opts: AnalyzerOptions = {}): Anal
 
   const reasons: string[] = [];
   let hardBlock = false;
+  let legacyUnboundedReason: string | undefined;
   if (returned.hasSource && !returned.bounded) {
     hardBlock = true;
-    reasons.push(
+    legacyUnboundedReason =
       `Return carries ${metrics.returnTaint} tool data (${metrics.returnOperation}) without a provable context bound after ${metrics.sourceCalls} source call(s). ` +
-        "A transformation such as map, filter, reduce, trim, or replace may still retain the full source. " +
-        "Use scalar projections, find/some/every, slice(0, N), extensions.ctx_summarize({ text, mode: \"structural\", maxTokens }), " +
-        "extensions.ctx_offload({ key, source, data }), or delegate the work."
-    );
+      "A transformation such as map, filter, reduce, trim, or replace may still retain the full source. " +
+      "Use scalar projections, find/some/every, slice(0, N), extensions.ctx_summarize({ text, mode: \"structural\", maxTokens }), " +
+      "extensions.ctx_offload({ key, source, data }), or delegate the work.";
+    reasons.push(legacyUnboundedReason);
   }
 
   const maxReturnTokens = opts.maxReturnTokens ?? 4000;
@@ -1200,7 +1214,21 @@ export function analyzeProgram(source: string, opts: AnalyzerOptions = {}): Anal
     );
   }
 
+  if (legacyUnboundedReason && quantitativeDecision.kind === "over-budget") {
+    const value = quantitativeDecision.bound.kind === "unknown" ? "unknown" : quantitativeDecision.bound.value;
+    reasons.push(`Quantitative policy rejects the proven maximum of ${value} ${quantitativeDecision.unit} because it exceeds the configured budget of ${quantitativeDecision.limit} ${quantitativeDecision.unit}.`);
+  } else if (legacyUnboundedReason && quantitativeDecision.kind === "not-comparable") {
+    reasons.push(`Quantitative policy cannot allow this return: ${quantitativeDecision.reason}`);
+  }
+
+  if (legacyUnboundedReason && quantitativeDecision.kind === "within-budget") {
+    const index = reasons.indexOf(legacyUnboundedReason);
+    if (index >= 0) reasons.splice(index, 1);
+    metrics.quantitativePolicyApplied = true;
+  }
+
   metrics.sourceCalls = metrics.toolCalls;
+  hardBlock = reasons.length > 0;
   const ok = reasons.length === 0;
   return { ok, hardBlock, reasons, metrics };
 }
