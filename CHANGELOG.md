@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (v0.5.0)
+## 0.5.0
 
 ### Context effects
 

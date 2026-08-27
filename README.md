@@ -246,7 +246,9 @@ The deterministic proof harness compares raw baseline results with CE addressabl
 npm run bench
 ```
 
-It covers huge grep/JSON/build-log payloads, repeated reads, parallel provider-like results, Fovea-like source selection, large summaries, and nested-agent handoffs. The default one-warmup/three-iteration run reports median and p95 wall time to `.tmp/context-benchmark.json`; `bench/result.schema.json` defines retained release results with sourceCommit/runtime provenance and per-iteration samples. Metrics include Main-context exposure (not total token usage), Main input/output/injected tokens, child-model tokens, wall time, disk bytes, selected bytes retrieved, task correctness, quality-adjusted savings, and context efficiency.
+It covers huge grep/JSON/build-log payloads, repeated reads, parallel provider-like results, Fovea-like source selection, large summaries, and nested-agent handoffs. The default one-warmup/three-iteration run reports median and p95 wall time to `.tmp/context-benchmark.json`; `bench/result.schema.json` defines retained release results with sourceCommit/runtime provenance and per-iteration samples. The v0.5.0 retained workload result is `bench/results/v0.5.0.json`; the frozen v0.4.0 result remains `bench/results/v0.4.0.json` for comparable baseline evidence.
+
+The separate v0.5 quantitative-policy result is `bench/results/v0.5.0-quantitative-policy.json`; it emphasizes maintained legacy parity plus intentional symbolic-cap acceptance, not a misleading performance comparison. Metrics include Main-context exposure (not total token usage), Main input/output/injected tokens, child-model tokens, wall time, disk bytes, selected bytes retrieved, task correctness, quality-adjusted savings, and context efficiency.
 
 Opt-in real runtime smoke tests launch the local `pi` CLI with CE and Fabric extensions. They require a configured model and are intentionally separate from CI's deterministic suite:
 

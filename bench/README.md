@@ -21,21 +21,21 @@ The runner disables auto-discovered extensions and loads the local CE/Fabric bui
 
 The runner writes `.tmp/context-benchmark.json`. It performs one warmup and three measured iterations by default, reports median and p95 wall time, and retains every sample in the JSON result. Override these with `CE_BENCHMARK_WARMUP` and `CE_BENCHMARK_ITERATIONS`.
 
-For a retained release artifact:
+For the retained v0.5.0 release artifact (the v0.4.0 artifact remains frozen):
 
 ```bash
-PI_MODEL=openai-codex/gpt-5.6-luna CE_BENCHMARK_WARMUP=1 CE_BENCHMARK_ITERATIONS=30 CE_BENCHMARK_OUT=bench/results/v0.4.0.json npm run bench
+PI_MODEL=openai-codex/gpt-5.6-luna CE_BENCHMARK_WARMUP=1 CE_BENCHMARK_ITERATIONS=30 CE_BENCHMARK_OUT=bench/results/v0.5.0.json npm run bench
 ```
 
-The machine-readable contract is `bench/result.schema.json`. Results record sourceCommit/dirty state, Node/Pi/Fabric versions, model/provider, Main input/output/injected tokens, internal model tokens, logical offload bytes, selected bytes retrieved, wall time, correctness, and all per-iteration samples.
+The machine-readable contract is `bench/result.schema.json`. Retained workload evidence is `bench/results/v0.5.0.json`; `bench/results/v0.4.0.json` is the byte-identical comparison baseline. Results record sourceCommit/dirty state, Node/Pi/Fabric versions, model/provider, Main input/output/injected tokens, internal model tokens, logical offload bytes, selected bytes retrieved, wall time, correctness, and all per-iteration samples.
 
 The v0.5 static policy benchmark is separate from the frozen workload benchmark:
 
 ```bash
-npm run bench:policy
+POLICY_BENCHMARK_OUT=bench/results/v0.5.0-quantitative-policy.json npm run bench:policy
 ```
 
-It runs symbolic `Math.min`, alias, conditional, and `Math.max` caps plus unknown, over-budget, and legacy-safe parity cases. Its report separates expected v0.5 changes from legacy parity and writes `.tmp/policy-benchmark.json`; it does not replace or mutate the retained v0.4 workload artifact.
+It runs symbolic `Math.min`, alias, conditional, and `Math.max` caps plus unknown, over-budget, and legacy-safe parity cases. Its report records sourceCommit, dirty state, runtime/model provenance, correctness, decisions, bounds, and analysis timing; `bench/policy-result.schema.json` defines its retained contract. It does not replace or mutate the retained v0.4 workload artifact.
 
 ## Metrics
 

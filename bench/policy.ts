@@ -1,4 +1,6 @@
+import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { performance } from "node:perf_hooks";
 import { analyzeProgram } from "../src/analyzer.js";
 
@@ -91,8 +93,23 @@ const rows = cases.map((test) => {
 const intentional = rows.filter((row, index) => cases[index].v04 !== cases[index].v05);
 const parity = rows.filter((row, index) => cases[index].v04 === cases[index].v05);
 const correct = rows.filter((row) => row.correct).length;
+function commandText(command: string, args: string[]): string | null {
+  try { return execFileSync(command, args, { encoding: "utf8" }).trim() || null; }
+  catch { return null; }
+}
+
+const environment = {
+  sourceCommit: commandText("git", ["rev-parse", "HEAD"]) ?? "unknown",
+  dirty: Boolean(commandText("git", ["status", "--porcelain"])),
+  nodeVersion: process.version,
+  model: process.env.PI_MODEL ?? null,
+  provider: process.env.PI_PROVIDER ?? (process.env.PI_MODEL?.includes("/") ? process.env.PI_MODEL.split("/", 1)[0] : null),
+  iterations,
+};
 const report = {
   suite: "v0.5 quantitative policy",
+  generatedAt: new Date().toISOString(),
+  environment,
   iterations,
   rows,
   totals: {
@@ -103,8 +120,9 @@ const report = {
   },
 };
 
-mkdirSync(".tmp", { recursive: true });
-writeFileSync(".tmp/policy-benchmark.json", JSON.stringify(report, null, 2) + "\n");
+const outputPath = process.env.POLICY_BENCHMARK_OUT ?? ".tmp/policy-benchmark.json";
+mkdirSync(dirname(outputPath), { recursive: true });
+writeFileSync(outputPath, JSON.stringify(report, null, 2) + "\n");
 console.log("# v0.5 quantitative policy benchmark");
 console.log(`Iterations: ${iterations}`);
 console.log("| Case | v0.4 | v0.5 expected | v0.5 actual | Decision | Bound | Correct |");
@@ -118,5 +136,5 @@ console.log(`- Correctness: ${report.totals.correct}`);
 console.log(`- Intentional v0.5 changes: ${report.totals.intentionalChanges}`);
 console.log(`- Legacy parity: ${report.totals.legacyParity}`);
 console.log(`- Unexpected differences: ${report.totals.unexpectedDifferences}`);
-console.log("JSON report: .tmp/policy-benchmark.json");
+console.log(`JSON report: ${outputPath}`);
 process.exitCode = report.totals.unexpectedDifferences === 0 ? 0 : 1;

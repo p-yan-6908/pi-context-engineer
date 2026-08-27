@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/p-yan-6908/pi-context-engineer/blob/main/bench/policy-result.schema.json",
+  "title": "Context Engineer v0.5 quantitative policy benchmark",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["suite", "generatedAt", "environment", "iterations", "rows", "totals"],
+  "properties": {
+    "suite": { "const": "v0.5 quantitative policy" },
+    "generatedAt": { "type": "string", "format": "date-time" },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceCommit", "dirty", "nodeVersion", "model", "provider", "iterations"],
+      "properties": {
+        "sourceCommit": { "type": "string", "minLength": 1 },
+        "dirty": { "type": "boolean" },
+        "nodeVersion": { "type": "string", "minLength": 1 },
+        "model": { "type": ["string", "null"] },
+        "provider": { "type": ["string", "null"] },
+        "iterations": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "iterations": { "type": "integer", "minimum": 1 },
+    "rows": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "v04", "expectedV05", "actualV05", "expectedDecision", "actualDecision", "bound", "policyApplied", "meanAnalysisMs", "correct"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "v04": { "enum": ["safe", "unsafe"] },
+          "expectedV05": { "enum": ["safe", "unsafe"] },
+          "actualV05": { "enum": ["safe", "unsafe"] },
+          "expectedDecision": { "enum": ["within-budget", "over-budget", "not-comparable"] },
+          "actualDecision": { "enum": ["within-budget", "over-budget", "not-comparable"] },
+          "bound": {
+            "oneOf": [
+              { "type": "null" },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind"],
+                "properties": {
+                  "kind": { "enum": ["exact", "upper", "unknown"] },
+                  "value": { "type": "integer", "minimum": 0 },
+                  "unit": { "enum": ["bytes", "tokens", "characters", "elements", "records"] }
+                }
+              }
+            ]
+          },
+          "policyApplied": { "type": "boolean" },
+          "meanAnalysisMs": { "type": "number", "minimum": 0 },
+          "correct": { "type": "boolean" }
+        }
+      }
+    },
+    "totals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["correct", "intentionalChanges", "legacyParity", "unexpectedDifferences"],
+      "properties": {
+        "correct": { "type": "string", "pattern": "^[0-9]+/[0-9]+$" },
+        "intentionalChanges": { "type": "string", "pattern": "^[0-9]+/[0-9]+$" },
+        "legacyParity": { "type": "string", "pattern": "^[0-9]+/[0-9]+$" },
+        "unexpectedDifferences": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}
