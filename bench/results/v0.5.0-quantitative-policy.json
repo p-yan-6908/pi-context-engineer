@@ -1,0 +1,132 @@
+{
+  "suite": "v0.5 quantitative policy",
+  "generatedAt": "2026-08-27T16:58:44.312Z",
+  "environment": {
+    "sourceCommit": "edae4c5876d3cbe392335040ad4771e287e7d154",
+    "dirty": false,
+    "nodeVersion": "v25.8.1",
+    "model": "gpt-5.6-luna",
+    "provider": "openai-codex",
+    "iterations": 25
+  },
+  "iterations": 25,
+  "rows": [
+    {
+      "id": "symbolic-min-cap",
+      "v04": "unsafe",
+      "expectedV05": "safe",
+      "actualV05": "safe",
+      "expectedDecision": "within-budget",
+      "actualDecision": "within-budget",
+      "bound": {
+        "kind": "upper",
+        "value": 3000,
+        "unit": "tokens"
+      },
+      "policyApplied": true,
+      "meanAnalysisMs": 0.493,
+      "correct": true
+    },
+    {
+      "id": "alias-cap",
+      "v04": "unsafe",
+      "expectedV05": "safe",
+      "actualV05": "safe",
+      "expectedDecision": "within-budget",
+      "actualDecision": "within-budget",
+      "bound": {
+        "kind": "upper",
+        "value": 3000,
+        "unit": "tokens"
+      },
+      "policyApplied": true,
+      "meanAnalysisMs": 0.181,
+      "correct": true
+    },
+    {
+      "id": "conditional-cap",
+      "v04": "unsafe",
+      "expectedV05": "safe",
+      "actualV05": "safe",
+      "expectedDecision": "within-budget",
+      "actualDecision": "within-budget",
+      "bound": {
+        "kind": "upper",
+        "value": 3000,
+        "unit": "tokens"
+      },
+      "policyApplied": true,
+      "meanAnalysisMs": 0.165,
+      "correct": true
+    },
+    {
+      "id": "bounded-max",
+      "v04": "unsafe",
+      "expectedV05": "safe",
+      "actualV05": "safe",
+      "expectedDecision": "within-budget",
+      "actualDecision": "within-budget",
+      "bound": {
+        "kind": "upper",
+        "value": 3000,
+        "unit": "tokens"
+      },
+      "policyApplied": true,
+      "meanAnalysisMs": 0.16,
+      "correct": true
+    },
+    {
+      "id": "unknown-conditional",
+      "v04": "unsafe",
+      "expectedV05": "unsafe",
+      "actualV05": "unsafe",
+      "expectedDecision": "not-comparable",
+      "actualDecision": "not-comparable",
+      "bound": {
+        "kind": "unknown",
+        "unit": "tokens"
+      },
+      "policyApplied": false,
+      "meanAnalysisMs": 0.082,
+      "correct": true
+    },
+    {
+      "id": "over-budget-cap",
+      "v04": "unsafe",
+      "expectedV05": "unsafe",
+      "actualV05": "unsafe",
+      "expectedDecision": "over-budget",
+      "actualDecision": "over-budget",
+      "bound": {
+        "kind": "upper",
+        "value": 4001,
+        "unit": "tokens"
+      },
+      "policyApplied": false,
+      "meanAnalysisMs": 0.083,
+      "correct": true
+    },
+    {
+      "id": "legacy-safe-over-budget",
+      "v04": "safe",
+      "expectedV05": "safe",
+      "actualV05": "safe",
+      "expectedDecision": "over-budget",
+      "actualDecision": "over-budget",
+      "bound": {
+        "kind": "exact",
+        "value": 4000000000,
+        "unit": "bytes"
+      },
+      "policyApplied": false,
+      "meanAnalysisMs": 0.067,
+      "correct": true
+    }
+  ],
+  "totals": {
+    "correct": "7/7",
+    "intentionalChanges": "4/4",
+    "legacyParity": "3/3",
+    "unexpectedDifferences": 0
+  }
+}
