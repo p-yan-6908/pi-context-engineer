@@ -116,7 +116,7 @@ export const contextEffects: Readonly<Record<string, ContextEffect>> = Object.fr
 // instead of being mistaken for raw sources. The provider list mirrors the
 // current Pi/Fabric guest surfaces; adding a provider here is safer than
 // treating its raw result as a scalar.
-const SOURCE_NAMESPACE = /^(?:tools|pi|fabric|mcp|extensions|agents|workflow|mesh|council|rlm|state|memory|schema)\./;
+const SOURCE_NAMESPACE = /^(?:tools|pi|fabric|mcp|extensions|agents|workflow|mesh|council|rlm|state|memory|schema|components|compact)\./;
 const DIRECT_SOURCE_TOOL = /^(?:read|write|edit|bash|powershell|grep|glob|list|ls|find|search|fetch|fetch_content|get_search_content|source_check|web_search|openai_websearch|openai_image|vision|subagent|delegate|agent|exec|execute|run|command|shell|terminal|request|download|upload|fabric_exec|fovea_[a-z0-9_]*)(?:$|\.)/;
 const CONTEXT_HELPER = /^(?:(?:extensions\.)?(?:ctx|ce)_[a-z0-9_]+|(?:ctx|ce)\.)/;
 

@@ -4,7 +4,7 @@
 
 ### Compatibility and boundary safety
 
-- Classified current Pi/Fabric provider namespaces, Fovea/web helpers, and PowerShell/process tools as source effects for raw-return analysis.
+- Classified current Pi/Fabric provider namespaces (including `components` and `compact`), Fovea/web helpers, and PowerShell/process tools as source effects for raw-return analysis.
 - Kept documented Fabric nested results byte-for-byte intact even when lifecycle events arrive out of order.
 - Raised the default model-boundary offload/read budget to 16 KB and added deterministic oversized-error compaction.
 - Added structural JSON/text previews, stable model/Fabric `ctx_read` recipes, and JSON-path selection for stored payloads.
