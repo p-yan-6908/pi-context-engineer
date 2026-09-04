@@ -19,7 +19,7 @@ import { ContextStore, DEFAULT_MEMORY_STORE_MAX_BYTES } from "./store.js";
 /** Headroom reserved for the JSON envelope around a CE tool result. */
 const RESULT_ENVELOPE_SLACK_BYTES = 1024;
 /** Default ceiling for one CE tool result; mirrors index.ts's offload threshold. */
-const DEFAULT_MAX_RETURN_BYTES = 8192;
+const DEFAULT_MAX_RETURN_BYTES = 16_384;
 type SummaryMode = "structural" | "code" | "model";
 type SummaryStrategy = "hierarchical" | "direct";
 const DEFAULT_SUMMARY_TOKENS = 500;
@@ -86,14 +86,15 @@ const ctxRead: ToolDef = {
   description:
     "Read a slice of or search within a previously offloaded tool result by its handle. " +
     "Keeps large data out of context — only the requested slice or matched lines return. " +
-    "Use offset/length for ranged reads, or query for literal substring search with context lines.",
+    "Use offset/length for ranged reads, query for literal line matches, or jsonPath for structured JSON selection.",
   inputSchema: {
     type: "object",
     properties: {
       id: { type: "string", description: "The handle returned when the data was offloaded." },
       offset: { type: "integer", description: "0-based byte offset for ranged read. Defaults to 0." },
-      length: { type: "integer", description: "Bytes to read. Defaults to ~8KB. Ranged results include a copyable nextOffset when more remains." },
+      length: { type: "integer", description: "Bytes to read. Defaults to the bounded read budget. Ranged results include a copyable nextOffset when more remains." },
       query: { type: "string", description: "Literal substring to search for. Overrides offset/length." },
+      jsonPath: { type: "string", description: "Dot/bracket JSON path for a stored JSON payload, e.g. $.results[0].name. Overrides query/offset/length." },
       contextLines: { type: "integer", description: "Lines of context around each query match. Default 2; clamped to 0-50." },
       maxMatches: { type: "integer", description: "Maximum matching windows to format while still reporting exact totalMatches. Default 100; maximum 500." },
     },
@@ -107,6 +108,13 @@ const ctxRead: ToolDef = {
       512,
       (ctx.maxReturnBytes ?? DEFAULT_MAX_RETURN_BYTES) - RESULT_ENVELOPE_SLACK_BYTES
     );
+
+    if (args.jsonPath !== undefined) {
+      const result = await ctx.store.read(args.id as string, {
+        jsonPath: String(args.jsonPath),
+      });
+      return capContent(result, budget, "narrow the JSON path or select a smaller value");
+    }
 
     if (args.query) {
       const requestedContextLines = Number(args.contextLines);

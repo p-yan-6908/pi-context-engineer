@@ -11,15 +11,19 @@
  *   - storeTokensWritten: payload tokens persisted for later retrieval.
  */
 
+import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 export type ContextStrategy = "PASS" | "WARN" | "BLOCK" | "WRITE" | "SELECT" | "COMPRESS" | "ISOLATE";
+export type TelemetryScope = "runtime" | "session" | "lifetime";
 
 export interface ContextEvent {
   version: 2;
   timestamp: string;
   sessionId: string;
+  /** Runtime/extension-instance identity; old event files may omit it. */
+  runtimeId?: string;
   strategy: ContextStrategy;
   tool: string;
   /** Legacy payload-size fields retained for compatibility. */
@@ -50,7 +54,9 @@ export interface StrategySummary {
 }
 
 export interface ContextSummary {
+  scope?: TelemetryScope;
   sessionId?: string;
+  runtimeId?: string;
   events: number;
   /** Legacy aggregate fields. */
   sourceTokens: number;
@@ -96,8 +102,19 @@ function isStrategy(value: unknown): value is ContextStrategy {
 }
 
 export class ContextTelemetry {
-  readonly sessionId = `${Date.now().toString(36)}-${process.pid.toString(36)}`;
+  readonly runtimeId = `${Date.now().toString(36)}-${process.pid.toString(36)}-${randomUUID()}`;
+  private activeSessionId = this.runtimeId;
   private readonly maxEvents = 5000;
+
+  get sessionId(): string {
+    return this.activeSessionId;
+  }
+
+  /** Bind this runtime to the host Pi session once session_start provides it. */
+  setSessionId(sessionId: unknown): void {
+    if (typeof sessionId !== "string" || sessionId.trim().length === 0) return;
+    this.activeSessionId = sessionId.trim().slice(0, 240);
+  }
 
   record(
     workspaceRoot: string,
@@ -132,6 +149,7 @@ export class ContextTelemetry {
         version: 2,
         timestamp: new Date().toISOString(),
         sessionId: this.sessionId,
+        runtimeId: this.runtimeId,
         strategy: event.strategy,
         tool: event.tool.slice(0, 120),
         sourceBytes,
@@ -155,8 +173,24 @@ export class ContextTelemetry {
     }
   }
 
+  /** Backward-compatible session/lifetime summary API. */
   summary(workspaceRoot: string, allSessions = false): ContextSummary {
-    const events = this.read(workspaceRoot).filter((event) => allSessions || event.sessionId === this.sessionId);
+    return this.summarizeScope(workspaceRoot, allSessions ? "lifetime" : "session");
+  }
+
+  /** Events produced by this extension runtime only. */
+  runtimeSummary(workspaceRoot: string): ContextSummary {
+    return this.summarizeScope(workspaceRoot, "runtime");
+  }
+
+  private summarizeScope(workspaceRoot: string, scope: TelemetryScope): ContextSummary {
+    const events = this.read(workspaceRoot).filter((event) =>
+      scope === "lifetime"
+        ? true
+        : scope === "runtime"
+          ? event.runtimeId === this.runtimeId || (!event.runtimeId && event.sessionId === this.sessionId)
+          : event.sessionId === this.sessionId,
+    );
     const byStrategy: Record<string, StrategySummary> = {};
     let sourceTokens = 0;
     let visibleTokens = 0;
@@ -199,7 +233,9 @@ export class ContextTelemetry {
     const potentialMainTokens = mainTokensPrevented + mainTokensInjected;
     const mainContextReductionRatio = potentialMainTokens > 0 ? mainTokensPrevented / potentialMainTokens : 0;
     return {
-      ...(allSessions ? {} : { sessionId: this.sessionId }),
+      scope,
+      ...(scope !== "lifetime" ? { sessionId: this.sessionId } : {}),
+      ...(scope === "runtime" ? { runtimeId: this.runtimeId } : {}),
       events: events.length,
       sourceTokens,
       visibleTokens,
@@ -278,6 +314,7 @@ export class ContextTelemetry {
       version: 2,
       timestamp: typeof raw.timestamp === "string" ? raw.timestamp : new Date(0).toISOString(),
       sessionId: raw.sessionId,
+      runtimeId: typeof raw.runtimeId === "string" ? raw.runtimeId : raw.sessionId,
       strategy: raw.strategy,
       tool: typeof raw.tool === "string" ? raw.tool.slice(0, 120) : "unknown",
       sourceBytes,

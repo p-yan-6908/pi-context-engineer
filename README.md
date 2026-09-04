@@ -71,15 +71,17 @@ contextEffectFor("extensions.ctx_summarize"); // COMPRESS bounded by maxTokens
 contextEffectFor("extensions.ctx_offload"); // OFFLOAD
 ```
 
+Unregistered calls under `mcp.*`, `agents.*`, `workflow.*`, `state.*`, `memory.*`, `schema.*`, `mesh.*`, `council.*`, `rlm.*`, `fabric.*`, and direct shell/web tools are conservatively classified as source effects; exact CE/Fovea entries override that fallback.
+
 The registry remains descriptive, while the analyzer reports `metrics.returnBound`, `metrics.returnProvenance`, and an independent `metrics.quantitativeDecision`. Bounds distinguish exact values from proven upper bounds; the upper-bound algebra supports safe-integer `+`, `-`, `*`, `Math.min`, expression-level conditional joins, and `Math.max` when every operand is bounded. Conditional joins require both branches to be finite and use the larger branch bound; unsupported operations and control-flow assignment remain unknown. Quantitative policy defaults to 8192 bytes, 4000 tokens, and 8192 characters. Only bytes, tokens, and characters are directly comparable to those budgets; characters mean JavaScript UTF-16 code units (`String.length`), with no implicit byte/token conversion. Element and record bounds remain structural and are not used as context-size proofs. A within-budget proof additively clears only the legacy unbounded-return block; legacy-safe paths remain safe, while over-budget and not-comparable proofs remain blocked. Configure overrides in `.pi/context-engineer.json` with `policy.maxBytes`, `policy.maxTokens`, and `policy.maxCharacters`; each must be a non-negative safe integer no greater than 1,000,000,000. `explainProgram(source)` and `formatProgramExplanation(...)` expose the decision, budget, proven maximum, and result.
 
 ### Addressable context store
 
-Stored payloads include content hashes, provenance/source, content type, creation/access timestamps, estimated tokens, and expiry. Identical payloads deduplicate. `ctx_read` supports UTF-8 byte ranges and literal line queries. Ranged results expose copyable `offset` / `nextOffset`; query mode formats at most 100 match windows by default (`maxMatches`, capped at 500), samples `matchedLines`, and preserves the exact `totalMatches`. The complete serialized result—not only its text field—is budgeted below the recursive-offload threshold. An offload or `ctx_read` preview remains intact for the first model call that needs it; on later calls, the non-destructive `context` hook replaces that repeated text with a one-line handle recipe. The full payload remains re-readable, and session history is never rewritten. By default, entries expire after one week and the store is capped at 500 MB; cleanup runs opportunistically during store activity.
+Stored payloads include content hashes, provenance/source, content type, creation/access timestamps, estimated tokens, and expiry. Identical payloads deduplicate. `ctx_read` supports UTF-8 byte ranges, literal line queries, and focused JSON-path lookups such as `$.results[0].name`. Ranged results expose copyable `offset` / `nextOffset`; query mode formats at most 100 match windows by default (`maxMatches`, capped at 500), samples `matchedLines`, and preserves the exact `totalMatches`. The complete serialized result—not only its text field—is budgeted below the recursive-offload threshold. Handles expose structural previews (JSON keys/counts, or head/tail text/code) rather than dumping arbitrary payloads. At the model boundary, use `ctx_read({ id, offset, length })`; inside Fabric code, use `extensions.ctx_read(...)`. An offload or `ctx_read` preview remains intact for the first model call that needs it; on later calls, the non-destructive `context` hook replaces that repeated text with a one-line handle recipe. The full payload remains re-readable, and session history is never rewritten. By default, entries expire after one week and the store is capped at 500 MB; cleanup runs opportunistically during store activity.
 
 ### Telemetry
 
-The extension records sizes and strategies—not prompts or payloads—in `.pi/context-store/context-events.jsonl`. Metrics separate `internalTokensProcessed`, `mainTokensPrevented`, `mainTokensInjected`, and `storeTokensWritten`; the legacy `savedTokens` field aliases Main-context prevention for compatibility.
+The extension records sizes and strategies—not prompts or payloads—in `.pi/context-store/context-events.jsonl`. Metrics separate `internalTokensProcessed`, `mainTokensPrevented`, `mainTokensInjected`, and `storeTokensWritten`; the legacy `savedTokens` field aliases Main-context prevention for compatibility. Telemetry is scoped by extension runtime, host Pi session, or workspace lifetime; `ctx_status` returns all three, so a fresh runtime can still show session/lifetime activity from earlier runtimes.
 
 Interactive commands:
 
@@ -115,7 +117,7 @@ return extensions.ctx_summarize({
 
 Unknown modes are rejected. `maxTokens` is an approximate UTF-8 budget and is clamped to a safe range. Model mode also accepts `maxInputTokens` (default 32000 per child-model call) and `strategy: "hierarchical" | "direct"`; hierarchical is the safe default. Prefer `code` or `structural` for source inspection because they avoid an extra model call.
 
-Offloaded results include a copyable `extensions.ctx_read({ id, offset, length })` example. Use `query` when you know a literal symbol or phrase.
+Offloaded results include a copyable `ctx_read({ id, offset, length })` example at the model boundary; inside Fabric code use `extensions.ctx_read(...)`. Use `query` for literal matches or `jsonPath` for focused JSON values.
 
 For large data, write it off-window instead of returning it directly:
 
@@ -129,13 +131,13 @@ return extensions.ctx_offload({
 });
 ```
 
-Use the returned handle with `ctx_read` to retrieve a range or literal matches later.
+Use the returned handle with `ctx_read` to retrieve a range, literal matches, or a focused JSON path later.
 
 ## Tools
 
 The registered tools are callable directly by the model and inside Fabric through `extensions.*`:
 
-- `ctx_read` — select a range or literal matches from a stored handle
+- `ctx_read` — select a range, literal matches, or a JSON path from a stored handle
 - `ctx_summarize` — free structural/code compression or isolated no-tools model compression
 - `ctx_remember` / `ctx_recall` / `ctx_forget` — persistent project facts with bounded recall, named upserts, and deletion
 - `ctx_delegate` — isolated child Pi fallback with bounded output and a nested-safe deadline
@@ -155,9 +157,12 @@ Create `.pi/context-engineer.json` in a project when needed:
   "strict": false,
   "blockUnboundedReturns": false,
   "maxReturnTokens": 4000,
-  "readOffloadThreshold": 8192,
-  "nestedResultThreshold": 8192,
-  "offloadPreviewBytes": 1024,
+  "readOffloadThreshold": 16384,
+  "nestedResultThreshold": 16384,
+  "resultPolicy": "auto",
+  "errorCompactionThreshold": 4096,
+  "errorCompactionPreviewBytes": 4096,
+  "offloadPreviewBytes": 2048,
   "runtimeAdvisoryThreshold": 0,
   "compactStaleResults": true,
   "notifyOnStart": false,
@@ -169,6 +174,8 @@ Create `.pi/context-engineer.json` in a project when needed:
 Project configuration is re-read when the file's modification time changes, so tuning does not require an extension reload. `/ce settings` shows effective values, including defaults.
 
 - `strict` or `blockUnboundedReturns` restores fail-closed static enforcement.
+- `resultPolicy` is `auto` (threshold-based), `inline` (never rewrite successful boundary results), `offload` (force addressable handles), or `summarize` (threshold-based structural summaries with recovery handles).
+- `errorCompactionThreshold` and `errorCompactionPreviewBytes` bound oversized model-facing parser/compiler errors; nested Fabric errors remain untouched.
 - `runtimeAdvisoryThreshold: 0` disables repetitive size nudges; use a positive byte threshold to opt in.
 - `compactStaleResults` controls automatic compaction of already-used, addressable previews.
 - `notifyOnStart` controls the session-start toast, which is off by default.
@@ -234,7 +241,8 @@ The test suite includes more than 50 static data-flow cases plus live hook probe
 - runtime-first versus strict preflight, bounded delegation, and deterministic `ctx_summarize` modes
 - content deduplication, UTF-8 ranges, and ripgrep-only brace parse repair
 - generated adversarial transformations for aliases, destructuring, callbacks, async wrappers, computed access, loops, and Promise aggregates
-- the explicit `src/context-effects.ts` registry used by the analyzer for source/select/compress/offload policy metadata
+- the explicit `src/context-effects.ts` registry used by the analyzer for source/select/compress/offload policy metadata, including current providers and PowerShell/process tools
+- JSON-path handle selection, structural previews, oversized error compaction, explicit result policies, and cross-runtime telemetry scopes
 
 Run the generated adversarial suite directly with the normal `npm test` command. It fails closed when an unsafe transformation is classified as safe.
 

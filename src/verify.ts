@@ -37,6 +37,31 @@ const tests: TestCase[] = [
     expectBlock: true,
   },
   {
+    name: "raw passthrough: MCP provider result",
+    program: `const r = await mcp.pi_web_access.web_search({ query: "context" }); return r;`,
+    expectBlock: true,
+  },
+  {
+    name: "raw passthrough: agents provider result",
+    program: `const r = await agents.run({ prompt: "inspect" }); return r;`,
+    expectBlock: true,
+  },
+  {
+    name: "raw passthrough: workflow provider result",
+    program: `const r = await workflow.agent({ prompt: "inspect" }); return r;`,
+    expectBlock: true,
+  },
+  {
+    name: "raw passthrough: state provider result",
+    program: `const r = await state.get({ key: "context" }); return r;`,
+    expectBlock: true,
+  },
+  {
+    name: "raw passthrough: PowerShell result",
+    program: `const r = await powershell({ script: "Get-ChildItem" }); return r;`,
+    expectBlock: true,
+  },
+  {
     name: "raw passthrough: return tools.grep(...)",
     program: `return await tools.grep({ pattern: "TODO", path: "src/" });`,
     expectBlock: true,
@@ -362,14 +387,18 @@ for (const [name, kind, boundName, unit] of registryExpectations) {
 }
 const aliasOk = contextEffectFor("extensions.ctx.read") === contextEffectFor("extensions.ctx_read");
 const sourceFallbackOk = contextEffectFor("pi.read").kind === "source";
+const expandedSourceNames = ["mcp.pi_web_access.web_search", "agents.run", "workflow.agent", "state.get", "powershell", "exec"];
+const expandedSourceOk = expandedSourceNames.every((name) => contextEffectFor(name).kind === "source");
 const unknownHelperOk = contextEffectFor("extensions.ctx_future").kind === "unknown";
 const foveaIdentityOk = isFoveaName("fovea_focus") && !isFoveaName("ctx_recall");
 console.log(`${aliasOk ? "[ok]" : "[FAIL]"} registry dotted helper alias resolves to the same effect`);
 console.log(`${sourceFallbackOk ? "[ok]" : "[FAIL]"} unregistered Pi tool remains a source effect`);
+console.log(`${expandedSourceOk ? "[ok]" : "[FAIL]"} current provider and PowerShell namespaces remain source effects`);
 console.log(`${unknownHelperOk ? "[ok]" : "[FAIL]"} unregistered context helper remains unknown`);
 console.log(`${foveaIdentityOk ? "[ok]" : "[FAIL]"} Fovea selection is identified by its registry definition`);
 if (!aliasOk) registryFailures++;
 if (!sourceFallbackOk) registryFailures++;
+if (!expandedSourceOk) registryFailures++;
 if (!unknownHelperOk) registryFailures++;
 if (!foveaIdentityOk) registryFailures++;
 
@@ -538,8 +567,8 @@ const nestedB = scopes.isNestedToolResult("fabric_child_b");
 const finishedB = scopes.finish("fabric_b");
 const sizeAfterFinishes = scopes.size;
 const nestedAfterFinishes = scopes.isNestedToolResult("fabric_child_after");
-const scopeOk = sizeAfterStarts === 2 && nestedA && ordinaryIsBoundary && finishedA && nestedB && finishedB && sizeAfterFinishes === 0 && !nestedAfterFinishes;
-console.log(`${scopeOk ? "[ok]" : "[FAIL]"} execution scopes handle overlapping out-of-order Fabric runs`);
+const scopeOk = sizeAfterStarts === 2 && nestedA && ordinaryIsBoundary && finishedA && nestedB && finishedB && sizeAfterFinishes === 0 && nestedAfterFinishes;
+console.log(`${scopeOk ? "[ok]" : "[FAIL]"} execution scopes handle overlapping and late nested Fabric results`);
 let scopeFailures = scopeOk ? 0 : 1;
 
 const summarizeTool = ceToolMap.get("ctx_summarize");

@@ -33,12 +33,13 @@ export class FabricExecutionScopes {
   }
 
   /**
-   * Nested Fabric tool IDs are safe to preserve even when multiple parent
-   * executions overlap. Non-prefixed IDs remain ordinary model-boundary calls
-   * rather than being misclassified by a global counter.
+   * Nested Fabric tool IDs are safe to preserve even when lifecycle events
+   * arrive out of order or the parent has already finished. The documented
+   * prefix is the durable boundary marker; non-prefixed IDs remain ordinary
+   * model-boundary calls.
    */
   isNestedToolResult(toolCallId: string): boolean {
-    return this.active.size > 0 && toolCallId.startsWith(FABRIC_NESTED_TOOL_CALL_ID_PREFIX);
+    return toolCallId.startsWith(FABRIC_NESTED_TOOL_CALL_ID_PREFIX);
   }
 
   clear(): void {

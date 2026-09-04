@@ -128,6 +128,14 @@ console.log("\n=== Read Auto-Offload Tests ===\n");
 
 const store = new ContextStore("/tmp/pi-ce-test-" + Date.now());
 
+let ctlFailed = 0;
+let ctlChecks = 0;
+function checkCtl(name: string, cond: boolean, detail = "") {
+  ctlChecks++;
+  console.log(`${cond ? "[ok]" : "[FAIL]"} ${name}${detail ? `\\n   ${detail}` : ""}`);
+  if (!cond) ctlFailed++;
+}
+
 const offloadTests = [
   {
     name: "large result offloaded with handle + preview",
@@ -146,7 +154,7 @@ let offloadFailed = 0;
 
 for (const test of offloadTests) {
   const result = store.write("test-read", "read", test.text);
-  const isLarge = result.bytes > 8192;
+  const isLarge = result.bytes > 16_384;
   const ok = test.expectTruncated ? isLarge : !isLarge;
   const status = ok ? "[ok]" : "[FAIL]";
   console.log(`${status} ${test.name}`);
@@ -164,6 +172,13 @@ const offloaded = store.write("test-readback", "read", largeText);
 
 const readResult = store.read(offloaded.id, {});
 const queryResult = store.read(offloaded.id, { query: "clearCustomerSession" });
+const jsonEntry = store.write("json-result", "fabric_exec", JSON.stringify({
+  results: [{ name: "alpha", score: 1 }, { name: "beta", score: 2 }],
+  metadata: { count: 2, ok: true },
+}));
+const jsonSelection = store.read(jsonEntry.id, { jsonPath: "$.results[1].name" });
+checkCtl("JSON handles expose type and structural preview", jsonEntry.contentType === "json" && jsonEntry.preview.includes("JSON object") && jsonEntry.preview.includes("results"));
+checkCtl("JSON-path reads return a focused typed value", jsonSelection.content === '"beta"' && jsonSelection.jsonPath === "$.results[1].name" && jsonSelection.selectedType === "string" && jsonSelection.contentType === "json");
 
 console.log(`[ok] ctx_read full preview (first ${readResult.bytesRead} bytes of ${readResult.totalBytes})`);
 console.log(`[ok] ctx_read query "clearCustomerSession": ${queryResult.matchedLines?.length ?? 0} matches`);
@@ -226,8 +241,8 @@ const ctrl = await callHook("tool_result", {
 });
 checkHook("top-level large result is offloaded", ctrl?.details?.ce_offloaded === true);
 const ctrlText = ctrl?.content?.find((item: any) => item.type === "text")?.text ?? "";
-checkHook("offload message includes a copyable ctx_read recipe", ctrlText.includes("extensions.ctx_read({ id:"));
-checkHook("offload preview stays bounded", Buffer.byteLength(ctrlText, "utf8") < 1800);
+checkHook("offload message includes a copyable model-facing ctx_read recipe", ctrlText.includes("ctx_read({ id:") && !ctrlText.includes("extensions.ctx_read({ id:"));
+checkHook("structural offload preview stays bounded", Buffer.byteLength(ctrlText, "utf8") < 3200);
 
 const addressableMessage = {
   role: "toolResult",
@@ -355,12 +370,19 @@ await callHook("tool_execution_end", {
   isError: true,
 });
 const afterInterrupted = await callHook("tool_result", {
-  toolCallId: "fabric_after_interrupted",
+  toolCallId: "after_interrupted",
   toolName: "read",
   input: { path: "later.txt" },
   content: [{ type: "text", text: BIG }],
 });
-checkHook("execution_end cleanup prevents a stale intermediate scope", afterInterrupted?.details?.ce_offloaded === true);
+checkHook("execution_end cleanup preserves ordinary boundary handling", afterInterrupted?.details?.ce_offloaded === true);
+const lateNested = await callHook("tool_result", {
+  toolCallId: "fabric_late_nested",
+  toolName: "read",
+  input: { path: "late.txt" },
+  content: [{ type: "text", text: BIG }],
+});
+checkHook("late Fabric-prefixed result remains an intermediate value", lateNested === undefined);
 
 const strictCwd = "/tmp/pi-ce-strict-" + Date.now();
 mkdirSync(join(strictCwd, ".pi"), { recursive: true });
@@ -398,14 +420,6 @@ checkHook("strict block does not suppress later boundary offload", postBlock?.de
 
 console.log("\n=== ctx_read Self-Cap ===\n");
 
-let ctlFailed = 0;
-let ctlChecks = 0;
-function checkCtl(name: string, cond: boolean, detail = "") {
-  ctlChecks++;
-  console.log(`${cond ? "[ok]" : "[FAIL]"} ${name}${detail ? `\n   ${detail}` : ""}`);
-  if (!cond) ctlFailed++;
-}
-
 const capCwd = "/tmp/pi-ce-cap-" + Date.now();
 mkdirSync(capCwd, { recursive: true });
 const capStore = new ContextStore(capCwd);
@@ -419,8 +433,8 @@ if (ctxReadDef) {
   const out1 = await ctxReadDef.execute("t1", { id: capEntry.id }, undefined, undefined, { cwd: capCwd });
   const p1 = JSON.parse(out1.content[0].text);
   checkCtl(
-    "default ranged read stays under the 8KB threshold",
-    Buffer.byteLength(out1.content[0].text, "utf8") < 8192 && p1.bytesRead < 8192 && p1.offset === 0 && p1.nextOffset === p1.bytesRead && p1.truncated === true && p1.totalBytes === Buffer.byteLength(payload),
+    "default ranged read stays under the 16KB threshold",
+    Buffer.byteLength(out1.content[0].text, "utf8") < 16_384 && p1.bytesRead < 16_384 && p1.offset === 0 && p1.nextOffset === p1.bytesRead && p1.truncated === true && p1.totalBytes === Buffer.byteLength(payload),
     `bytesRead=${p1.bytesRead}, totalBytes=${p1.totalBytes}`
   );
   const ctxReadMessage = {
@@ -455,9 +469,9 @@ if (ctxReadDef) {
   const out2 = await ctxReadDef.execute("t2", { id: capEntry.id, query: "needle" }, undefined, undefined, { cwd: capCwd });
   const p2 = JSON.parse(out2.content[0].text);
   checkCtl(
-    "query-mode serialized envelope stays under the threshold",
-    Buffer.byteLength(out2.content[0].text, "utf8") < 8192 &&
-      p2.content.length < 8192 &&
+    "query-mode serialized envelope stays under the 16KB threshold",
+    Buffer.byteLength(out2.content[0].text, "utf8") < 16_384 &&
+      p2.content.length < 16_384 &&
       p2.truncated === true &&
       p2.matchedLines?.length <= 64 &&
       p2.totalMatches === 4000,
@@ -475,6 +489,10 @@ if (ctxReadDef) {
     "maxMatches bounds formatted windows while preserving the exact total",
     pLimitedMatches.matchedLines?.length === 5 && pLimitedMatches.totalMatches === 4000,
   );
+  const jsonForRead = capStore.write("json-cap-test", "read", JSON.stringify({ results: [{ id: 7 }, { id: 8 }] }));
+  const jsonRead = await ctxReadDef.execute("json-read", { id: jsonForRead.id, jsonPath: "$.results[0].id" }, undefined, undefined, { cwd: capCwd });
+  const jsonReadRecord = JSON.parse(jsonRead.content[0].text);
+  checkCtl("ctx_read exposes JSON-path selection", jsonReadRecord.content === "7" && jsonReadRecord.jsonPath === "$.results[0].id" && jsonReadRecord.selectedType === "number");
 }
 
 // Project config lowers the threshold; the self-cap must follow it.
@@ -594,6 +612,17 @@ mkdirSync(join(legacyCwd, ".pi/context-store"), { recursive: true });
 writeFileSync(join(legacyCwd, ".pi/context-store/context-events.jsonl"), JSON.stringify({ version: 1, timestamp: new Date().toISOString(), sessionId: "legacy", strategy: "WRITE", tool: "read", sourceBytes: 4000, visibleBytes: 400, sourceTokens: 1000, visibleTokens: 100, savedTokens: 900 }) + "\n");
 const legacySummary = new ContextTelemetry().summary(legacyCwd, true);
 checkCtl("telemetry reads legacy version-1 events", legacySummary.mainTokensPrevented === 900 && legacySummary.mainTokensInjected === 100 && legacySummary.savedTokens === 900);
+const sharedTelemetryCwd = "/tmp/pi-ce-shared-telemetry-" + Date.now();
+const runtimeA = new ContextTelemetry();
+const runtimeB = new ContextTelemetry();
+runtimeA.setSessionId("pi-session-shared");
+runtimeB.setSessionId("pi-session-shared");
+runtimeA.record(sharedTelemetryCwd, { strategy: "WRITE", tool: "runtime-a", sourceTokens: 100, visibleTokens: 10 });
+runtimeB.record(sharedTelemetryCwd, { strategy: "WRITE", tool: "runtime-b", sourceTokens: 200, visibleTokens: 20 });
+const sharedSession = runtimeA.summary(sharedTelemetryCwd);
+const sharedLifetime = runtimeA.summary(sharedTelemetryCwd, true);
+checkCtl("telemetry session scope spans extension runtimes", sharedSession.events === 2 && sharedSession.mainTokensPrevented === 270 && sharedSession.scope === "session");
+checkCtl("telemetry exposes distinct runtime and lifetime scopes", runtimeA.runtimeSummary(sharedTelemetryCwd).events === 1 && sharedLifetime.events === 2 && sharedLifetime.scope === "lifetime");
 
 // ---- ctx_offload signature ergonomics (session regressions) ----
 
@@ -603,6 +632,10 @@ checkCtl("ctx_offload tool is registered", Boolean(offDef));
 if (offDef) {
   const o1 = await offDef.execute("o1", { key: "k1", source: "bash", data: "payload-one" }, undefined, undefined, { cwd: capCwd });
   checkCtl("canonical { key, source, data } works", o1?.details?.id !== undefined);
+  const manualMessage = { role: "toolResult", toolCallId: "manual-o1", toolName: "ctx_offload", content: o1.content, details: o1.details, isError: false, timestamp: Date.now() };
+  await callHook("context", { messages: [manualMessage] }, capCwd);
+  const repeatedManual = await callHook("context", { messages: [manualMessage] }, capCwd);
+  checkCtl("manual offload preview compacts after first use", String(repeatedManual?.messages?.[0]?.content?.[0]?.text).includes(String(o1?.details?.id)));
   const o2 = await offDef.execute("o2", { key: "k2", text: "payload-two" }, undefined, undefined, { cwd: capCwd });
   checkCtl("{ key, text } alias works", o2?.details?.id !== undefined);
   const o3 = await offDef.execute("o3", { key: "k3", content: "payload-three" }, undefined, undefined, { cwd: capCwd });
@@ -670,6 +703,55 @@ checkCtl(
   adv3?.details?.ce_offloaded === true && adv3?.details?.ce_advisory === undefined,
 );
 
+const errorLines = Array.from({ length: 420 }, (_, index) => `error TS${1000 + (index % 12)} at line ${index + 1}: malformed command diagnostic`);
+const compactedError = await callHook("tool_result", {
+  toolCallId: "error-boundary",
+  toolName: "fabric_exec",
+  input: { code: "return 1;" },
+  isError: true,
+  content: [{ type: "text", text: errorLines.join("\\n") }],
+});
+checkHook(
+  "oversized model-boundary errors are compacted with diagnostics",
+  compactedError?.details?.ce_error_compacted === true &&
+    Buffer.byteLength(compactedError.content?.[0]?.text ?? "", "utf8") <= 4096 &&
+    String(compactedError.content?.[0]?.text).includes("Error output compacted"),
+);
+
+const inlineCwd = "/tmp/pi-ce-inline-" + Date.now();
+mkdirSync(join(inlineCwd, ".pi"), { recursive: true });
+writeFileSync(join(inlineCwd, ".pi", "context-engineer.json"), JSON.stringify({ resultPolicy: "inline" }));
+const inlineResult = await callHook("tool_result", {
+  toolCallId: "inline-boundary",
+  toolName: "bash",
+  input: { cmd: "cat huge" },
+  content: [{ type: "text", text: BIG }],
+}, inlineCwd);
+checkHook("explicit inline policy preserves a large success result", inlineResult === undefined);
+
+const forcedOffloadCwd = "/tmp/pi-ce-force-offload-" + Date.now();
+mkdirSync(join(forcedOffloadCwd, ".pi"), { recursive: true });
+writeFileSync(join(forcedOffloadCwd, ".pi", "context-engineer.json"), JSON.stringify({ resultPolicy: "offload" }));
+const forcedOffload = await callHook("tool_result", {
+  toolCallId: "forced-offload",
+  toolName: "bash",
+  input: { cmd: "printf small" },
+  content: [{ type: "text", text: "small but explicitly addressable" }],
+}, forcedOffloadCwd);
+checkHook("explicit offload policy handles a small success result", forcedOffload?.details?.ce_offloaded === true && String(forcedOffload?.content?.[0]?.text).includes("ctx_read({ id:"));
+
+const summarizeCwd = "/tmp/pi-ce-summarize-" + Date.now();
+mkdirSync(join(summarizeCwd, ".pi"), { recursive: true });
+writeFileSync(join(summarizeCwd, ".pi", "context-engineer.json"), JSON.stringify({ resultPolicy: "summarize" }));
+const oversizedJson = JSON.stringify({ items: Array.from({ length: 6000 }, (_, index) => ({ id: index, ok: index % 2 === 0 })) });
+const summarizedResult = await callHook("tool_result", {
+  toolCallId: "summarize-boundary",
+  toolName: "bash",
+  input: { cmd: "emit-json" },
+  content: [{ type: "text", text: oversizedJson }],
+}, summarizeCwd);
+checkHook("explicit summarize policy returns a structural JSON handle", summarizedResult?.details?.ce_offloaded === true && String(summarizedResult?.content?.[0]?.text).includes("JSON object") && String(summarizedResult?.content?.[0]?.text).includes("ctx_read({ id:"));
+
 // ---- ctx_status reports policy state ----
 
 console.log("\n=== ctx_status ===\n");
@@ -679,9 +761,12 @@ if (statusDef) {
   const st = await statusDef.execute("st1", {}, undefined, undefined, { cwd: capCwd });
   const parsed = JSON.parse(st.content[0].text);
   checkCtl(
-    "ctx_status exposes thresholds and policy",
-    parsed.enabled === true && parsed.runtimeAdvisoryThreshold === 0 && parsed.blockUnboundedReturns === false && parsed.compactStaleResults === true && typeof parsed.readOffloadThreshold === "number" && typeof parsed.policy === "string" && typeof parsed.session?.internalTokensProcessed === "number" && typeof parsed.session?.mainTokensPrevented === "number" && typeof parsed.session?.mainTokensInjected === "number" && typeof parsed.session?.storeTokensWritten === "number",
+    "ctx_status exposes thresholds, policy, and telemetry scopes",
+    parsed.enabled === true && parsed.resultPolicy === "auto" && parsed.runtimeAdvisoryThreshold === 0 && parsed.blockUnboundedReturns === false && parsed.compactStaleResults === true && typeof parsed.readOffloadThreshold === "number" && typeof parsed.errorCompactionThreshold === "number" && typeof parsed.policy === "string" && typeof parsed.runtime?.events === "number" && typeof parsed.session?.mainTokensPrevented === "number" && typeof parsed.lifetime?.storeTokensWritten === "number" && parsed.telemetryScope === "session",
   );
+  const lifetimeStatus = await statusDef.execute("st2", { scope: "lifetime" }, undefined, undefined, { cwd: capCwd });
+  const lifetimeParsed = JSON.parse(lifetimeStatus.content[0].text);
+  checkCtl("ctx_status can emphasize lifetime telemetry", lifetimeParsed.telemetryScope === "lifetime" && lifetimeParsed.summary?.scope === "lifetime" && lifetimeParsed.lifetime?.scope === "lifetime");
 }
 
 // ---- Quiet session startup ----

@@ -27,6 +27,7 @@ import { resolve } from "node:path";
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ContextStore, DEFAULT_CONTEXT_STORE_TTL_MS, MAX_CONTEXT_STORE_BYTES } from "./store.js";
+import { compactErrorOutput, structuralPreview } from "./preview.js";
 import { ceTools, type ToolContext } from "./tools.js";
 import { evaluateProgram, runtimeAdvisoryLine, type WrapperOptions } from "./wrapper.js";
 import { runChildPi } from "./child.js";
@@ -59,12 +60,20 @@ export type { ContextBoundaryPolicy, QuantitativeDecision } from "./quantitative
 
 // ---- Config ----
 
+export type ResultPolicy = "auto" | "inline" | "offload" | "summarize";
+
 interface CeConfig extends WrapperOptions {
   /** User-facing alias for quantitativePolicy in context-engineer.json. */
   policy?: ContextBoundaryPolicy;
   enabled?: boolean;
-  /** UTF-8 bytes before text results are auto-offloaded. Default: 8192. */
+  /** UTF-8 bytes before text results are auto-offloaded. Default: 16384. */
   readOffloadThreshold?: number;
+  /** Automatic boundary behavior: auto, inline, offload, or summarize. Default: auto. */
+  resultPolicy?: ResultPolicy;
+  /** UTF-8 bytes before a model-boundary error is compacted. Default: 4096. */
+  errorCompactionThreshold?: number;
+  /** Maximum UTF-8 bytes retained by a compacted error. Default: 4096. */
+  errorCompactionPreviewBytes?: number;
   /** fabric_exec boundary results at or above this size get a one-line
    *  advisory instead of silence. Default: 0 (disabled). */
   runtimeAdvisoryThreshold?: number;
@@ -74,7 +83,7 @@ interface CeConfig extends WrapperOptions {
   notifyOnStart?: boolean;
   /** Nested Fabric provider threshold. Defaults to readOffloadThreshold. */
   nestedResultThreshold?: number;
-  /** UTF-8 preview bytes retained in an offload handle message. Default: 1024. */
+  /** UTF-8 preview budget retained in an offload handle message. Default: 2048. */
   offloadPreviewBytes?: number;
   /** Optional maximum bytes retained by the context store. */
   storeMaxBytes?: number;
@@ -98,6 +107,20 @@ function loadConfig(cwd: string): CeConfig {
     if (error instanceof Error && error.message.startsWith("Invalid context policy")) throw error;
     return {};
   }
+}
+
+const DEFAULT_RESULT_POLICY: ResultPolicy = "auto";
+const RESULT_POLICIES = new Set<ResultPolicy>(["auto", "inline", "offload", "summarize"]);
+
+function normalizeResultPolicy(value: unknown): ResultPolicy {
+  return typeof value === "string" && RESULT_POLICIES.has(value as ResultPolicy)
+    ? value as ResultPolicy
+    : DEFAULT_RESULT_POLICY;
+}
+
+function boundedNumber(value: unknown, fallback: number, minimum = 0, maximum = 1_000_000_000): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.max(minimum, Math.min(maximum, Math.floor(parsed))) : fallback;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -150,7 +173,7 @@ function isProviderBounded(toolName: string, input: Record<string, unknown>, det
 }
 
 function inputHint(input: Record<string, unknown>): string {
-  return String(input.path ?? input.pattern ?? input.command ?? input.code ?? input.query ?? "result");
+  return String(input.path ?? input.pattern ?? input.command ?? input.script ?? input.code ?? input.query ?? "result");
 }
 
 function strategyForTool(toolName: string): "WRITE" | "SELECT" | "COMPRESS" | "ISOLATE" | "PASS" {
@@ -161,21 +184,29 @@ function strategyForTool(toolName: string): "WRITE" | "SELECT" | "COMPRESS" | "I
   return "PASS";
 }
 
-function utf8Preview(text: string, maxBytes: number): string {
-  const raw = Buffer.from(text, "utf8");
-  let end = Math.max(0, Math.min(raw.length, Math.floor(maxBytes)));
-  while (end > 0 && (raw[end] & 0xc0) === 0x80) end--;
-  return raw.subarray(0, end).toString("utf8");
+type ReadSurface = "model" | "fabric";
+
+function readRecipe(id: string, surface: ReadSurface): string {
+  const tool = surface === "fabric" ? "extensions.ctx_read" : "ctx_read";
+  return `${tool}({ id: "${id}", offset: 0, length: 2048 })`;
 }
 
-function formatHandleText(id: string, bytes: number, estimatedTokens: number, text: string, previewBytes: number): string {
-  const raw = Buffer.from(text, "utf8");
-  const preview = utf8Preview(text, previewBytes);
-  const truncated = raw.length > previewBytes;
+function formatHandleText(
+  id: string,
+  bytes: number,
+  estimatedTokens: number,
+  text: string,
+  previewBytes: number,
+  surface: ReadSurface = "model",
+): string {
+  const preview = structuralPreview(text, previewBytes);
+  const truncated = Buffer.byteLength(text, "utf8") > previewBytes;
   const handle =
     `[offloaded to handle "${id}" — ${bytes} bytes, ~${estimatedTokens} tokens]\n` +
-    `Preview (first ${previewBytes} bytes):\n${preview}` +
-    (truncated ? `\n... [${raw.length - previewBytes} more bytes — use extensions.ctx_read({ id: "${id}", offset: 0, length: 2048 }) to inspect; use query for a literal match]` : "");
+    `Preview (structural, up to ${previewBytes} bytes):\n${preview}` +
+    (truncated
+      ? `\n... [full payload remains available; call ${readRecipe(id, surface)}; use query or jsonPath for structured selection]`
+      : `\nRead later with ${readRecipe(id, surface)}.`);
   return handle;
 }
 
@@ -218,8 +249,8 @@ function compactAddressableContextMessage<T>(
   const originalContent = Array.isArray(record.content) ? record.content : [];
   const nonText = originalContent.filter((item) => asRecord(item)?.type !== "text");
   const text = addressable.toolName === "ctx_read"
-    ? `[ctx_read output compacted after use — source handle "${addressable.handle}" remains available; call extensions.ctx_read({ id: "${addressable.handle}", offset: ${addressable.readOffset}, length: 2048 }) or use a literal query to inspect again.]`
-    : `[offloaded preview compacted after use — handle "${addressable.handle}"; call extensions.ctx_read({ id: "${addressable.handle}", offset: 0, length: 2048 }) to inspect again.]`;
+    ? `[ctx_read output compacted after use — source handle "${addressable.handle}" remains available; call ctx_read({ id: "${addressable.handle}", offset: ${addressable.readOffset}, length: 2048 }) or use query/jsonPath to inspect again.]`
+    : `[offloaded preview compacted after use — handle "${addressable.handle}"; call ctx_read({ id: "${addressable.handle}", offset: 0, length: 2048 }) at the model boundary, or extensions.ctx_read(...) inside fabric_exec.]`;
   const compacted = {
     ...record,
     content: [{ type: "text", text }, ...nonText],
@@ -453,14 +484,17 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   // This applies to both the built-in `read` tool and any tool whose
   // result is text content (including fabric_exec results that are large).
 
-  const READ_OFFLOAD_THRESHOLD = 8192; // ~2K tokens
-  const PREVIEW_BYTES = 1024;
+  const READ_OFFLOAD_THRESHOLD = 16_384; // ~4K tokens
+  const PREVIEW_BYTES = 2048;
+  const ERROR_COMPACTION_THRESHOLD = 4096;
+  const ERROR_COMPACTION_PREVIEW_BYTES = 4096;
 
   pi.on("tool_result", async (event, ctx) => {
-    // Classify first: the fabric_exec result itself closes its own scope.
-    // Nested Fabric IDs remain intermediate even when sibling executions are
-    // active; ordinary non-prefixed calls stay model-boundary results.
-    const isFabricExecResult = event.toolName === "fabric_exec";
+    // Classify first. A top-level fabric_exec result closes its own scope;
+    // documented fabric_-prefixed nested results are never model-boundary
+    // values, even if lifecycle events arrive out of order.
+    const nestedToolResult = fabricExecutions.isNestedToolResult(event.toolCallId);
+    const isFabricExecResult = event.toolName === "fabric_exec" && !nestedToolResult;
     if (isFabricExecResult) fabricExecutions.finish(event.toolCallId);
     const fabricProxy = readFabricToolResultProxy(event.toolCallId, event.toolName, event.details);
     const isIntermediate = !isFabricExecResult && (
@@ -478,7 +512,10 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     const cfg = configFor(ctx.cwd);
     if (cfg.enabled === false) return undefined;
 
-    const threshold = cfg.readOffloadThreshold ?? READ_OFFLOAD_THRESHOLD;
+    const threshold = boundedNumber(cfg.readOffloadThreshold, READ_OFFLOAD_THRESHOLD, 256);
+    const resultPolicy = normalizeResultPolicy(cfg.resultPolicy);
+    const errorThreshold = boundedNumber(cfg.errorCompactionThreshold, ERROR_COMPACTION_THRESHOLD, 256);
+    const errorPreviewBytes = boundedNumber(cfg.errorCompactionPreviewBytes, ERROR_COMPACTION_PREVIEW_BYTES, 256, 64_000);
     const existingDetails = (event.details ?? {}) as Record<string, unknown>;
     const input = (event.input ?? {}) as Record<string, unknown>;
 
@@ -487,10 +524,11 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     // the guest receives a handle, not merely a shortened display string.
     if (fabricProxy) {
       const serialized = serializeResult(fabricProxy.result);
-      const nestedThreshold = cfg.nestedResultThreshold ?? threshold;
+      const nestedThreshold = boundedNumber(cfg.nestedResultThreshold, threshold, 256);
       const serializedBytes = Buffer.byteLength(serialized, "utf8");
       const providerBounded = isProviderBounded(event.toolName, input, existingDetails, serializedBytes);
-      if (event.isError || providerBounded || serializedBytes < nestedThreshold) {
+      const forceNestedOffload = resultPolicy === "offload";
+      if (event.isError || resultPolicy === "inline" || providerBounded || (!forceNestedOffload && serializedBytes < nestedThreshold)) {
         if (serializedBytes >= 1024) {
           telemetry.record(ctx.cwd, {
             strategy: providerBounded ? strategyForTool(event.toolName) : "PASS",
@@ -516,9 +554,10 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         handle: offloaded.id,
         originalBytes: offloaded.bytes,
         originalTokens: offloaded.estimatedTokens,
-        preview: utf8Preview(serialized, previewBytes),
+        contentType: offloaded.contentType,
+        preview: structuralPreview(serialized, previewBytes, offloaded.contentType),
       };
-      const nestedText = formatHandleText(offloaded.id, offloaded.bytes, offloaded.estimatedTokens, serialized, previewBytes);
+      const nestedText = formatHandleText(offloaded.id, offloaded.bytes, offloaded.estimatedTokens, serialized, previewBytes, "fabric");
       telemetry.record(ctx.cwd, {
         strategy: "WRITE",
         tool: event.toolName,
@@ -537,7 +576,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         : [...event.content, { type: "text" as const, text: nestedText }];
       return {
         content,
-        details: { ...existingDetails, result: replacement, ce_offloaded: true, ce_handle: offloaded.id },
+        details: { ...existingDetails, result: replacement, ce_offloaded: true, ce_handle: offloaded.id, ce_return_policy: resultPolicy },
       };
     }
 
@@ -553,14 +592,50 @@ export default function contextEngineer(pi: ExtensionAPI): void {
       /^\[offloaded to handle "[^\"]+"/.test(text);
     const textBytes = Buffer.byteLength(text, "utf8");
     const providerBounded = isProviderBounded(event.toolName, input, existingDetails, textBytes);
+    const preservedDetails = asRecord(slimForDetails(existingDetails)) ?? {};
 
-    // Errors, small results, already-offloaded results, and provider-bounded
-    // results are not rewritten; CE should not stack a second budget/artifact.
+    // Parser/compiler failures can be much larger than successful results and
+    // are especially likely to repeat dozens of diagnostics. Compact only at
+    // the model boundary; nested errors must retain their exact value.
+    if (event.isError) {
+      if (resultPolicy !== "inline" && textBytes >= errorThreshold) {
+        const compactedText = compactErrorOutput(text, errorPreviewBytes);
+        if (compactedText !== text) {
+          const content = event.content.map((item) =>
+            item.type === "text" ? { ...item, text: item === textContent ? compactedText : item.text } : item
+          );
+          const visibleBytes = Buffer.byteLength(compactedText, "utf8");
+          telemetry.record(ctx.cwd, {
+            strategy: "COMPRESS",
+            tool: event.toolName,
+            sourceBytes: textBytes,
+            visibleBytes,
+            mainTokensPrevented: Math.max(0, Math.ceil(textBytes / 4) - Math.ceil(visibleBytes / 4)),
+            mainTokensInjected: Math.ceil(visibleBytes / 4),
+            note: "oversized model-boundary error compacted",
+          });
+          return {
+            content,
+            details: {
+              ...preservedDetails,
+              ce_error_compacted: true,
+              ce_error_original_bytes: textBytes,
+              ce_error_original_tokens: Math.ceil(textBytes / 4),
+              ce_error_compacted_bytes: visibleBytes,
+              ce_return_policy: resultPolicy,
+            },
+          };
+        }
+      }
+      return undefined;
+    }
 
+    // Explicit inline is an escape hatch: do not rewrite successful results.
     // ctx_read caps its own output below the threshold (see tools.ts); letting
     // the hook rewrite it would chain handles recursively and make stored
     // payloads effectively unreachable.
-    if (event.isError || alreadyOffloaded || providerBounded || event.toolName === "ctx_read" || textBytes < threshold) {
+    const forceOffload = resultPolicy === "offload";
+    if (resultPolicy === "inline" || alreadyOffloaded || providerBounded || event.toolName === "ctx_read" || (!forceOffload && textBytes < threshold)) {
       if (textBytes >= 1024 && (providerBounded || event.toolName === "fabric_exec")) {
         telemetry.record(ctx.cwd, {
           strategy: providerBounded ? strategyForTool(event.toolName) : "PASS",
@@ -595,7 +670,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
 
     const store = storeFor(ctx.cwd, cfg);
     const offloaded = store.write(key, event.toolName, text);
-    const previewBytes = Math.max(256, Math.min(4096, cfg.offloadPreviewBytes ?? PREVIEW_BYTES));
+    const previewBytes = boundedNumber(cfg.offloadPreviewBytes, PREVIEW_BYTES, 256, 4096);
     const replacementText = formatHandleText(offloaded.id, offloaded.bytes, offloaded.estimatedTokens, text, previewBytes);
     telemetry.record(ctx.cwd, {
       strategy: "WRITE",
@@ -615,11 +690,14 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     return {
       content,
       details: {
+        ...preservedDetails,
         ce_offloaded: true,
         ce_handle: offloaded.id,
+        ce_content_type: offloaded.contentType,
         ce_original_bytes: offloaded.bytes,
         ce_original_tokens: offloaded.estimatedTokens,
-        ce_saved_tokens: Math.max(0, offloaded.estimatedTokens - Math.ceil(replacementText.length / 4)),
+        ce_return_policy: resultPolicy,
+        ce_saved_tokens: Math.max(0, offloaded.estimatedTokens - Math.ceil(Buffer.byteLength(replacementText, "utf8") / 4)),
       },
     };
   });
@@ -658,7 +736,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         const toolCtx: ToolContext = {
           store: storeFor(execCtx.cwd, toolConfig),
           workspaceRoot: execCtx.cwd,
-          maxReturnBytes: toolConfig.readOffloadThreshold ?? READ_OFFLOAD_THRESHOLD,
+          maxReturnBytes: boundedNumber(toolConfig.readOffloadThreshold, READ_OFFLOAD_THRESHOLD, 256),
           callTool: async () => {
             throw new Error("callTool is only available inside a Fabric program; use pi.* or extensions.* there.");
           },
@@ -736,7 +814,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         ((params.source as string) ?? "manual"),
         payload
       );
-      const visibleText = `Offloaded ${result.bytes} bytes (~${result.estimatedTokens} tokens) to handle "${result.id}".\nPreview:\n${result.preview}`;
+      const visibleText = `Offloaded ${result.bytes} bytes (~${result.estimatedTokens} tokens) to handle "${result.id}" [${result.contentType}].\nStructural preview:\n${result.preview}\nRead later with ${readRecipe(result.id, "model")}; use jsonPath for a focused JSON value.`;
       const visibleBytes = Buffer.byteLength(visibleText, "utf8");
       telemetry.record(execCtx.cwd, {
         strategy: "WRITE",
@@ -754,7 +832,16 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           type: "text" as const,
           text: visibleText,
         }],
-        details: { id: result.id, bytes: result.bytes, estimatedTokens: result.estimatedTokens },
+        details: {
+          id: result.id,
+          bytes: result.bytes,
+          estimatedTokens: result.estimatedTokens,
+          ce_offloaded: true,
+          ce_handle: result.id,
+          ce_content_type: result.contentType,
+          ce_original_bytes: result.bytes,
+          ce_original_tokens: result.estimatedTokens,
+        },
       };
     },
   });
@@ -767,27 +854,46 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     name: "ctx_status",
     label: "ctx_status",
     description:
-      "Report context-engineer policy state: enabled, strict mode, offload/advisory thresholds, " +
-      "and token savings so far. Call this instead of guessing why a program was blocked.",
-    parameters: Type.Object({}),
-    async execute(_id, _params, _signal, _onUpdate, execCtx) {
+      "Report context-engineer policy state: enabled, strict mode, result policy, " +
+      "offload/error thresholds, and runtime/session/lifetime token savings.",
+    parameters: Type.Object({
+      scope: Type.Optional(Type.Union([
+        Type.Literal("runtime"),
+        Type.Literal("session"),
+        Type.Literal("lifetime"),
+      ], { description: "Summary to emphasize; all three scopes are returned. Default: session." })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, execCtx) {
       const cfg = configFor(execCtx.cwd);
-      const summary = telemetry.summary(execCtx.cwd, false);
-      const effectiveReadThreshold = cfg.readOffloadThreshold ?? READ_OFFLOAD_THRESHOLD;
+      const requestedScope = (params as { scope?: unknown }).scope;
+      const scope = requestedScope === "runtime" || requestedScope === "lifetime" ? requestedScope : "session";
+      const runtimeSummary = telemetry.runtimeSummary(execCtx.cwd);
+      const sessionSummary = telemetry.summary(execCtx.cwd, false);
+      const lifetimeSummary = telemetry.summary(execCtx.cwd, true);
+      const summary = scope === "runtime" ? runtimeSummary : scope === "lifetime" ? lifetimeSummary : sessionSummary;
+      const effectiveReadThreshold = boundedNumber(cfg.readOffloadThreshold, READ_OFFLOAD_THRESHOLD, 256);
       const body = {
         enabled: cfg.enabled !== false,
         strict: cfg.strict ?? false,
+        resultPolicy: normalizeResultPolicy(cfg.resultPolicy),
         readOffloadThreshold: effectiveReadThreshold,
+        nestedResultThreshold: boundedNumber(cfg.nestedResultThreshold, effectiveReadThreshold, 256),
+        errorCompactionThreshold: boundedNumber(cfg.errorCompactionThreshold, ERROR_COMPACTION_THRESHOLD, 256),
+        errorCompactionPreviewBytes: boundedNumber(cfg.errorCompactionPreviewBytes, ERROR_COMPACTION_PREVIEW_BYTES, 256, 64_000),
         runtimeAdvisoryThreshold: cfg.runtimeAdvisoryThreshold ?? 0,
         blockUnboundedReturns: cfg.strict === true || cfg.blockUnboundedReturns === true,
         compactStaleResults: cfg.compactStaleResults !== false,
         notifyOnStart: cfg.notifyOnStart === true,
-        offloadPreviewBytes: Math.max(256, Math.min(4096, cfg.offloadPreviewBytes ?? PREVIEW_BYTES)),
+        offloadPreviewBytes: boundedNumber(cfg.offloadPreviewBytes, PREVIEW_BYTES, 256, 4096),
         storeTtlMs: cfg.storeTtlMs ?? DEFAULT_CONTEXT_STORE_TTL_MS,
         storeMaxBytes: Math.min(MAX_CONTEXT_STORE_BYTES, cfg.storeMaxBytes ?? MAX_CONTEXT_STORE_BYTES),
         maxReturnTokens: cfg.maxReturnTokens ?? 4000,
+        telemetryScope: scope,
         policy: `runtime guard executes uncertain programs and auto-offloads actual ${effectiveReadThreshold}-byte+ boundary results; strict/blockUnboundedReturns restores fail-closed preflight; stale addressable previews compact after first use`,
-        session: summary,
+        summary,
+        runtime: runtimeSummary,
+        session: sessionSummary,
+        lifetime: lifetimeSummary,
       };
       return {
         content: [{ type: "text" as const, text: JSON.stringify(body, null, 2) }],
@@ -911,10 +1017,13 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           strict: cfg.strict ?? false,
           blockUnboundedReturns: cfg.strict === true || cfg.blockUnboundedReturns === true,
           maxReturnTokens: cfg.maxReturnTokens ?? 4000,
-          readOffloadThreshold: cfg.readOffloadThreshold ?? READ_OFFLOAD_THRESHOLD,
-          nestedResultThreshold: cfg.nestedResultThreshold ?? cfg.readOffloadThreshold ?? READ_OFFLOAD_THRESHOLD,
+          readOffloadThreshold: boundedNumber(cfg.readOffloadThreshold, READ_OFFLOAD_THRESHOLD, 256),
+          nestedResultThreshold: boundedNumber(cfg.nestedResultThreshold, cfg.readOffloadThreshold ?? READ_OFFLOAD_THRESHOLD, 256),
+          resultPolicy: normalizeResultPolicy(cfg.resultPolicy),
+          errorCompactionThreshold: boundedNumber(cfg.errorCompactionThreshold, ERROR_COMPACTION_THRESHOLD, 256),
+          errorCompactionPreviewBytes: boundedNumber(cfg.errorCompactionPreviewBytes, ERROR_COMPACTION_PREVIEW_BYTES, 256, 64_000),
           runtimeAdvisoryThreshold: cfg.runtimeAdvisoryThreshold ?? 0,
-          offloadPreviewBytes: Math.max(256, Math.min(4096, cfg.offloadPreviewBytes ?? PREVIEW_BYTES)),
+          offloadPreviewBytes: boundedNumber(cfg.offloadPreviewBytes, PREVIEW_BYTES, 256, 4096),
           compactStaleResults: cfg.compactStaleResults !== false,
           notifyOnStart: cfg.notifyOnStart === true,
           storeMaxBytes: Math.min(MAX_CONTEXT_STORE_BYTES, cfg.storeMaxBytes ?? MAX_CONTEXT_STORE_BYTES),
@@ -922,13 +1031,13 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         }, null, 2);
       } else if (command === "explain") {
         const cfg = configFor(ctx.cwd);
-        const effectiveReadThreshold = cfg.readOffloadThreshold ?? READ_OFFLOAD_THRESHOLD;
+        const effectiveReadThreshold = boundedNumber(cfg.readOffloadThreshold, READ_OFFLOAD_THRESHOLD, 256);
         message = [
           "Context Engineer is the context governor above Fabric and Fovea.",
-          `The default runtime guard executes statically uncertain programs, keeps small results, and offloads actual ${effectiveReadThreshold}-byte+ boundary payloads.`,
+          `The default runtime guard executes statically uncertain programs, keeps small results, and offloads actual ${effectiveReadThreshold}-byte+ boundary payloads; resultPolicy controls inline/offload/summarize overrides.`,
           "Set strict=true or blockUnboundedReturns=true for fail-closed preflight. Explicit scalar projections, bounded selections, summaries, and offloads pass silently.",
           "Addressable offload and ctx_read previews stay visible for one model call, then compact to a re-readable handle reference.",
-          "extensions.ctx_status reports thresholds and savings; extensions.ce_exec pre-checks a program.",
+          "ctx_status reports runtime/session/lifetime savings; ce_exec pre-checks a program. At the model boundary use ctx_read; inside fabric_exec use extensions.ctx_read.",
           "Use /ce status, /ce trace, /ce settings, or /ce status --all.",
         ].join("\n");
       } else if (command === "clear") {
@@ -949,6 +1058,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     fabricExecutions.clear();
     exposedAddressableResults.clear();
+    telemetry.setSessionId(ctx.sessionManager?.getSessionId?.());
     const cfg = configFor(ctx.cwd);
     if (cfg.enabled === false) return;
     if (ctx.hasUI && cfg.notifyOnStart === true) {

@@ -23,6 +23,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
+import { inferContentType, structuralPreview, type PreviewContentType } from "./preview.js";
 
 export const DEFAULT_CONTEXT_STORE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 export const MAX_CONTEXT_STORE_BYTES = 500_000_000;
@@ -36,7 +37,7 @@ export interface StoreEntry {
   lastAccessed: string;
   source: string;
   contentHash: string;
-  contentType: "json" | "code" | "text" | "unknown";
+  contentType: PreviewContentType;
   bytes: number;
   estimatedTokens: number;
   expiresAt?: string;
@@ -66,6 +67,8 @@ export interface ReadOptions {
   length?: number;
   /** Literal substring to search for; returns matching lines with context. */
   query?: string;
+  /** Dot/bracket JSON path, for example `$.results[0].name`. */
+  jsonPath?: string;
   /** Lines of context around each query match. */
   contextLines?: number;
   /** Maximum matching windows to format while still counting every match. */
@@ -76,6 +79,12 @@ export interface ReadResult {
   id: string;
   totalBytes: number;
   totalTokens: number;
+  /** Stored payload type; retained on ranges and JSON-path selections. */
+  contentType?: PreviewContentType;
+  /** Selected JSON path when this is a structured lookup. */
+  jsonPath?: string;
+  /** Runtime type of the selected JSON value. */
+  selectedType?: string;
   bytesRead: number;
   /** Actual byte offset used for a ranged read. */
   offset?: number;
@@ -89,6 +98,17 @@ export interface ReadResult {
 }
 
 type StoreMetadata = Omit<StoreEntry, "data"> & { blobPath: string };
+
+export interface StoreHandle {
+  id: string;
+  key: string;
+  source: string;
+  contentType: PreviewContentType;
+  preview: string;
+  bytes: number;
+  estimatedTokens: number;
+}
+
 interface StoreIndex {
   version: 1;
   entries: StoreMetadata[];
@@ -158,7 +178,7 @@ export class ContextStore {
     source: string,
     data: string,
     writeOptions: StoreWriteOptions = {},
-  ): { id: string; preview: string; bytes: number; estimatedTokens: number } {
+  ): StoreHandle {
     const bytes = Buffer.byteLength(data, "utf8");
     const contentHash = this.hash(data);
 
@@ -208,7 +228,7 @@ export class ContextStore {
     });
   }
 
-  /** Read a UTF-8 byte range or literal line matches. */
+  /** Read a UTF-8 byte range, literal line matches, or a focused JSON path. */
   read(id: string, opts: ReadOptions = {}): ReadResult {
     return this.withLock(() => {
       let entries = this.loadAll();
@@ -234,6 +254,11 @@ export class ContextStore {
 
       entry.lastAccessed = new Date().toISOString();
       this.writeIndex(entries);
+
+      if (opts.jsonPath !== undefined) {
+        const data = readFileSync(blob, "utf8");
+        return this.readJsonPath(entry, data, opts);
+      }
 
       if (opts.query !== undefined) {
         const data = readFileSync(blob, "utf8");
@@ -438,15 +463,22 @@ export class ContextStore {
     return actual;
   }
 
+  private baseResult(entry: StoreMetadata): Pick<ReadResult, "id" | "totalBytes" | "totalTokens" | "contentType"> {
+    return {
+      id: entry.id,
+      totalBytes: entry.bytes,
+      totalTokens: entry.estimatedTokens,
+      contentType: entry.contentType,
+    };
+  }
+
   private readRange(entry: StoreMetadata, blob: string, opts: ReadOptions): ReadResult {
     const totalBytes = entry.bytes;
     const requestedOffset = Math.max(0, Math.min(totalBytes, Math.floor(Number(opts.offset) || 0)));
     const requestedLength = Math.max(0, Math.floor(Number(opts.length ?? DEFAULT_PREVIEW_BYTES * 4) || 0));
     if (requestedLength === 0) {
       return {
-        id: entry.id,
-        totalBytes,
-        totalTokens: entry.estimatedTokens,
+        ...this.baseResult(entry),
         bytesRead: 0,
         offset: requestedOffset,
         nextOffset: requestedOffset < totalBytes ? requestedOffset : undefined,
@@ -464,9 +496,7 @@ export class ContextStore {
     const content = this.readBlobBytes(blob, actualOffset, Math.max(0, actualEnd - actualOffset)).toString("utf8");
     const truncated = actualEnd < totalBytes;
     return {
-      id: entry.id,
-      totalBytes,
-      totalTokens: entry.estimatedTokens,
+      ...this.baseResult(entry),
       bytesRead: actualEnd - actualOffset,
       offset: actualOffset,
       nextOffset: truncated ? actualEnd : undefined,
@@ -474,6 +504,60 @@ export class ContextStore {
         ? content + `\n... [${totalBytes - actualEnd} more bytes, use ctx_read with offset=${actualEnd} to continue]`
         : content,
       truncated,
+    };
+  }
+
+  private readJsonPath(entry: StoreMetadata, data: string, opts: ReadOptions): ReadResult {
+    const jsonPath = opts.jsonPath ?? "$";
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      return {
+        ...this.baseResult(entry),
+        jsonPath,
+        content: `Error: stored result "${entry.id}" is not valid JSON; JSON path "${jsonPath}" cannot be selected.`,
+        bytesRead: 0,
+        truncated: false,
+      };
+    }
+
+    const parsedPath = parseJsonPath(jsonPath);
+    if (typeof parsedPath === "string") {
+      return {
+        ...this.baseResult(entry),
+        jsonPath,
+        content: `Error: ${parsedPath}`,
+        bytesRead: 0,
+        truncated: false,
+      };
+    }
+
+    let selected = parsed;
+    for (const segment of parsedPath) {
+      if (Array.isArray(selected) && typeof segment === "number" && segment >= 0 && segment < selected.length) {
+        selected = selected[segment];
+      } else if (selected && typeof selected === "object" && !Array.isArray(selected) && Object.prototype.hasOwnProperty.call(selected, segment)) {
+        selected = (selected as Record<string, unknown>)[segment];
+      } else {
+        return {
+          ...this.baseResult(entry),
+          jsonPath,
+          content: `Error: JSON path "${jsonPath}" was not found in stored result "${entry.id}".`,
+          bytesRead: 0,
+          truncated: false,
+        };
+      }
+    }
+
+    const content = JSON.stringify(selected, null, 2) ?? String(selected);
+    return {
+      ...this.baseResult(entry),
+      jsonPath,
+      selectedType: Array.isArray(selected) ? "array" : selected === null ? "null" : typeof selected,
+      bytesRead: Buffer.byteLength(content, "utf8"),
+      content,
+      truncated: false,
     };
   }
 
@@ -500,9 +584,7 @@ export class ContextStore {
       : `${totalMatches} match(es) for "${opts.query}":\n${result.join("\n")}` +
         (omitted > 0 ? `\n... [${omitted} additional matches counted but not formatted]` : "");
     return {
-      id: entry.id,
-      totalBytes: entry.bytes,
-      totalTokens: entry.estimatedTokens,
+      ...this.baseResult(entry),
       bytesRead: Buffer.byteLength(content, "utf8"),
       content,
       matchedLines: matches,
@@ -624,11 +706,14 @@ export class ContextStore {
     return options.ttlMs !== undefined && options.ttlMs > 0 && Date.parse(entry.created) + options.ttlMs <= Date.now();
   }
 
-  private handleResult(entry: StoreMetadata, data: string): { id: string; preview: string; bytes: number; estimatedTokens: number } {
-    const preview = utf8Prefix(data, DEFAULT_PREVIEW_BYTES);
+  private handleResult(entry: StoreMetadata, data: string): StoreHandle {
+    const preview = structuralPreview(data, DEFAULT_PREVIEW_BYTES, entry.contentType);
     const truncated = entry.bytes > DEFAULT_PREVIEW_BYTES;
     return {
       id: entry.id,
+      key: entry.key,
+      source: entry.source,
+      contentType: entry.contentType,
       preview: truncated ? preview + "\n... [truncated, use ctx_read to inspect]" : preview,
       bytes: entry.bytes,
       estimatedTokens: entry.estimatedTokens,
@@ -648,13 +733,39 @@ export class ContextStore {
   }
 }
 
-function inferContentType(data: string): StoreEntry["contentType"] {
-  const trimmed = data.trim();
-  try {
-    JSON.parse(trimmed);
-    return "json";
-  } catch {
-    if (/^(?:import |export |from |const |let |var |function |class |interface |def |package )/m.test(trimmed)) return "code";
-    return trimmed.length > 0 ? "text" : "unknown";
+function parseJsonPath(path: string): Array<string | number> | string {
+  const input = path.trim();
+  if (!input) return "JSON path must not be empty.";
+  if (input === "$") return [];
+
+  const segments: Array<string | number> = [];
+  let index = input.startsWith("$") ? 1 : 0;
+  if (input.startsWith(".", index)) index++;
+
+  while (index < input.length) {
+    if (input[index] === ".") {
+      index++;
+      if (index >= input.length) return `JSON path "${path}" ends after a separator.`;
+    }
+
+    if (input[index] === "[") {
+      const close = input.indexOf("]", index + 1);
+      if (close < 0) return `JSON path "${path}" has an unclosed bracket.`;
+      const token = input.slice(index + 1, close).trim();
+      if (/^\d+$/.test(token)) segments.push(Number(token));
+      else if ((token.startsWith("\"") && token.endsWith("\"")) || (token.startsWith("'") && token.endsWith("'"))) {
+        segments.push(token.slice(1, -1));
+      } else {
+        return `JSON path "${path}" has an invalid bracket segment "${token}".`;
+      }
+      index = close + 1;
+      continue;
+    }
+
+    const match = /^[A-Za-z_$][\w$-]*/.exec(input.slice(index));
+    if (!match) return `JSON path "${path}" has an invalid segment near "${input.slice(index)}".`;
+    segments.push(match[0]);
+    index += match[0].length;
   }
+  return segments;
 }

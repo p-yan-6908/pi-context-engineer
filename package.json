@@ -1,6 +1,6 @@
 {
   "name": "pi-context-engineer",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "description": "Context governor for Pi Fabric and Pi Fovea: taint-gates data flow, budgets selection, compresses results, offloads payloads, and records context cost.",
   "keywords": [

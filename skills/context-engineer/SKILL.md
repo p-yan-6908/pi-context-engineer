@@ -27,7 +27,7 @@ When the Fabric `fabric_exec` tool is installed, the extension adds static inter
 
 ## Automatic policy
 
-The live `fabric_exec` call is checked before execution using local data-flow analysis. Source values from `pi.*`, `mcp.*`, captured `extensions.*`, and direct Pi tools are tracked through aliases, destructuring, object/array values, callbacks, `Promise.all`, local functions, and arguments.
+The live `fabric_exec` call is checked before execution using local data-flow analysis. Source values from `pi.*`, `mcp.*`, captured `extensions.*`, current Fabric provider namespaces (`agents.*`, `workflow.*`, `state.*`, `memory.*`, `schema.*`, `mesh.*`, `council.*`, and `rlm.*`), and direct Pi/shell/web tools are tracked through aliases, destructuring, object/array values, callbacks, `Promise.all`, local functions, and arguments.
 
 The analyzer classifies the value returned to Main:
 
@@ -38,7 +38,7 @@ The analyzer classifies the value returned to Main:
 - **COMPRESSED:** `ctx_summarize`
 - **OFFLOADED:** `ctx_offload`
 
-Default policy is runtime-first: an uncertain source-bearing return is classified as a warning but executes silently; the boundary hook keeps a small actual result or offloads a large one. Call `ce_exec` when the explicit static diagnostic is useful. `strict: true` or `blockUnboundedReturns: true` restores fail-closed preflight. Certain static failures remain blocked. Numeric limits passed through aliases/local helpers and common tool status fields are recognized as bounded. The number of internal Fabric calls is not the main budget: many calls are acceptable when the returned context is small and meaningful.
+Default policy is runtime-first: an uncertain source-bearing return is classified as a warning but executes silently; the boundary hook keeps a small actual result or offloads a large one. Call `ce_exec` when the explicit static diagnostic is useful. `strict: true` or `blockUnboundedReturns: true` restores fail-closed preflight. Certain static failures remain blocked. Numeric limits passed through aliases/local helpers and common tool status fields are recognized as bounded. The number of internal Fabric calls is not the main budget: many calls are acceptable when the returned context is small and meaningful. `resultPolicy` can explicitly choose `auto`, `inline`, `offload`, or `summarize` for successful model-boundary returns; oversized model-facing errors are deterministically compacted while nested Fabric values remain exact.
 
 ## The four strategies
 
@@ -88,7 +88,7 @@ A Fovea call with `maxTokens` is recognized as a budgeted selection. Context Eng
 
 ## Standalone tools
 
-- `ctx_read`: read a UTF-8 byte range or search literal matches; ranged results expose copyable `offset` / `nextOffset`, query mode defaults to 100 formatted windows (`maxMatches`, capped at 500) and reports sampled `matchedLines` plus exact `totalMatches`
+- `ctx_read`: read a UTF-8 byte range, search literal matches, or select a JSON path such as `$.results[0].name`; ranged results expose copyable `offset` / `nextOffset`, query mode defaults to 100 formatted windows (`maxMatches`, capped at 500) and reports sampled `matchedLines` plus exact `totalMatches`
 - `ctx_summarize`: deterministic structural/code compression or bounded isolated no-tools model compression
 - `ctx_remember` / `ctx_recall` / `ctx_forget`: persistent project facts with bounded recall, named upserts, and deletion
 - `ctx_delegate`: isolated child-Pi fallback with `maxTokens` and a nested-safe timeout
@@ -98,8 +98,9 @@ For Fabric-native recursive agents and RLM-style decomposition, call Fabric's `a
 
 ## Runtime protections
 
-- Ordinary large model-boundary text results (about 8 KB by default) are written to `<workspace>/.pi/context-store/` and replaced by a handle plus preview.
-- Addressable offload and `ctx_read` previews remain for their first model call, then repeated context copies compact to a one-line `ctx_read` recipe; stored data and session history remain intact.
+- Ordinary large model-boundary text results (16 KB by default) are written to `<workspace>/.pi/context-store/` and replaced by a structural handle preview.
+- Addressable offload and `ctx_read` previews remain for their first model call, then repeated context copies compact to a one-line `ctx_read` recipe; stored data and session history remain intact. Use `ctx_read(...)` at the model boundary and `extensions.ctx_read(...)` inside Fabric.
+- Oversized model-facing parser/compiler errors are compacted to representative diagnostics, first/last context, and repetition counts; nested Fabric results are never replaced.
 - Ordinary intermediate `pi.*` results consumed inside Fabric are left byte-for-byte intact.
 - Fabric's documented nested provider-result proxy is inspected before QuickJS. Oversized provider values are replaced structurally with a CE handle; already-bounded Fabric artifact results are not offloaded again.
 - Fovea results that honor `maxTokens` are treated as already budgeted and are not redundantly offloaded.
@@ -115,9 +116,12 @@ Create `<repo>/.pi/context-engineer.json`:
   "strict": false,
   "blockUnboundedReturns": false,
   "maxReturnTokens": 4000,
-  "readOffloadThreshold": 8192,
-  "nestedResultThreshold": 8192,
-  "offloadPreviewBytes": 1024,
+  "readOffloadThreshold": 16384,
+  "nestedResultThreshold": 16384,
+  "resultPolicy": "auto",
+  "errorCompactionThreshold": 4096,
+  "errorCompactionPreviewBytes": 4096,
+  "offloadPreviewBytes": 2048,
   "runtimeAdvisoryThreshold": 0,
   "compactStaleResults": true,
   "notifyOnStart": false,
@@ -129,9 +133,11 @@ Create `<repo>/.pi/context-engineer.json`:
 - `enabled`: disable enforcement hooks when false
 - `strict` / `blockUnboundedReturns`: fail closed on statically unbounded source returns
 - `maxReturnTokens`: certain static-return threshold
-- `readOffloadThreshold`: ordinary text-result threshold
+- `readOffloadThreshold`: ordinary text-result threshold (default 16 KB)
 - `nestedResultThreshold`: Fabric provider-proxy threshold
-- `offloadPreviewBytes`: first-use handle preview size
+- `resultPolicy`: `auto`, `inline`, `offload`, or `summarize` for successful boundary returns
+- `errorCompactionThreshold` / `errorCompactionPreviewBytes`: deterministic model-facing error bounds
+- `offloadPreviewBytes`: structural first-use handle preview budget
 - `runtimeAdvisoryThreshold`: optional byte threshold for size nudges; `0` disables them
 - `compactStaleResults`: compact already-used addressable previews in later model contexts
 - `notifyOnStart`: opt into the session-start toast
@@ -143,7 +149,7 @@ Project configuration is re-read when its modification time changes. Transient e
 
 Transient payload metadata is stored in `<workspace>/.pi/context-store/index.json` and content-addressed blobs live under `blobs/`; durable facts use `<workspace>/.pi/agent/context-store/` with the same private metadata/blob layout. Directories use 0700, files use 0600, writes are atomic, and identical payloads deduplicate by hash. Handles survive session restarts, subject to transient TTL or disk-budget cleanup; remembered facts are persistent until forgotten or evicted by their 5 MB budget.
 
-Telemetry stores sizes and strategy names, never prompts or payloads, in `.pi/context-store/context-events.jsonl`.
+Telemetry stores sizes and strategy names, never prompts or payloads, in `.pi/context-store/context-events.jsonl`. `ctx_status` reports runtime, current host-session, and workspace-lifetime scopes; `/ce status --all` selects the lifetime view, which remains useful across fresh extension runtimes.
 
 Use:
 
