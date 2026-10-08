@@ -8,8 +8,11 @@ description: >-
   (query / offset / length / jsonPath / section), when a ctx_* call fails
   (invalid JSON for jsonPath, stale handle, invalid bracket segment), when
   offloading or summarizing a large payload, or when deciding whether to
-  aggregate in-guest instead of offloading. RU: хэндл, оффложенный результат,
-  ctx_read упал, jsonPath не работает, срезы большого результата.
+  aggregate in-guest instead of offloading. NOT for cross-session history
+  (use the memory/session layer) or corpus-wide search (use grep). RU:
+  использовать, когда результат вернулся хэндлом и секциями, ctx_read упал,
+  jsonPath не работает по текстовому хэндлу, нужно откачать срез большого
+  результата.
 ---
 
 # context-engineer — the model-boundary playbook
