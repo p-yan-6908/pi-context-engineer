@@ -203,18 +203,49 @@ function formatHandleText(
   text: string,
   previewBytes: number,
   surface: ReadSurface = "model",
+  nestedRead = false,
 ): string {
   const preview = structuralPreview(text, previewBytes);
   const truncated = Buffer.byteLength(text, "utf8") > previewBytes;
+  const tool = surface === "fabric" ? "extensions.ctx_read" : "ctx_read";
+  const actions =
+    `  ${tool}({ id: "${id}", query: "field-or-term" })       // search inside the handle\n` +
+    `  ${tool}({ id: "${id}", offset: 0, length: 4096 })      // read a window\n` +
+    `  ${tool}({ id: "${id}", section: "name" })              // named section of a sectioned preview\n` +
+    `  ${tool}({ id: "${id}", jsonPath: "$.path.to.field" })  // JSON payloads only — not for text previews`;
+  const hint = nestedRead
+    ? `\nThis handle holds a ctx_read result — your selection exceeded the boundary. Narrow it: smaller \`length\`, tighter \`query\`, a single \`section\`; or aggregate in-guest and return a digest.`
+    : ``;
   const handle =
-    `[offloaded to handle "${id}" — ${bytes} bytes (~${estimatedTokens} tokens at ~4 chars/token, ASCII-biased)]\n` +
-    `Preview (structural, up to ${previewBytes} bytes):\n${preview}` +
-    (truncated
-      ? `\n... [full payload remains available; call ${readRecipe(id, surface)}; use query or jsonPath for structured selection]`
-      : `\nRead later with ${readRecipe(id, surface)}.`);
+    `[offloaded to handle "${id}" — ${bytes} bytes (~${estimatedTokens} tokens). The FULL result is stored; nothing is lost. Do not re-run the command — read the handle instead:]\n` +
+    hint +
+    actions +
+    `\nPreview (first ${previewBytes} bytes of the stored payload):\n${preview}` +
+    (truncated ? `\n[preview ends mid-payload; the handle holds the rest]` : ``);
   return handle;
 }
 
+// ---- Always-on boundary cheat sheet ---------------------------------------
+// Injected at before_agent_start so the rules travel with the extension
+// lifecycle: enable context-engineer and they appear, disable it and they are
+// gone. Kept deliberately small; the deep playbook lives in the skill.
+
+const BOUNDARY_GUIDELINES = `
+
+## Context boundary (context-engineer)
+
+Tool results over ~16 KB auto-offload to a session-scoped handle: you see a
+structural preview, not the blob. An \`[offloaded to handle ...]\` notice means
+the data is SAFE and readable — pull slices with \`ctx_read\`; do not re-run the
+command to "get the full output".
+- Pull slices with \`ctx_read({ id, offset, length })\`; field names and text
+  occurrences with \`{ id, query }\`; named parts with \`{ id, section }\`.
+- \`jsonPath\` only on JSON handles (\`ctx_offload\` payloads). Auto-offloaded
+  previews are sectioned text — \`jsonPath\` fails there.
+- Handles die with the session and nest: read slices, never re-read raw sources.
+- Prefer deterministic compression: \`ctx_summarize({ text, mode: "structural" | "code", maxTokens })\`.
+  Aggregate in-guest before offloading.
+`;
 // ---- Extension setup ----
 
 export default function contextEngineer(pi: ExtensionAPI): void {
@@ -245,6 +276,12 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   const failedChildUsage = new Map<string, { usage?: Usage; complete: boolean }>();
   // execute must throw on failure. Restore measured usage through Pi's
   // supported middleware instead of marking a failed tool as successful.
+  // Always-on boundary cheat sheet: travels with the extension lifecycle.
+  // Appended after the current system prompt (see claude-rules example idiom).
+  pi.on("before_agent_start", async (event) => ({
+    systemPrompt: event.systemPrompt + BOUNDARY_GUIDELINES,
+  }));
+
   pi.on("tool_result", async (event) => {
     const pending = failedChildUsage.get(event.toolCallId);
     if (!pending) return undefined;
@@ -421,7 +458,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
       const summary = JSON.stringify(summarizeText(payload, Math.floor(previewBytes / 4)));
       replacement = `Structural summary:\n${structuralPreview(summary, previewBytes)}\n${recovery}`;
     } else {
-      replacement = formatHandleText(offloaded.id, offloaded.bytes, offloaded.estimatedTokens, payload, previewBytes, event.toolName === "fabric_exec" ? "fabric" : "model");
+      replacement = formatHandleText(offloaded.id, offloaded.bytes, offloaded.estimatedTokens, payload, previewBytes, event.toolName === "fabric_exec" ? "fabric" : "model", event.toolName === "ctx_read");
     }
     // Preserve media positions and a bounded allowance of short independent
     // text notes. The handle retains ALL original text blocks with indices.
