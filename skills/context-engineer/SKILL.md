@@ -9,10 +9,7 @@ description: >-
   (invalid JSON for jsonPath, stale handle, invalid bracket segment), when
   offloading or summarizing a large payload, or when deciding whether to
   aggregate in-guest instead of offloading. NOT for cross-session history
-  (use the memory/session layer) or corpus-wide search (use grep). RU:
-  использовать, когда результат вернулся хэндлом и секциями, ctx_read упал,
-  jsonPath не работает по текстовому хэндлу, нужно откачать срез большого
-  результата.
+  (use the memory/session layer) or corpus-wide search (use grep).
 ---
 
 # context-engineer — the model-boundary playbook
