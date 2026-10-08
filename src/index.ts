@@ -206,12 +206,17 @@ function formatHandleText(
 ): string {
   const preview = structuralPreview(text, previewBytes);
   const truncated = Buffer.byteLength(text, "utf8") > previewBytes;
+  const tool = surface === "fabric" ? "extensions.ctx_read" : "ctx_read";
+  const actions =
+    `  ${tool}({ id: "${id}", query: "field-or-term" })       // search inside the handle\n` +
+    `  ${tool}({ id: "${id}", offset: 0, length: 4096 })      // read a window\n` +
+    `  ${tool}({ id: "${id}", section: "name" })              // named section of a sectioned preview\n` +
+    `  ${tool}({ id: "${id}", jsonPath: "$.path.to.field" })  // JSON payloads only — not for text previews`;
   const handle =
-    `[offloaded to handle "${id}" — ${bytes} bytes (~${estimatedTokens} tokens at ~4 chars/token, ASCII-biased)]\n` +
-    `Preview (structural, up to ${previewBytes} bytes):\n${preview}` +
-    (truncated
-      ? `\n... [full payload remains available; call ${readRecipe(id, surface)}; use query or jsonPath for structured selection]`
-      : `\nRead later with ${readRecipe(id, surface)}.`);
+    `[offloaded to handle "${id}" — ${bytes} bytes (~${estimatedTokens} tokens). The FULL result is stored; nothing is lost. Do not re-run the command — read the handle instead:]\n` +
+    actions +
+    `\nPreview (first ${previewBytes} bytes of the stored payload):\n${preview}` +
+    (truncated ? `\n[preview ends mid-payload; the handle holds the rest]` : ``);
   return handle;
 }
 
