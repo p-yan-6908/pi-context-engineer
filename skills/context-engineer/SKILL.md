@@ -94,6 +94,8 @@ const slice = await extensions.ctx_read({ id, offset: 0, length: 4000 });
 const field = await extensions.ctx_read({ id, query: "perTool" });
 ```
 
+If a `ctx_read` result itself comes back as a handle — your slice was too big: narrow the window (`length`), tighten the `query`, or aggregate in-guest and return a digest.
+
 **R2 — heavy external JSON → `ctx_offload` + `jsonPath`:**
 
 ```ts
