@@ -168,20 +168,6 @@ function isContinuationByte(value: number | undefined): boolean {
   return value !== undefined && (value & 0xc0) === 0x80;
 }
 
-/** Return a UTF-8 prefix that never ends inside a multi-byte code point. */
-function utf8Prefix(data: string, maxBytes: number): string {
-  const buffer = Buffer.from(data, "utf8");
-  let end = Math.max(0, Math.min(buffer.length, Math.floor(maxBytes)));
-  while (end > 0 && isContinuationByte(buffer[end])) end--;
-  return buffer.subarray(0, end).toString("utf8");
-}
-
-function normalizeId(value: unknown): string | undefined {
-  return typeof value === "string" && value.length > 0 && !value.includes("/") && !value.includes("\\")
-    ? value
-    : undefined;
-}
-
 export class ContextStore {
   private readonly dir: string;
   private readonly blobsDir: string;

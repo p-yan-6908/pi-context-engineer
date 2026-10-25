@@ -407,8 +407,8 @@ export const ceToolMap = new Map(ceTools.map((t) => [t.name, t]));
 
 // ---- Structural summary implementation ----
 
-/** Shared deterministic compression for ctx_summarize and boundary policy. */
-export function summarizeText(data: string, maxTokens = 500, mode: "structural" | "code" = "structural", source = "inline"): unknown {
+/** Deterministic compression behind ctx_summarize. */
+function summarizeText(data: string, maxTokens = 500, mode: "structural" | "code" = "structural", source = "inline"): unknown {
   const budget = normalizeSummaryTokens(maxTokens);
   return capSummary(structuralSummary(data, source, budget, mode), budget);
 }

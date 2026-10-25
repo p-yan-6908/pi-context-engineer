@@ -5,7 +5,6 @@
 
 import contextEngineer from "./index.js";
 import { ContextStore, DEFAULT_CONTEXT_STORE_TTL_MS, MAX_CONTEXT_STORE_BYTES } from "./store.js";
-import { ceToolMap } from "./tools.js";
 import { ContextTelemetry } from "./telemetry.js";
 import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, utimesSync } from "node:fs";
 import { join } from "node:path";

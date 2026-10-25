@@ -47,10 +47,6 @@ const REMOVED_CONFIG_KEYS = [
   "runtimeAdvisoryThreshold", "resultPolicy", "compactStaleResults", "nestedResultThreshold",
 ];
 
-function loadConfig(cwd: string): CeConfig {
-  return loadConfigWithWarnings(cwd).config;
-}
-
 /** Load config without throwing; bad JSON and removed settings become warnings surfaced by /ce settings. */
 function loadConfigWithWarnings(cwd: string): { config: CeConfig; warnings: string[] } {
   const warnings: string[] = [];
