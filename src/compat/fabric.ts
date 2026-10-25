@@ -6,6 +6,10 @@
  * a compatibility fallback. All Fabric-specific knowledge stays here.
  */
 
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, isAbsolute, resolve } from "node:path";
+
 export interface FabricToolResultProxy {
   kind: "pi-fabric.tool-result-proxy.v1";
   ref: string;
@@ -90,6 +94,39 @@ export function enableFabricContextReadForChild(enabled: boolean): boolean {
     FABRIC_CONTEXT_READ_TOOL,
   ]);
   return true;
+}
+
+/** Fabric's notice after a final output it truncated: the artifact holds every character. */
+const FABRIC_FULL_OUTPUT_NOTICE = /\n\n\[Full output \((\d+) chars\) saved to: ([^\n\]]+)\]$/;
+const FABRIC_OUTPUT_SCRATCH_PREFIX = "pi-fabric-output-";
+const MAX_FABRIC_FULL_OUTPUT_BYTES = 64 * 1024 * 1024;
+
+/**
+ * The complete text behind a fabric_exec result that Fabric truncated, read
+ * from its output artifact. Fabric marks that scratch directory for cleanup
+ * as soon as it writes it, so this must run when the result arrives.
+ *
+ * The notice is program output, so only a regular file named output.txt in a
+ * Fabric output scratch directory directly under the temp root, whose length
+ * matches the notice, is accepted. Anything else returns undefined and the
+ * visible text is stored as before.
+ */
+export function readFabricFullOutput(text: string, tempRoot = tmpdir()): string | undefined {
+  const match = FABRIC_FULL_OUTPUT_NOTICE.exec(text);
+  if (!match) return undefined;
+  const [, chars, artifact] = match;
+  const scratch = dirname(artifact);
+  if (!isAbsolute(artifact) || resolve(artifact) !== artifact || basename(artifact) !== "output.txt" ||
+    !basename(scratch).startsWith(FABRIC_OUTPUT_SCRATCH_PREFIX)) return undefined;
+  try {
+    if (dirname(scratch) !== tempRoot && dirname(scratch) !== realpathSync(tempRoot)) return undefined;
+    const stat = lstatSync(artifact);
+    if (!stat.isFile() || stat.size > MAX_FABRIC_FULL_OUTPUT_BYTES) return undefined;
+    const full = readFileSync(artifact, "utf8");
+    return full.length === Number(chars) ? full : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**

@@ -24,6 +24,7 @@
 
 ### Fabric child integration
 
+- When Fabric truncates a `fabric_exec` result over its 50,000-character cap, CE stores the full output from Fabric's artifact instead of the truncated view. Fabric marks that scratch file for cleanup as soon as it writes it, so earlier handles kept only the visible head and tail while the notice claimed the full result was stored. Only a regular `output.txt` in a Fabric output scratch directory under the temp root, with the length the notice states, is read.
 - Extension-enabled Fabric Pi children that load CE grant themselves `ctx_read` before Fabric's lazy provider initialization, at every depth. Like Fabric's `agents.childQuestionTools`, the grant is skipped for an explicit empty `tools` list and for `+name`/`-name` lists; a malformed allowlist fails closed.
 - CE no longer offloads to a handle the current process cannot read (a withheld Fabric allowlist, or a Pi `--tools` list without `ctx_read`); the result stays inline and telemetry records why.
 

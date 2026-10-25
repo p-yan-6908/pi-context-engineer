@@ -9,6 +9,7 @@ It works with ordinary Pi tools and with [Pi Fabric](https://github.com/monotyka
 - **Offloads large results.** CE measures the sum of a result's text blocks. Over the threshold, the exact text is stored and replaced by a notice with copyable `ctx_read` calls and a structural preview: JSON keys and short fields, Fabric section names, or head and tail lines. Images keep their positions. If the store fails, the original result stays visible.
 - **Compacts oversized errors.** An error result of 4 KB or more keeps its most useful diagnostic lines inline, plus a handle to the complete output.
 - **Compacts verbose edit results.** A successful edit whose result carries a diff or patch of 2 KB or more keeps its acknowledgment inline; the full diff stays readable.
+- **Completes Fabric-truncated output.** Fabric caps a `fabric_exec` result at 50,000 characters and saves the full text to a temporary file that it soon deletes. When a result arrives truncated like that, CE stores the full text from the file, so the handle also holds the part Fabric left out.
 - **Leaves intermediate values alone.** Inside a Fabric program, tool results are program data. CE only rewrites what reaches the model.
 - **Keeps exposed messages stable.** CE rewrites a result once, before the model first sees it, and never edits earlier messages, so provider prompt caches stay valid. Pi's session compaction handles accumulated history.
 - **Records what it did.** Sizes and strategies, never payloads, go to `.pi/context-store/context-events.jsonl`.

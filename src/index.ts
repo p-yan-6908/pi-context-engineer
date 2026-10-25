@@ -16,7 +16,7 @@ import { Type } from "typebox";
 import { ContextStore, DEFAULT_CONTEXT_STORE_TTL_MS, MAX_CONTEXT_STORE_BYTES } from "./store.js";
 import { compactErrorOutput, fabricSectionNames, isVerboseEditAcknowledgement, structuralPreview, type PreviewContentType } from "./preview.js";
 import { ceTools, isErrorResult, type ToolContext } from "./tools.js";
-import { enableFabricContextReadForChild, FABRIC_CONTEXT_READ_TOOL } from "./compat/fabric.js";
+import { enableFabricContextReadForChild, FABRIC_CONTEXT_READ_TOOL, readFabricFullOutput } from "./compat/fabric.js";
 import { ContextTelemetry, REPEATED_OFFLOADED_CALL_NOTE } from "./telemetry.js";
 import { FabricExecutionScopes } from "./execution-scope.js";
 // ---- Config ----
@@ -305,9 +305,6 @@ export default function contextEngineer(pi: ExtensionAPI): void {
       item.type === "text" ? [{ index, text: item.text }] : []);
     if (textBlocks.length === 0) return undefined;
     const textBytes = textBlocks.reduce((bytes, block) => bytes + Buffer.byteLength(block.text, "utf8"), 0);
-    // Single-text handles retain the exact old read-back contract. Multi-text
-    // handles retain every original text and its content-array position.
-    const payload = textBlocks.length === 1 ? textBlocks[0].text : JSON.stringify({ textBlocks });
     const diagnosticText = textBlocks.map((block) => block.text).join("\n");
     const existingDetails = asRecord(event.details) ?? {};
     const input = (event.input ?? {}) as Record<string, unknown>;
@@ -344,6 +341,13 @@ export default function contextEngineer(pi: ExtensionAPI): void {
       return undefined;
     }
 
+    // Fabric truncates a final output over its own cap and keeps the full text
+    // in a scratch file it soon deletes; store that text so the handle is
+    // complete. Single-text handles otherwise store the exact text. Multi-text
+    // handles retain every original text and its content-array position.
+    const fabricFullOutput = event.toolName === "fabric_exec" && textBlocks.length === 1
+      ? readFabricFullOutput(textBlocks[0].text) : undefined;
+    const payload = fabricFullOutput ?? (textBlocks.length === 1 ? textBlocks[0].text : JSON.stringify({ textBlocks }));
     const key = `${event.toolName}-${inputHint(input)}`.replace(/[^a-z0-9-]/gi, "-").slice(0, 48);
     let offloaded: ReturnType<ContextStore["write"]>;
     try {
@@ -389,7 +393,8 @@ export default function contextEngineer(pi: ExtensionAPI): void {
       sourceBytes: textBytes, visibleBytes, mainTokensPrevented: Math.max(0, sourceTokens - visibleTokens),
       mainTokensInjected: visibleTokens, storeTokensWritten: offloaded.estimatedTokens, handle: offloaded.id,
       note: event.isError ? "error compacted with exact recovery" : compactEditAck
-        ? "verbose successful edit acknowledgement offloaded" : "large final text result offloaded",
+        ? "verbose successful edit acknowledgement offloaded" : fabricFullOutput !== undefined
+          ? "Fabric-truncated result offloaded with its full output" : "large final text result offloaded",
     });
     if (!event.isError) rememberOffloadedCall(event.toolName, input, offloaded.id);
     // Details are rendering/state data in native Pi and program data in Fabric.
@@ -402,6 +407,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         ce_original_bytes: textBytes, ce_original_tokens: sourceTokens,
         ce_saved_tokens: Math.max(0, sourceTokens - visibleTokens),
         ...(textBlocks.length > 1 ? { ce_text_blocks: textBlocks.length } : {}),
+        ...(fabricFullOutput !== undefined ? { ce_fabric_full_output: true } : {}),
         ...(event.isError ? { ce_error_compacted: true, ce_error_original_bytes: textBytes,
           ce_error_original_tokens: sourceTokens, ce_error_compacted_bytes: visibleBytes } : {}),
         ...(!event.isError && compactEditAck ? { ce_compacted_edit_ack: true } : {}),

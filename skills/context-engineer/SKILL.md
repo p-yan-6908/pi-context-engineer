@@ -25,8 +25,10 @@ about doing that well.
 - **Auto-offload is the main path.** When a `fabric_exec` / `pi.*` / `mcp.*`
   return is huge, expect preview + handle. That is the tool working, not an
   error. The notice lists the `ctx_read` calls that fit that payload.
-- **Read the handle; do not re-run the call.** The full result is stored.
-  Re-running pays for the same output again and may repeat side effects.
+- **Read the handle; do not re-run the call.** The full result is stored,
+  including the middle of a `fabric_exec` output that Fabric itself
+  truncated. Re-running pays for the same output again and may repeat side
+  effects.
 - **Handles live in the workspace store** (`.pi/context-store/`, one week and
   500 MB by default). `no stored result with id` means the handle expired, was
   evicted, or belongs to another working directory; only then re-run the source.
