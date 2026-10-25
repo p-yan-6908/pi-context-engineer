@@ -101,6 +101,8 @@ Interactive commands:
 /ce clear          clear telemetry
 ```
 
+`offloadFollowUp` (also shown by `/ce status`) reports how many boundary-offloaded handles were later read with `ctx_read`/`ctx_summarize` and how many offloaded calls were repeated anyway. A repeat suggests the preview or notice did not make the handle usable, and the same output was paid for again.
+
 The numbers are approximate context-token estimates, not billing reconciliation or proof of agent effectiveness. Internal helper calls do not count as Main exposure; reading an existing handle does not count the same source as prevented again. Use actual model Usage (including nested calls and cache/cost fields) to evaluate billed savings. `ctx_status` exposes `childCalls`, observed `childUsage`, and `childUsageComplete`; incomplete/missing reports are not zero-cost work. Native standalone calls attach observed Usage on success and failure. Current Fabric capture omits nested tool Usage from native totals, so `childUsageOutsideParent` reports the additional observed usage separately; add it exactly once, not all `childUsage` again. The effectiveness harness performs this accounting from isolated-workspace telemetry.
 
 ## Fabric example

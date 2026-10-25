@@ -8,6 +8,7 @@
  * Standalone ctx_* helpers provide explicit selection, storage and isolation.
  */
 
+import { createHash } from "node:crypto";
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -20,7 +21,7 @@ import { ceTools, isErrorResult, summarizeText, type ToolContext } from "./tools
 import { evaluateProgram, runtimeAdvisoryLine, type WrapperOptions } from "./wrapper.js";
 import { CONTEXT_ENGINEER_CHILD_ENV, runChildPiResult } from "./child.js";
 import { enableFabricContextReadForChild, FABRIC_CONTEXT_READ_TOOL } from "./compat/fabric.js";
-import { ContextTelemetry } from "./telemetry.js";
+import { ContextTelemetry, REPEATED_OFFLOADED_CALL_NOTE } from "./telemetry.js";
 import { FabricExecutionScopes } from "./execution-scope.js";
 import { DEFAULT_RUNTIME_OFFLOAD_BYTES, resolveRuntimeByteBudget, validateContextBoundaryPolicy, type ContextBoundaryPolicy } from "./quantitative-policy.js";
 
@@ -273,6 +274,17 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   const fabricExecutions = new FabricExecutionScopes();
   // fabric_exec calls whose program reads handles; see formatHandleText.
   const handleReadingCalls = new Set<string>();
+  // Offloaded calls by tool and input. Repeating one suggests the handle went
+  // unused; telemetry reports it through offloadFollowUp.
+  const offloadedCalls = new Map<string, string>();
+  const callKey = (toolName: string, input: unknown): string =>
+    createHash("sha256").update(`${toolName}\0${JSON.stringify(input ?? {})}`).digest("hex");
+  const rememberOffloadedCall = (toolName: string, input: unknown, handle: string): void => {
+    const key = callKey(toolName, input);
+    offloadedCalls.delete(key);
+    offloadedCalls.set(key, handle);
+    if (offloadedCalls.size > 256) offloadedCalls.delete(offloadedCalls.keys().next().value!);
+  };
   const telemetry = new ContextTelemetry();
   const failedChildUsage = new Map<string, { usage?: Usage; complete: boolean }>();
   // execute must throw on failure. Restore measured usage through Pi's
@@ -308,6 +320,17 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   // we intercept the program BEFORE it runs. If the analyzer detects a
   // passthrough (raw tool result returned with no processing), runtime-first
   // mode executes under the actual boundary guard; strict mode blocks.
+
+  pi.on("tool_call", async (event, ctx) => {
+    const handle = offloadedCalls.get(callKey(event.toolName, event.input));
+    if (handle && configFor(ctx.cwd).enabled !== false) {
+      telemetry.record(ctx.cwd, {
+        strategy: "PASS", tool: event.toolName, handle,
+        mainTokensPrevented: 0, mainTokensInjected: 0, note: REPEATED_OFFLOADED_CALL_NOTE,
+      });
+    }
+    return undefined;
+  });
 
   pi.on("tool_call", async (event, ctx) => {
     if (event.toolName !== "fabric_exec") return undefined;
@@ -497,6 +520,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         ? "structural boundary summary with exact recovery" : compactEditAck
           ? "verbose successful edit acknowledgement offloaded" : "large final text result offloaded",
     });
+    if (!event.isError) rememberOffloadedCall(event.toolName, input, offloaded.id);
     // Details are rendering/state data in native Pi and program data in Fabric.
     // Only content crosses the native model boundary; do not destroy details.
     return {
@@ -629,6 +653,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
             mainTokensPrevented: 0,
             mainTokensInjected: fabricExecutions.isNestedToolResult(_id) ? 0 : Math.ceil(Buffer.byteLength(serialized, "utf8") / 4),
             note: fabricExecutions.isNestedToolResult(_id) ? "internal CE helper result" : "CE helper result",
+            ...(typeof (params as { id?: unknown }).id === "string" ? { handle: (params as { id: string }).id } : {}),
           });
           // Preserve exact structured helper values, including nested Fabric consumers.
           const maybeHandle = resultRecord as Record<string, unknown> | undefined;
@@ -895,6 +920,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           `Store tokens written: ${summary.storeTokensWritten.toLocaleString()}`,
           `Main context reduction: ${summary.mainTokensPrevented.toLocaleString()} tokens (${reduction})`,
           `Events: ${summary.events}`,
+          `Offloads read back: ${summary.offloadFollowUp.handlesRead}/${summary.offloadFollowUp.handles}; repeated offloaded calls: ${summary.offloadFollowUp.repeatedCalls}`,
           ...(strategyLines.length > 0 ? ["", "By strategy:", ...strategyLines] : []),
           ...(summary.largest ? ["", `Largest Main-context prevention: ${summary.largest.tool} — ${summary.largest.mainTokensPrevented.toLocaleString()} tokens`] : []),
         ].join("\n");
@@ -954,6 +980,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     failedChildUsage.clear();
     fabricExecutions.clear();
     handleReadingCalls.clear();
+    offloadedCalls.clear();
     telemetry.setSessionId(ctx.sessionManager?.getSessionId?.());
     const cfg = configFor(ctx.cwd);
     if (cfg.enabled === false) return;

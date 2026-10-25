@@ -9,6 +9,10 @@
 - `ctx_read` gained `section` mode for Fabric sectioned results; `offset`/`length` page within the section.
 - Rewrote the skill as an operational playbook (#1 by @e4779), correcting handle lifetime (workspace store, not session-scoped) and the jsonPath dialect (no wildcards or slices).
 
+### Offload follow-up telemetry
+
+- `ctx_read` and `ctx_summarize` events record the handle they read, and repeating a call whose result was offloaded is recorded. Summaries and `/ce status` report `offloadFollowUp`: offloaded handles, handles read back, and repeated calls.
+
 ### Fabric child integration
 
 - Extension-enabled Fabric Pi children that load CE grant themselves `ctx_read` before Fabric's lazy provider initialization, at every depth. Like Fabric's `agents.childQuestionTools`, the grant is skipped for an explicit empty `tools` list and for `+name`/`-name` lists; a malformed allowlist fails closed.

@@ -17,6 +17,9 @@ import { resolve } from "node:path";
 import type { Usage } from "@earendil-works/pi-ai";
 import { mergeUsage, readUsage } from "./usage.js";
 
+/** Note on a call repeated after its result was offloaded; see offloadFollowUp. */
+export const REPEATED_OFFLOADED_CALL_NOTE = "repeated a call whose result is already offloaded";
+
 export type ContextStrategy = "PASS" | "WARN" | "BLOCK" | "WRITE" | "SELECT" | "COMPRESS" | "ISOLATE";
 export type TelemetryScope = "runtime" | "session" | "lifetime";
 
@@ -87,6 +90,8 @@ export interface ContextSummary {
   childUsageComplete?: boolean;
   /** Add only this usage to native parent totals to avoid double counting. */
   childUsageOutsideParent?: Usage;
+  /** Whether boundary offloads were used: distinct handles, handles later read, and repeated source calls. */
+  offloadFollowUp: { handles: number; handlesRead: number; repeatedCalls: number };
   largest?: ContextEvent;
 }
 
@@ -278,6 +283,14 @@ export class ContextTelemetry {
       if (!largest || event.mainTokensPrevented > largest.mainTokensPrevented) largest = event;
     }
 
+    // ctx_* helpers carry the handle they were given, not a new boundary offload.
+    const offloadHandles = new Set(events.filter(event => event.handle && (event.strategy === "WRITE" || event.strategy === "COMPRESS") && !event.tool.startsWith("ctx_")).map(event => event.handle!));
+    const readHandles = new Set(events.filter(event => event.handle && (event.tool === "ctx_read" || event.tool === "ctx_summarize")).map(event => event.handle!));
+    const offloadFollowUp = {
+      handles: offloadHandles.size,
+      handlesRead: [...offloadHandles].filter(handle => readHandles.has(handle)).length,
+      repeatedCalls: events.filter(event => event.note === REPEATED_OFFLOADED_CALL_NOTE).length,
+    };
     const childEvents = events.filter(event => event.childUsageComplete !== undefined);
     const childUsage = mergeUsage(...childEvents.map(event => event.childUsage));
     const childUsageOutsideParent = mergeUsage(...childEvents.filter(event => event.usageInParent === false).map(event => event.childUsage));
@@ -302,6 +315,7 @@ export class ContextTelemetry {
       ...(childUsage ? { childUsage } : {}),
       ...(childEvents.length ? { childUsageComplete: childEvents.every(event => event.childUsageComplete === true) } : {}),
       ...(childUsageOutsideParent ? { childUsageOutsideParent } : {}),
+      offloadFollowUp,
       ...(largest ? { largest } : {}),
     };
   }

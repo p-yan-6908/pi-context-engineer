@@ -939,8 +939,39 @@ async function testSectionReadsAndOffloadNotice(): Promise<void> {
   check(jsonNotice.startsWith('[offloaded to handle "') && jsonNotice.includes("instead of re-running"), "the notice keeps its marker and discourages re-runs");
 }
 
+async function testOffloadFollowUpTelemetry(): Promise<void> {
+  const root = tempRoot("ce-remediation-followup-");
+  const handlers = new Map<string, Array<(event: any, ctx: any) => Promise<any>>>();
+  const tools = new Map<string, any>();
+  contextEngineer({
+    on: (name: string, handler: any) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
+    registerTool: (definition: any) => tools.set(definition.name, definition),
+    registerCommand() {},
+  } as any);
+  const run = async (name: string, event: any): Promise<any> => {
+    let last: any;
+    for (const handler of handlers.get(name) ?? []) last = (await handler(event, { cwd: root })) ?? last;
+    return last;
+  };
+  const input = { code: "return (await pi.read({ path: 'big.log' }))" };
+  await run("tool_call", { toolName: "fabric_exec", toolCallId: "follow-1", input });
+  const offloaded = await run("tool_result", { toolName: "fabric_exec", toolCallId: "follow-1", input, details: {}, isError: false, content: [{ type: "text", text: "log line\n".repeat(4000) }] });
+  const handle = offloaded?.details?.ce_handle as string;
+  check(typeof handle === "string", "a large fabric_exec result is offloaded");
+  const fresh = () => new ContextTelemetry().summary(root, true).offloadFollowUp;
+  equal(fresh(), { handles: 1, handlesRead: 0, repeatedCalls: 0 }, "an unread offload is counted");
+
+  await run("tool_call", { toolName: "fabric_exec", toolCallId: "follow-2", input });
+  await run("tool_call", { toolName: "fabric_exec", toolCallId: "follow-3", input: { code: "return 1" } });
+  equal(fresh().repeatedCalls, 1, "only repeating the offloaded call is counted");
+
+  await tools.get("ctx_read").execute("read-1", { id: handle, offset: 0, length: 64 }, undefined, undefined, { cwd: root });
+  equal(fresh(), { handles: 1, handlesRead: 1, repeatedCalls: 1 }, "ctx_read attributes its read to the handle");
+}
+
 try {
   await testStoreAndToolReads();
+  await testOffloadFollowUpTelemetry();
   await testSectionReadsAndOffloadNotice();
   await testModelSummaryBudgets();
   await testUsageAndTelemetry();
