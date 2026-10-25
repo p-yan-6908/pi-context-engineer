@@ -2,7 +2,7 @@
   "name": "pi-context-engineer",
   "version": "0.6.0",
   "type": "module",
-  "description": "Context governor for Pi Fabric and Pi Fovea: taint-gates data flow, budgets selection, compresses results, offloads payloads, and records context cost.",
+  "description": "Keeps large Pi and Fabric tool results out of model context: offloads them to a local store behind a readable handle, compacts oversized errors and edit diffs, and records what it saved.",
   "keywords": [
     "pi-package",
     "pi",
@@ -26,7 +26,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck src/*.ts",
     "build": "rm -rf .tmp/pi-ce-build && tsc --outDir .tmp/pi-ce-build --rootDir src --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck src/*.ts",
-    "verify": "npm run build && node .tmp/pi-ce-build/verify.js && node .tmp/pi-ce-build/verify-hooks.js && node .tmp/pi-ce-build/verify-adversarial.js && node .tmp/pi-ce-build/verify-runtime.js && node .tmp/pi-ce-build/verify-fabric-child.js && node .tmp/pi-ce-build/verify-remediation.js",
+    "verify": "npm run build && node .tmp/pi-ce-build/verify.js && node .tmp/pi-ce-build/verify-hooks.js && node .tmp/pi-ce-build/verify-runtime.js && node .tmp/pi-ce-build/verify-fabric-child.js && node .tmp/pi-ce-build/verify-remediation.js",
     "e2e": "npm run build && node .tmp/pi-ce-build/e2e.js",
     "test": "npm run verify"
   },
@@ -42,14 +42,11 @@
     "CHANGELOG.md",
     "LICENSE"
   ],
-  "dependencies": {
-    "typescript": "^5.5.0"
-  },
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=0.80.0",
     "@earendil-works/pi-coding-agent": ">=0.80.0",
-    "typebox": "*",
-    "pi-fabric": "*"
+    "pi-fabric": "*",
+    "typebox": "*"
   },
   "peerDependenciesMeta": {
     "pi-fabric": {
@@ -71,5 +68,8 @@
       "ctx_summarize",
       "ctx_offload"
     ]
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
   }
 }

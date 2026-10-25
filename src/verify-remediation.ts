@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -553,23 +552,7 @@ async function testOffloadFollowUpTelemetry(): Promise<void> {
   equal(fresh(), { handles: 1, handlesRead: 1, repeatedCalls: 1 }, "ctx_read attributes its read to the handle");
 }
 
-function testTypeScriptLoadsOnDemand(): void {
-  // Default-mode startup must not pay for TypeScript; analysis loads it on first use.
-  const probe = [
-    `import { createRequire } from "node:module";`,
-    `const cache = createRequire(import.meta.url).cache;`,
-    `const loaded = () => Object.keys(cache).some((key) => /[\\\\/]typescript[\\\\/]/.test(key));`,
-    `const ce = await import(${JSON.stringify(new URL("./index.js", import.meta.url).href)});`,
-    `const atImport = loaded();`,
-    `ce.explainProgram("return 1");`,
-    `console.log(JSON.stringify({ atImport, afterAnalysis: loaded() }));`,
-  ].join("\n");
-  const output = execFileSync(process.execPath, ["--input-type=module", "-e", probe], { encoding: "utf8" });
-  equal(JSON.parse(output), { atImport: false, afterAnalysis: true }, "TypeScript loads on first analysis, not at import");
-}
-
 try {
-  testTypeScriptLoadsOnDemand();
   await testStoreAndToolReads();
   await testOffloadFollowUpTelemetry();
   await testSectionReadsAndOffloadNotice();

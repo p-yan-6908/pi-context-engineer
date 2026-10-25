@@ -144,9 +144,8 @@ instead of offloading. Other CE/Fovea extension tools remain opt-in; explicit
   limits; history lives in the session/memory layer.
 - **Not a search engine.** `query` searches one handle; corpus-wide search
   belongs to grep/Fovea.
-- **Not a gate to fight.** By default nothing is blocked: small results pass
-  through untouched and large ones are offloaded after they run. Static
-  preflight runs only with `strict` or `blockUnboundedReturns`.
+- **Not a gate to fight.** Nothing is blocked: small results pass through
+  untouched and large ones are offloaded after they run.
 
 ## Tools
 
@@ -158,6 +157,4 @@ instead of offloading. Other CE/Fovea extension tools remain opt-in; explicit
 
 ## Configuration
 
-Defaults fit most workloads. `strict`, `blockUnboundedReturns` and
-`resultPolicy` exist for fail-closed preflight and explicit policy — see the
-package README.
+Defaults fit most workloads; the package README lists the thresholds.

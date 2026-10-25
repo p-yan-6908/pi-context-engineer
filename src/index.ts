@@ -1,7 +1,6 @@
 /**
  * pi-context-engineer — model-boundary context optimization.
  *
- * fabric_exec preflight is advisory by default, with explicit strict modes.
  * Initial model-facing results are budgeted, summarized, or offloaded with
  * exact recovery. Already-exposed messages and all internal Fabric values
  * remain untouched. Search semantics belong to Pi/Fabric, not this extension.
@@ -17,41 +16,14 @@ import { Type } from "typebox";
 import { ContextStore, DEFAULT_CONTEXT_STORE_TTL_MS, MAX_CONTEXT_STORE_BYTES } from "./store.js";
 import { compactErrorOutput, fabricSectionNames, isVerboseEditAcknowledgement, structuralPreview, type PreviewContentType } from "./preview.js";
 import { ceTools, isErrorResult, summarizeText, type ToolContext } from "./tools.js";
-import { evaluateProgram, runtimeAdvisoryLine, type WrapperOptions } from "./wrapper.js";
 import { enableFabricContextReadForChild, FABRIC_CONTEXT_READ_TOOL } from "./compat/fabric.js";
 import { ContextTelemetry, REPEATED_OFFLOADED_CALL_NOTE } from "./telemetry.js";
 import { FabricExecutionScopes } from "./execution-scope.js";
-import { DEFAULT_RUNTIME_OFFLOAD_BYTES, resolveRuntimeByteBudget, validateContextBoundaryPolicy, type ContextBoundaryPolicy } from "./quantitative-policy.js";
-
-export {
-  contextEffects,
-  contextEffectFor,
-  isBoundedContextEffect,
-  isContextHelperName,
-  isFoveaName,
-  normalizeCalleeName,
-} from "./context-effects.js";
-export type {
-  BoundExpression,
-  BoundUnit,
-  ContextEffect,
-  ContextEffectKind,
-  ContextProvenanceLocation,
-  ContextProvenanceStep,
-  ResolvedBound,
-} from "./context-effects.js";
-export { explainProgram, explanationFromAnalysis, formatProgramExplanation } from "./explanation.js";
-export type { ProgramExplanation } from "./explanation.js";
-export { DEFAULT_CONTEXT_BOUNDARY_POLICY, evaluateReturnBudget, MAX_CONTEXT_BOUNDARY_BUDGET, validateContextBoundaryPolicy } from "./quantitative-policy.js";
-export type { ContextBoundaryPolicy, QuantitativeDecision } from "./quantitative-policy.js";
-
 // ---- Config ----
 
 export type ResultPolicy = "auto" | "inline" | "offload" | "summarize";
 
-interface CeConfig extends WrapperOptions {
-  /** User-facing alias for quantitativePolicy in context-engineer.json. */
-  policy?: ContextBoundaryPolicy;
+interface CeConfig {
   enabled?: boolean;
   /** UTF-8 bytes before text results are auto-offloaded. Default: 16384. */
   readOffloadThreshold?: number;
@@ -61,9 +33,6 @@ interface CeConfig extends WrapperOptions {
   errorCompactionThreshold?: number;
   /** Maximum UTF-8 bytes retained by a compacted error. Default: 4096. */
   errorCompactionPreviewBytes?: number;
-  /** fabric_exec boundary results at or above this size get a one-line
-   *  advisory instead of silence. Default: 0 (disabled). */
-  runtimeAdvisoryThreshold?: number;
   /** @deprecated Accepted but ignored. Previously exposed messages stay prefix-stable. */
   compactStaleResults?: boolean;
   /** Compact successful 2 KB+ edit envelopes while keeping their exact output addressable. */
@@ -80,11 +49,14 @@ interface CeConfig extends WrapperOptions {
   storeTtlMs?: number;
 }
 
+/** Settings earlier versions read. Reported so a stale config is not silently ignored. */
+const REMOVED_CONFIG_KEYS = ["strict", "blockUnboundedReturns", "maxReturnTokens", "maxUnprocessedToolCalls", "quantitativePolicy", "policy", "runtimeAdvisoryThreshold"];
+
 function loadConfig(cwd: string): CeConfig {
   return loadConfigWithWarnings(cwd).config;
 }
 
-/** Load config without throwing; bad JSON and invalid policy become warnings surfaced by /ce settings. */
+/** Load config without throwing; bad JSON and removed settings become warnings surfaced by /ce settings. */
 function loadConfigWithWarnings(cwd: string): { config: CeConfig; warnings: string[] } {
   const warnings: string[] = [];
   const configPath = resolve(cwd, ".pi", "context-engineer.json");
@@ -96,20 +68,14 @@ function loadConfigWithWarnings(cwd: string): { config: CeConfig; warnings: stri
     warnings.push(`Ignored invalid JSON in ${configPath}; using defaults. Fix the file to clear this warning.`);
     return { config: {}, warnings };
   }
-  const configuredPolicy = (parsed as CeConfig).policy ?? (parsed as CeConfig).quantitativePolicy;
-  if (configuredPolicy !== undefined) {
-    if (!configuredPolicy || typeof configuredPolicy !== "object") {
-      warnings.push("Ignored invalid context policy (must be an object); using defaults for policy.");
-      const { policy: _droppedPolicy, quantitativePolicy: _droppedQuant, ...rest } = parsed as Record<string, unknown>;
-      return { config: rest as unknown as CeConfig, warnings };
-    }
-    const errors = validateContextBoundaryPolicy(configuredPolicy as ContextBoundaryPolicy);
-    if (errors.length > 0) {
-      warnings.push(`Ignored invalid context policy (${errors.join(" ")}); using defaults for policy.`);
-      const { policy: _droppedPolicy2, quantitativePolicy: _droppedQuant2, ...rest } = parsed as Record<string, unknown>;
-      return { config: rest as unknown as CeConfig, warnings };
-    }
-    return { config: configuredPolicy === undefined ? parsed : { ...parsed, quantitativePolicy: configuredPolicy as ContextBoundaryPolicy }, warnings };
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    warnings.push(`Ignored ${configPath}: it must contain a JSON object; using defaults.`);
+    return { config: {}, warnings };
+  }
+  const removed = REMOVED_CONFIG_KEYS.filter((key) => Object.hasOwn(parsed, key));
+  if (removed.length > 0) {
+    warnings.push(`Ignored removed setting${removed.length === 1 ? "" : "s"}: ${removed.join(", ")}.` +
+      (removed.includes("policy") || removed.includes("quantitativePolicy") ? " readOffloadThreshold sets the offload budget." : ""));
   }
   return { config: parsed, warnings };
 }
@@ -126,7 +92,7 @@ function describeBoundedClamp(name: string, value: unknown, effective: number, m
 function collectBoundedWarnings(cfg: CeConfig): string[] {
   const warnings: string[] = [];
   const push = (msg: string | undefined): void => { if (msg) warnings.push(msg); };
-  push(describeBoundedClamp("readOffloadThreshold", cfg.readOffloadThreshold, resolveRuntimeByteBudget(cfg.readOffloadThreshold, cfg.quantitativePolicy ?? cfg.policy), 256));
+  push(describeBoundedClamp("readOffloadThreshold", cfg.readOffloadThreshold, effectiveOffloadThreshold(cfg), 256));
   push(describeBoundedClamp("errorCompactionThreshold", cfg.errorCompactionThreshold, boundedNumber(cfg.errorCompactionThreshold, 4096, 256), 256));
   push(describeBoundedClamp("errorCompactionPreviewBytes", cfg.errorCompactionPreviewBytes, boundedNumber(cfg.errorCompactionPreviewBytes, 4096, 256, 64_000), 256));
   push(describeBoundedClamp("offloadPreviewBytes", cfg.offloadPreviewBytes, boundedNumber(cfg.offloadPreviewBytes, 2048, 256, 4096), 256));
@@ -137,12 +103,11 @@ function collectBoundedWarnings(cfg: CeConfig): string[] {
   return warnings;
 }
 
-function effectivePolicyFor(cfg: CeConfig): ContextBoundaryPolicy | undefined {
-  return cfg.quantitativePolicy ?? cfg.policy;
-}
+/** UTF-8 bytes before a text result is offloaded: about 4K tokens of ASCII. */
+const DEFAULT_OFFLOAD_BYTES = 16_384;
 
 function effectiveOffloadThreshold(cfg: CeConfig): number {
-  return resolveRuntimeByteBudget(cfg.readOffloadThreshold, effectivePolicyFor(cfg));
+  return boundedNumber(cfg.readOffloadThreshold, DEFAULT_OFFLOAD_BYTES, 256);
 }
 
 const DEFAULT_RESULT_POLICY: ResultPolicy = "auto";
@@ -283,14 +248,8 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   // force the agent to reread evidence. Pi's explicit/automatic session
   // compaction remains responsible for shortening accumulated history.
 
-  // ================================================================
-  // Fix 2: Intercept fabric_exec via tool_call hook
-  // ================================================================
-  //
-  // With strict or blockUnboundedReturns, the analyzer checks the program
-  // BEFORE it runs and blocks a passthrough (raw tool data returned with no
-  // processing). Otherwise nothing acts on the verdict, so analysis is skipped
-  // and the runtime boundary guard handles the actual result.
+  // Track each fabric_exec so tool_result can tell its final result from the
+  // nested results its program consumes.
 
   pi.on("tool_call", async (event, ctx) => {
     const handle = offloadedCalls.get(callKey(event.toolName, event.input));
@@ -319,27 +278,6 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         : undefined;
     if (!program || typeof program !== "string") return undefined;
 
-    const decision = cfg.strict === true || cfg.blockUnboundedReturns === true ? evaluateProgram(program, cfg) : undefined;
-
-    if (decision?.tier === "BLOCK") {
-      telemetry.record(ctx.cwd, {
-        strategy: "BLOCK",
-        tool: "fabric_exec",
-        sourceTokens: decision.analysis.metrics.estimatedSourceTokens ?? 0,
-        visibleTokens: Math.ceil(decision.guidance.length / 4),
-        mainTokensPrevented: decision.analysis.metrics.estimatedSourceTokens ?? 0,
-        mainTokensInjected: Math.ceil(decision.guidance.length / 4),
-        note: decision.analysis.reasons[0] ?? "static policy block",
-      });
-      return {
-        block: true,
-        reason: decision.guidance,
-      };
-    }
-
-    // PASS and WARN both execute; track the execution so tool_result can tell
-    // model-boundary results apart from intermediate ones. BLOCK does not
-    // execute, so it must not open a scope.
     fabricExecutions.start({
       toolCallId: event.toolCallId,
       workspaceRoot: ctx.cwd,
@@ -350,8 +288,8 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     return undefined;
   });
 
-  // A later extension can block a call after CE preflight. Always close any
-  // optimistic scope at lifecycle end even when no tool_result fired.
+  // A later extension can block the call after this hook. Always close the
+  // scope at lifecycle end even when no tool_result fired.
   pi.on("tool_execution_end", async (event) => {
     if (event.toolName !== "fabric_exec") return;
     fabricExecutions.finish(event.toolCallId);
@@ -370,9 +308,6 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   // This applies to both the built-in `read` tool and any tool whose
   // result is text content (including fabric_exec results that are large).
 
-  // Unified byte budgets: runtime default preserved at 16KB (~4K tokens ASCII-biased);
-  // static policy maxBytes (8KB) documented in quantitative-policy; policy.maxBytes unifies when set.
-  const READ_OFFLOAD_THRESHOLD = DEFAULT_RUNTIME_OFFLOAD_BYTES; // 16_384 bytes, ~4K tokens ASCII-biased
   const PREVIEW_BYTES = 2048;
   const ERROR_COMPACTION_THRESHOLD = 4096;
   const ERROR_COMPACTION_PREVIEW_BYTES = 4096;
@@ -420,11 +355,6 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           mainTokensPrevented: 0, mainTokensInjected: Math.ceil(textBytes / 4),
           note: "final result kept inline",
         });
-      }
-      const advisoryThreshold = cfg.runtimeAdvisoryThreshold ?? 0;
-      if (!event.isError && event.toolName === "fabric_exec" && advisoryThreshold > 0 && textBytes >= advisoryThreshold) {
-        const advisory = runtimeAdvisoryLine(textBytes);
-        return { content: event.content.map((item, index) => item.type === "text" && index === textBlocks[0].index ? { ...item, text: `${item.text}\n${advisory}` } : item), details: { ...existingDetails, ce_advisory: advisory } };
       }
       return undefined;
     }
@@ -694,16 +624,12 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         const cfg = configFor(ctx.cwd);
         message = JSON.stringify({
           enabled: cfg.enabled !== false,
-          strict: cfg.strict ?? false,
-          blockUnboundedReturns: cfg.strict === true || cfg.blockUnboundedReturns === true,
-          maxReturnTokens: cfg.maxReturnTokens ?? 4000,
           readOffloadThreshold: effectiveOffloadThreshold(cfg),
           warnings: configWarningsFor(ctx.cwd),
           nestedResultThreshold: null, // Deprecated: Fabric owns internal transport limits.
           resultPolicy: normalizeResultPolicy(cfg.resultPolicy),
           errorCompactionThreshold: boundedNumber(cfg.errorCompactionThreshold, ERROR_COMPACTION_THRESHOLD, 256),
           errorCompactionPreviewBytes: boundedNumber(cfg.errorCompactionPreviewBytes, ERROR_COMPACTION_PREVIEW_BYTES, 256, 64_000),
-          runtimeAdvisoryThreshold: cfg.runtimeAdvisoryThreshold ?? 0,
           offloadPreviewBytes: boundedNumber(cfg.offloadPreviewBytes, PREVIEW_BYTES, 256, 4096),
           compactStaleResults: false, // Legacy field: historical context is never rewritten.
           compactEditResults: cfg.compactEditResults !== false,
@@ -716,8 +642,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         const effectiveReadThreshold = effectiveOffloadThreshold(cfg);
         message = [
           "Context Engineer is the context governor above Fabric and Fovea.",
-          `The default runtime guard executes statically uncertain programs, keeps small results, and offloads actual ${effectiveReadThreshold}-byte+ boundary payloads (~${Math.ceil(effectiveReadThreshold / 4)} tokens ASCII-biased); policy.maxBytes unifies static/runtime byte budgets; resultPolicy controls inline/offload/summarize overrides.`,
-          "Set strict=true or blockUnboundedReturns=true for fail-closed preflight. Explicit scalar projections, bounded selections, summaries, and offloads pass silently.",
+          `Boundary results below ${effectiveReadThreshold} bytes (~${Math.ceil(effectiveReadThreshold / 4)} tokens ASCII-biased) stay inline; larger ones are offloaded to a readable handle. resultPolicy controls inline/offload/summarize overrides.`,
           "Results are compacted before first exposure; already-exposed offload and ctx_read messages stay unchanged to preserve cacheable prefixes. Use Pi session compaction for accumulated history.",
           "At the model boundary use ctx_read; inside fabric_exec use extensions.ctx_read.",
           "Use /ce status, /ce trace, /ce settings, or /ce status --all.",

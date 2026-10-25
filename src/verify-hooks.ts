@@ -189,6 +189,19 @@ for (const compactStaleResults of [true, false]) {
   checkHook(`legacy setting ${compactStaleResults}: settings reports effective false`, JSON.parse(settings).compactStaleResults === false);
 }
 
+for (const [label, config, expected] of [
+  ["removed settings", JSON.stringify({ strict: true, policy: { maxBytes: 1 } }), "Ignored removed settings: strict, policy. readOffloadThreshold sets the offload budget."],
+  ["non-object config", "null", "must contain a JSON object"],
+] as const) {
+  const configCwd = `/tmp/pi-ce-config-${label.replace(/\W/g, "-")}-${Date.now()}`;
+  mkdirSync(join(configCwd, ".pi"), { recursive: true });
+  writeFileSync(join(configCwd, ".pi", "context-engineer.json"), config);
+  let settings = "";
+  await registeredCommands.get("ce").handler("settings", { cwd: configCwd, ui: { notify: (text: string) => { settings = text; } } });
+  const parsed = JSON.parse(settings);
+  checkHook(`${label} surface as a settings warning`, parsed.warnings.some((warning: string) => warning.includes(expected)) && parsed.readOffloadThreshold === 16384);
+}
+
 // While a program runs, inner results are intermediate values consumed by
 // program code and must arrive byte-for-byte intact.
 await callHook("tool_call", { toolCallId: "fe1", toolName: "fabric_exec", input: { code: PROGRAM } });
@@ -297,37 +310,16 @@ const lateNested = await callHook("tool_result", {
 });
 checkHook("late Fabric-prefixed result remains an intermediate value", lateNested === undefined);
 
-const strictCwd = "/tmp/pi-ce-strict-" + Date.now();
-mkdirSync(join(strictCwd, ".pi"), { recursive: true });
-writeFileSync(join(strictCwd, ".pi", "context-engineer.json"), JSON.stringify({ strict: true }));
-const blocked = await callHook("tool_call", {
-  toolCallId: "strict-fe",
-  toolName: "fabric_exec",
-  input: { code: `const r = await pi.read({ path: "f" }); return r;` },
-}, strictCwd);
-checkHook("strict mode still blocks raw passthrough", blocked?.block === true);
-writeFileSync(join(strictCwd, ".pi", "context-engineer.json"), JSON.stringify({ strict: false }));
+const reloadCwd = "/tmp/pi-ce-reload-" + Date.now();
+mkdirSync(join(reloadCwd, ".pi"), { recursive: true });
+writeFileSync(join(reloadCwd, ".pi", "context-engineer.json"), JSON.stringify({ enabled: false }));
+const reloadEvent = (toolCallId: string) => ({ toolCallId, toolName: "bash", input: { cmd: "cat big" }, content: [{ type: "text", text: BIG }] });
+checkHook("disabled project config leaves boundary results alone", await callHook("tool_result", reloadEvent("reload-disabled"), reloadCwd) === undefined);
+writeFileSync(join(reloadCwd, ".pi", "context-engineer.json"), JSON.stringify({ enabled: true }));
 const futureMtime = new Date(Date.now() + 2000);
-utimesSync(join(strictCwd, ".pi", "context-engineer.json"), futureMtime, futureMtime);
-const afterConfigReload = await callHook("tool_call", {
-  toolCallId: "reloaded-fe",
-  toolName: "fabric_exec",
-  input: { code: `const r = await pi.read({ path: "f" }); return r;` },
-}, strictCwd);
-checkHook("updated project config applies without extension reload", afterConfigReload?.block !== true);
-await callHook("tool_result", {
-  toolCallId: "reloaded-fe",
-  toolName: "fabric_exec",
-  input: { code: `const r = await pi.read({ path: "f" }); return r;` },
-  content: [{ type: "text", text: "reloaded" }],
-}, strictCwd);
-const postBlock = await callHook("tool_result", {
-  toolCallId: "postblock1",
-  toolName: "bash",
-  input: { cmd: "cat big" },
-  content: [{ type: "text", text: BIG }],
-}, strictCwd);
-checkHook("strict block does not suppress later boundary offload", postBlock?.details?.ce_offloaded === true);
+utimesSync(join(reloadCwd, ".pi", "context-engineer.json"), futureMtime, futureMtime);
+const afterConfigReload = await callHook("tool_result", reloadEvent("reload-enabled"), reloadCwd);
+checkHook("updated project config applies without extension reload", afterConfigReload?.details?.ce_offloaded === true);
 
 // ---- Test ctx_read self-cap (recursive offload fix) ----
 
@@ -526,34 +518,9 @@ if (sumDef) {
   checkCtl("content still carries the full summary once", typeof sum.content?.[0]?.text === "string" && sum.content[0].text.length > 100);
 }
 
-// ---- Runtime advisory for heavy-but-below-threshold fabric_exec results ----
+// ---- Boundary policies ----
 
-console.log("\n=== Runtime Advisory ===\n");
-const adv1 = await callHook("tool_result", {
-  toolCallId: "adv1",
-  toolName: "fabric_exec",
-  input: { code: "return 1;" },
-  content: [{ type: "text", text: "m".repeat(5000) }],
-});
-checkCtl("default runtime advisory is silent", adv1 === undefined);
-
-const advisoryCwd = "/tmp/pi-ce-advisory-" + Date.now();
-mkdirSync(join(advisoryCwd, ".pi"), { recursive: true });
-writeFileSync(
-  join(advisoryCwd, ".pi", "context-engineer.json"),
-  JSON.stringify({ runtimeAdvisoryThreshold: 4096 }),
-);
-const configuredAdvisory = await callHook("tool_result", {
-  toolCallId: "adv-configured",
-  toolName: "fabric_exec",
-  input: { code: "return 1;" },
-  content: [{ type: "text", text: "m".repeat(5000) }],
-}, advisoryCwd);
-checkCtl(
-  "configured 4KB threshold adds a one-line advisory",
-  typeof configuredAdvisory?.details?.ce_advisory === "string" &&
-    String(configuredAdvisory?.content?.[0]?.text).includes("context-engineer"),
-);
+console.log("\n=== Boundary Policies ===\n");
 const adv2 = await callHook("tool_result", {
   toolCallId: "adv2",
   toolName: "fabric_exec",
@@ -567,10 +534,7 @@ const adv3 = await callHook("tool_result", {
   input: { code: "return 1;" },
   content: [{ type: "text", text: "b".repeat(20000) }],
 });
-checkCtl(
-  "8KB+ fabric_exec result still auto-offloads without double annotation",
-  adv3?.details?.ce_offloaded === true && adv3?.details?.ce_advisory === undefined,
-);
+checkCtl("large fabric_exec result auto-offloads", adv3?.details?.ce_offloaded === true);
 
 const errorLines = Array.from({ length: 420 }, (_, index) => `error TS${1000 + (index % 12)} at line ${index + 1}: malformed command diagnostic`);
 const compactedError = await callHook("tool_result", {

@@ -17,7 +17,7 @@ import { resolve } from "node:path";
 /** Note on a call repeated after its result was offloaded; see offloadFollowUp. */
 export const REPEATED_OFFLOADED_CALL_NOTE = "repeated a call whose result is already offloaded";
 
-export type ContextStrategy = "PASS" | "WARN" | "BLOCK" | "WRITE" | "SELECT" | "COMPRESS";
+export type ContextStrategy = "PASS" | "WRITE" | "SELECT" | "COMPRESS";
 export type TelemetryScope = "session" | "lifetime";
 
 export interface ContextEvent {
@@ -95,7 +95,7 @@ function safeNumber(value: unknown): number {
 }
 
 function isStrategy(value: unknown): value is ContextStrategy {
-  return typeof value === "string" && ["PASS", "WARN", "BLOCK", "WRITE", "SELECT", "COMPRESS"].includes(value);
+  return typeof value === "string" && ["PASS", "WRITE", "SELECT", "COMPRESS"].includes(value);
 }
 
 export class ContextTelemetry {

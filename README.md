@@ -10,25 +10,6 @@ The roles are deliberately separate:
 
 ## Features
 
-### Static data-flow gate
-
-With `strict` or `blockUnboundedReturns`, `fabric_exec` programs are analyzed before execution; `explainProgram` runs the same analysis on demand. TypeScript, which the analyzer parses with, loads on first analysis rather than at extension startup. Tool-originated values are tracked through aliases, destructuring, object/array construction, method chains, callbacks, local helper functions, `Promise.all`, and function arguments.
-
-The analyzer distinguishes:
-
-- `RAW` — direct or near-direct tool data
-- `ENCODED` — `String(raw)`, `JSON.stringify(raw)`, templates, and similar representations that still contain the payload
-- `UNKNOWN` — an untrusted helper received tainted data
-- `PROJECTED` — scalar fields, counts, keys, and field projections (only scalar projections are inherently bounded)
-- `SELECTED` — slices, filters, matches, and bounded Fovea results (only explicit bounds are safe)
-- `AGGREGATED` — reductions and scalar summaries
-- `COMPRESSED` — context summaries
-- `OFFLOADED` — disk handles
-
-Scalar projections, `some()`/`every()`/`includes()`, one-item selectors such as `find()`, explicit `slice(0, N)`, Fovea `maxTokens`, summaries, and offloads establish bounds. Numeric bounds survive aliases and local helper arguments, and common tool status fields such as `ok`, `exitCode`, and `truncated` are treated as scalars. `map()`, `filter()`, `reduce()`, `Object.entries()`/`values()`, `trim()`, and `replace()` can still retain the full source, so the analyzer marks them unbounded unless a later operation derives an explicit bound.
-
-By default CE skips static preflight, because nothing acts on an advisory verdict: programs run and the runtime boundary guard keeps a small actual result or offloads a large one. Use `explainProgram` when you want the static diagnostic explicitly. This avoids blocking useful work because of a conservative static approximation. Set `strict: true` or `blockUnboundedReturns: true` for fail-closed preflight. With `blockUnboundedReturns` alone, only hard blocks (statically unbounded source returns) stop a program. Fabric retains authoritative syntax/execution validation; only explicit strict/blocking settings turn CE diagnostics into pre-execution blocks. The number of internal calls is not the primary limit: a Fabric program may make many calls when its boundary result is controlled.
-
 ### Runtime boundary guard
 
 CE leaves **all** internal Fabric values intact: ordinary `pi.*` results, MCP results, captured Fovea/CE tools, and provider proxy `details.result`. Fabric owns its executor/transport limits. Explicit `ctx_offload` remains available when the program deliberately wants a handle.
@@ -40,8 +21,6 @@ Large final text results are offloaded; budgeted Fovea results that meet their r
 CE never rewrites grep patterns or other tool arguments. Fabric's catalog repairs handle argument/action naming near-misses; its entropy compiler optimizes tool surfaces. Neither requires CE to guess regex intent.
 
 Recognized successful edit envelopes containing verbose diff/patch strings are compacted from 2 KB onward, even below the ordinary offload threshold. The acknowledgment stays visible and the complete original diff/patch remains retrievable. This only changes model-boundary text, never ordinary intermediate Pi values. Set `compactEditResults: false` to disable the lower edit threshold, or `resultPolicy: "inline"` to bypass successful-result rewriting altogether.
-
-Runtime size advisories are disabled by default because bounded 4–8 KB results are usually intentional; set `runtimeAdvisoryThreshold` to opt in.
 
 ### Fovea-aware selection
 
@@ -59,28 +38,11 @@ return (await extensions.ctx_summarize({
 })).text;
 ```
 
-A Fovea call with `maxTokens` is classified as a budgeted `SELECT` operation. Context Engineer does not reproduce Fovea's code graph.
+CE leaves a Fovea result alone when it fits the `maxTokens` budget the call requested. Context Engineer does not reproduce Fovea's code graph.
 
 ### Fabric child agents
 
 When CE is enabled, each extension-enabled Fabric Pi child that loads CE adds `ctx_read` to its own captured-tool allowlist before Fabric initializes, so the child can read back what CE offloaded in it without the caller listing the helper. This repeats at every depth. Like Fabric's own `agents.childQuestionTools` grant, it is skipped for an explicit empty `tools` list and for `+name`/`-name` lists; a malformed allowlist fails closed. Where no read path exists (a withheld allowlist, or a Pi `--tools` list without `ctx_read`), CE keeps the result inline rather than returning a handle that cannot be read. Other CE and Fovea extension tools remain opt-in; an explicit `extensions: false`/`--no-extensions` request and non-Pi runners are still intentional opt-outs.
-
-### Context-effect registry (v0.5)
-
-The analyzer consumes a small exported registry describing how calls affect context:
-
-```ts
-import { contextEffectFor } from "pi-context-engineer";
-
-contextEffectFor("pi.read"); // { kind: "source" }
-contextEffectFor("extensions.ctx_read"); // SELECT bounded by length bytes
-contextEffectFor("extensions.ctx_summarize"); // COMPRESS bounded by maxTokens
-contextEffectFor("extensions.ctx_offload"); // OFFLOAD
-```
-
-Unregistered calls under `mcp.*`, `agents.*`, `workflow.*`, `state.*`, `memory.*`, `schema.*`, `mesh.*`, `council.*`, `rlm.*`, `fabric.*`, and direct shell/web tools are conservatively classified as source effects; exact CE/Fovea entries override that fallback.
-
-The registry remains descriptive, while the analyzer reports `metrics.returnBound`, `metrics.returnProvenance`, and an independent `metrics.quantitativeDecision`. Bounds distinguish exact values from proven upper bounds; the upper-bound algebra supports safe-integer `+`, `-`, `*`, `Math.min`, expression-level conditional joins, and `Math.max` when every operand is bounded. Conditional joins require both branches to be finite and use the larger branch bound; unsupported operations and control-flow assignment remain unknown. Quantitative policy defaults to 8192 bytes, 4000 tokens, and 8192 characters. Only bytes, tokens, and characters are directly comparable to those budgets; characters mean JavaScript UTF-16 code units (`String.length`), with no implicit byte/token conversion. Element and record bounds remain structural and are not used as context-size proofs. A within-budget proof additively clears only the legacy unbounded-return block; legacy-safe paths remain safe, while over-budget and not-comparable proofs remain blocked. Configure overrides in `.pi/context-engineer.json` with `policy.maxBytes`, `policy.maxTokens`, and `policy.maxCharacters`; each must be a non-negative safe integer no greater than 1,000,000,000. `explainProgram(source)` and `formatProgramExplanation(...)` expose the decision, budget, proven maximum, and result.
 
 ### Addressable context store
 
@@ -168,15 +130,11 @@ Create `.pi/context-engineer.json` in a project when needed:
 ```json
 {
   "enabled": true,
-  "strict": false,
-  "blockUnboundedReturns": false,
-  "maxReturnTokens": 4000,
   "readOffloadThreshold": 16384,
   "resultPolicy": "auto",
   "errorCompactionThreshold": 4096,
   "errorCompactionPreviewBytes": 4096,
   "offloadPreviewBytes": 2048,
-  "runtimeAdvisoryThreshold": 0,
   "compactEditResults": true,
   "notifyOnStart": false,
   "storeMaxBytes": 500000000,
@@ -191,21 +149,11 @@ All options live in `.pi/context-engineer.json` (field names are exact `CeConfig
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `true` | Set `false` to disable enforcement hooks. |
-| `strict` | boolean | `false` | Fail closed on statically unbounded source returns and soft warnings. |
-| `blockUnboundedReturns` | boolean | `false` | Block statically unbounded source returns before execution; `strict: true` implies blocking. |
-| `maxReturnTokens` | number | `4000` | Static advisory budget only; enforced by explicit strict/blocking modes. Maps to ~16 KB at ~4 chars/token (ASCII-biased). |
-| `maxUnprocessedToolCalls` | number | legacy | Accepted for older configs; data-flow reduction and observed context cost are primary. |
-| `quantitativePolicy` | object | `{maxBytes: 8192, maxTokens: 4000, maxCharacters: 8192}` | Single policy source for static preflight and runtime budgets. |
-| `policy` | object | alias | User-facing alias for `quantitativePolicy`; when both are set they are unified with `policy` as source. |
-| `quantitativePolicy.maxBytes` / `policy.maxBytes` | number (bytes) | `8192` | Static preflight budget; also unifies the runtime offload budget when `readOffloadThreshold` is unset (see `resolveRuntimeByteBudget`). Max 1,000,000,000. |
-| `quantitativePolicy.maxTokens` / `policy.maxTokens` | number | `4000` | Token budget for token-unit bounds. Max 1,000,000,000. |
-| `quantitativePolicy.maxCharacters` / `policy.maxCharacters` | number | `8192` | Character budget (UTF-16 code units). Max 1,000,000,000. |
-| `readOffloadThreshold` | number (bytes) | `16384` | Runtime auto-offload budget; wins over `policy.maxBytes` when set. Clamped to 256–1,000,000,000; clamps surface via `/ce settings` warnings. |
+| `readOffloadThreshold` | number (bytes) | `16384` | Offload budget for boundary text results. Clamped to 256–1,000,000,000; clamps surface via `/ce settings` warnings. |
 | `resultPolicy` | `"auto" \| "inline" \| "offload" \| "summarize"` | `"auto"` | `auto` previews/offloads by threshold; `inline` preserves all results (including errors); `offload` forces handles for successful results; `summarize` uses threshold-based deterministic structural compression with exact recovery (no model call). |
 | `errorCompactionThreshold` | number (bytes) | `4096` | Model-boundary errors at/above this size are compacted (min 256). |
 | `errorCompactionPreviewBytes` | number (bytes) | `4096` | Visible budget retained by a compacted error, including the recovery recipe (256–64,000). |
 | `offloadPreviewBytes` | number (bytes) | `2048` | Structural first-use handle preview budget (256–4,096). |
-| `runtimeAdvisoryThreshold` | number (bytes) | `0` | Fabric boundary results at/above this size get a one-line advisory; `0` disables nudges. |
 | `compactEditResults` | boolean | `true` | Compact recognized verbose 2 KB+ successful edit envelopes (diff/patch) into an acknowledgment + recovery handle. Set `false` to keep them inline. |
 | `notifyOnStart` | boolean | `false` | Opt into the session-start toast. |
 | `storeMaxBytes` | number (bytes) | `500000000` | Transient store cap; cannot exceed 500 MB. Newest write is never evicted; over-budget writes evict oldest first (LRU) after TTL sweep. |
@@ -217,7 +165,7 @@ Bad JSON in `.pi/context-engineer.json` does not throw: defaults load and a warn
 
 ### Bytes vs tokens
 
-Prefer byte budgets. Static preflight defaults to 8 KB (`quantitativePolicy.maxBytes`) while the runtime auto-offload default is 16 KB (`readOffloadThreshold` / `DEFAULT_RUNTIME_OFFLOAD_BYTES`) because static estimates are conservative upper bounds and runtime measures actual UTF-8 bytes. Token equivalents are heuristic: ~4 chars/token, so 16 KB ≈ 4,000 tokens for ASCII. Multibyte UTF-8 inflates bytes faster than the heuristic implies, and boundary messages report bytes with the ASCII-biased token estimate in parentheses. Invalid `policy` objects are ignored with a `/ce settings` warning; per-budget maximum is 1,000,000,000.
+Prefer byte budgets. The offload default is 16 KB of actual UTF-8 bytes. Token equivalents are heuristic: ~4 chars/token, so 16 KB ≈ 4,000 tokens for ASCII. Multibyte UTF-8 inflates bytes faster than the heuristic implies, and boundary messages report bytes with the ASCII-biased token estimate in parentheses.
 
 ### Selection and compression notes
 
@@ -226,11 +174,9 @@ Prefer byte budgets. Static preflight defaults to 8 KB (`quantitativePolicy.maxB
 
 Project configuration is re-read when the file's modification time changes, so tuning does not require an extension reload. `/ce settings` shows effective values, including defaults.
 
-- `strict` or `blockUnboundedReturns` restores fail-closed static enforcement.
 - `resultPolicy` is `auto` (threshold-based previews), `inline` (never rewrite boundary results, including errors), `offload` (force addressable handles for successful results), or `summarize` (threshold-based deterministic structural summaries with recovery handles; no child model call). `ctx_read` remains exempt from successful-result offloading to prevent recursive handles.
 - `errorCompactionThreshold` and `errorCompactionPreviewBytes` bound oversized model-facing errors, including the recovery recipe in the visible budget. Full original diagnostics are stored first; nested Fabric errors remain untouched.
 - `nestedResultThreshold` is deprecated and ignored (effective value `null`): Fabric owns its internal transport limits. CE never substitutes handles for internal provider values.
-- `runtimeAdvisoryThreshold: 0` disables repetitive size nudges; use a positive byte threshold to opt in.
 - `compactStaleResults` is deprecated and ignored (effective value `false`, even in older configs that set it to `true`). CE never shortens already-exposed messages; use Pi session compaction to reduce accumulated history.
 - `compactEditResults` (default `true`) additionally offloads recognized successful 2 KB+ edit envelopes containing a verbose diff/patch. Set it to `false` to keep those results inline below the normal threshold. `resultPolicy: "inline"` still bypasses all successful-result rewriting.
 - `notifyOnStart` controls the session-start toast, which is off by default.
@@ -282,24 +228,14 @@ npm ci
 npm test
 ```
 
-The test suite includes more than 50 static data-flow cases plus live hook probes covering:
+`npm test` builds the extension and runs live hook probes covering:
 
-- aliases, destructuring, scalar result fields, numeric bounds passed through local helpers, and paging metadata
-- `String`/`JSON.stringify` false reductions
-- unknown helper arguments
-- callback projections and identity maps
-- `Promise.all`
-- bounded and unbounded Fovea calls
-- nested Fabric provider proxies
-- intermediate-result preservation, including large MCP/Fovea/CE provider proxies under every result policy
-- automatic final offload, prefix-stable previews across retries and branches, legacy config compatibility, serialized `ctx_read` envelope caps, and bounded query work
-- runtime-first versus strict preflight and deterministic `ctx_summarize` modes
-- content deduplication, UTF-8 ranges, unchanged grep inputs (including valid ripgrep-only regex syntax), and lossless multi-text/error recovery
-- generated adversarial transformations for aliases, destructuring, callbacks, async wrappers, computed access, loops, and Promise aggregates
-- the explicit `src/context-effects.ts` registry used by the analyzer for source/select/compress/offload policy metadata, including current providers and PowerShell/process tools
-- JSON-path handle selection, structural previews, oversized error compaction, explicit result policies, and cross-runtime telemetry scopes
-
-Run the generated adversarial suite directly with the normal `npm test` command. It fails closed when an unsafe transformation is classified as safe.
+- boundary offload of single and multi-block text, media positions, storage failure, and prefix-stable previews across retries and branches
+- intermediate Fabric results, including large provider proxies, left byte-for-byte intact
+- `ctx_read` ranges, queries, sections, JSON paths, UTF-8 boundaries, and its serialized-envelope cap
+- deterministic `ctx_summarize` modes, error compaction, edit-diff compaction, and result policies
+- the Fabric child `ctx_read` grant, inline fallback without a read path, and Pi's native tool error contract
+- telemetry scopes, legacy event files, and offload follow-up accounting
 
 ## Real Pi/Fabric smoke test
 

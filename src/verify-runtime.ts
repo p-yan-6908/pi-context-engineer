@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import * as extension from "./index.js";
 import { ContextStore } from "./store.js";
-import { evaluateProgram, wrappedExec } from "./wrapper.js";
 
 const root = mkdtempSync(join(tmpdir(), "ce-runtime-"));
 let checks = 0;
@@ -41,20 +40,6 @@ try {
       assert.deepEqual(call, original); checks++;
     }
   }
-  const programs = [
-    'const r = await extensions.ctx_read({ id: "test", length: 100 }); return r.details.result.id;',
-    `return ${JSON.stringify("x".repeat(30000))};`,
-    'const r = await pi.read("file"); return r;',
-  ];
-  for (const program of programs) {
-    check("default preflight never blocks return estimates", evaluateProgram(program).tier !== "BLOCK");
-    check("strict mode remains explicit", evaluateProgram(program, { strict: true }).tier === "BLOCK");
-    check("legacy explicit blocking remains effective", evaluateProgram(program, { blockUnboundedReturns: true }).tier === "BLOCK");
-  }
-  let ran = false;
-  const executed = await wrappedExec(programs[0], async () => { ran = true; return "small-id"; });
-  check("zero-source projection really executes", ran && executed.result === "small-id");
-
   for (const policy of ["auto", "inline", "offload", "summarize"]) {
     const scoped = workspace({ resultPolicy: policy, nestedResultThreshold: 256 });
     for (const toolName of ["mcp.test.fetch", "extensions.ctx_read", "extensions.fovea_focus"]) {

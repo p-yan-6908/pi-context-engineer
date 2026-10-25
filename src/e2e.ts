@@ -9,14 +9,11 @@ export interface SmokeScenario {
   name: string;
   program: string;
   prompt: string;
-  strict?: boolean;
   assert: (answer: string, results: any[], workspace: string) => boolean;
 }
 
 const readCommand = `node -e 'process.stdout.write("x".repeat(5000) + "E2E-READ-MARKER" + "x".repeat(15000))'`;
 const readProgram = `const raw = await pi.bash({ cmd: ${JSON.stringify(readCommand)} }); return raw;`;
-const policyProgram = `const raw = await pi.bash({ cmd: "printf 100000" }); const limit = Math.min(Number(raw.output), 3000); return { marker: "E2E-POLICY-ALLOW", limit };`;
-const blockedProgram = `return await pi.bash({ cmd: "touch blocked-sentinel" });`;
 
 export const smokeScenarios: SmokeScenario[] = [
   {
@@ -25,19 +22,6 @@ export const smokeScenarios: SmokeScenario[] = [
     prompt: `Run this code in fabric_exec: ${readProgram} Then use another fabric_exec call with extensions.ctx_read and the returned handle to locate the marker in the stored payload. Return the recovered marker and state that recovery succeeded. Additional bounded reads are allowed.`,
     assert: (answer, results) => answer.includes("E2E-READ-MARKER") && /recover/i.test(answer) &&
       results.some(result => result.details?.ce_offloaded === true) && results.filter(result => result.isError !== true).length >= 2,
-  },
-  {
-    name: "small numeric projection executes under runtime-first policy",
-    program: policyProgram,
-    prompt: `Run this code in fabric_exec: ${policyProgram} Report the returned marker and limit.`,
-    assert: (answer, results) => answer.includes("E2E-POLICY-ALLOW") && /3000/.test(answer) && results.some(result => result.isError !== true),
-  },
-  {
-    name: "explicit strict preflight blocks before side effects",
-    program: blockedProgram,
-    strict: true,
-    prompt: `This isolated workspace explicitly enables CE strict mode. Request this exact code in fabric_exec once: ${blockedProgram} Do not change the program, config, or try an alternative when it is blocked. Report that the operation was blocked and did not execute.`,
-    assert: (answer, results, workspace) => /block/i.test(answer) && results.some(result => result.isError === true) && !existsSync(join(workspace, "blocked-sentinel")),
   },
 ];
 
@@ -64,7 +48,7 @@ export function runSmokeTests(): void {
     const workspace = mkdtempSync(join(tmpdir(), "ce-smoke-"));
     try {
       mkdirSync(join(workspace, ".pi"));
-      writeFileSync(join(workspace, ".pi/context-engineer.json"), JSON.stringify({ strict: scenario.strict ?? false, notifyOnStart: false }));
+      writeFileSync(join(workspace, ".pi/context-engineer.json"), JSON.stringify({ notifyOnStart: false }));
       const result = spawnSync(process.env.PI_BIN ?? "pi", [
         "--model", process.env.PI_MODEL, "--no-extensions", "--no-skills", "--no-context-files",
         "--no-prompt-templates", "--no-themes", "--no-approve", "--print", "--mode", "json", "--no-session",

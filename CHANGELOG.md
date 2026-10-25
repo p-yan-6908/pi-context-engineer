@@ -4,6 +4,7 @@
 
 ### Removed
 
+- The static preflight analyzer: `strict`, `blockUnboundedReturns`, `explainProgram`, and the context-effect registry and quantitative-policy exports. It could only block a program before it ran, 0.6.0 had already made it advisory by default, and no recorded configuration enabled it; the runtime boundary bounds every actual result. The opt-in runtime size advisory goes with it. CE no longer depends on TypeScript at runtime, and `/ce settings` warns about a config that still sets a removed key.
 - `ctx_remember`, `ctx_recall` and `ctx_forget`, with their persistent memory store. None was called in 295 recorded Pi sessions; Fabric's `memory` provider already recalls session history.
 - `ctx_delegate`, `ctx_summarize` `mode: "model"`, and the child Pi runner, generation-budget extension and Usage accounting they shared. Each tool was called five times across those sessions, mostly as probes, and Fabric's `agents.run` delegates with a fresh context.
 - The `ctx_status` and `ce_exec` tools. `/ce status` and `/ce settings` report the same telemetry and policy to the user, and models called `ctx_status` mostly to inspect CE itself. Telemetry drops its per-runtime scope and child-usage fields.
@@ -15,11 +16,6 @@
 - A `fabric_exec` program that reads handles and still overflows gets a narrowing hint, detected from the program source (idea from #4 by @e4779).
 - `ctx_read` gained `section` mode for Fabric sectioned results; `offset`/`length` page within the section.
 - Rewrote the skill as an operational playbook (#1 by @e4779), correcting handle lifetime (workspace store, not session-scoped) and the jsonPath dialect (no wildcards or slices).
-
-### Startup and preflight cost
-
-- Default mode no longer runs static analysis on every `fabric_exec`; its advisory verdict was discarded. Analysis runs with `strict`/`blockUnboundedReturns` and `explainProgram`.
-- The analyzer loads TypeScript on first use, cutting CE import time from roughly 300 ms to 90 ms on a local machine; every Pi session and Fabric child that loads CE pays this.
 
 ### Offload follow-up telemetry
 
