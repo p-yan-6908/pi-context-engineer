@@ -106,7 +106,7 @@ aggregate in-guest and return a digest.
 
 ```ts
 const h = await extensions.ctx_offload({ key: "api-response", source: "mcp", data: txt });
-const first = await extensions.ctx_read({ id: h.id, jsonPath: "$.items[0].name" });
+const first = await extensions.ctx_read({ id: h.details.id, jsonPath: "$.items[0].name" });
 ```
 
 **R3 — `ctx_summarize` with deterministic modes.** `structural` and `code` are

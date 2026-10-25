@@ -186,7 +186,7 @@ for (const compactStaleResults of [true, false]) {
   await checkStableContextPrefix(`legacy compactStaleResults=${compactStaleResults}`, [addressableMessage], legacyCwd);
   let settings = "";
   await registeredCommands.get("ce").handler("settings", { cwd: legacyCwd, ui: { notify: (text: string) => { settings = text; } } });
-  checkHook(`legacy setting ${compactStaleResults}: settings reports effective false`, JSON.parse(settings).compactStaleResults === false);
+  checkHook(`legacy setting ${compactStaleResults}: settings flags it as removed`, JSON.parse(settings).warnings.some((warning: string) => warning.includes("compactStaleResults")));
 }
 
 for (const [label, config, expected] of [
@@ -551,40 +551,6 @@ checkHook(
     String(compactedError.content?.[0]?.text).includes("Error output compacted"),
 );
 
-const inlineCwd = "/tmp/pi-ce-inline-" + Date.now();
-mkdirSync(join(inlineCwd, ".pi"), { recursive: true });
-writeFileSync(join(inlineCwd, ".pi", "context-engineer.json"), JSON.stringify({ resultPolicy: "inline" }));
-const inlineResult = await callHook("tool_result", {
-  toolCallId: "inline-boundary",
-  toolName: "bash",
-  input: { cmd: "cat huge" },
-  content: [{ type: "text", text: BIG }],
-}, inlineCwd);
-checkHook("explicit inline policy preserves a large success result", inlineResult === undefined);
-
-const forcedOffloadCwd = "/tmp/pi-ce-force-offload-" + Date.now();
-mkdirSync(join(forcedOffloadCwd, ".pi"), { recursive: true });
-writeFileSync(join(forcedOffloadCwd, ".pi", "context-engineer.json"), JSON.stringify({ resultPolicy: "offload" }));
-const forcedOffload = await callHook("tool_result", {
-  toolCallId: "forced-offload",
-  toolName: "bash",
-  input: { cmd: "printf small" },
-  content: [{ type: "text", text: "small but explicitly addressable" }],
-}, forcedOffloadCwd);
-checkHook("explicit offload policy handles a small success result", forcedOffload?.details?.ce_offloaded === true && String(forcedOffload?.content?.[0]?.text).includes("ctx_read({ id:"));
-
-const summarizeCwd = "/tmp/pi-ce-summarize-" + Date.now();
-mkdirSync(join(summarizeCwd, ".pi"), { recursive: true });
-writeFileSync(join(summarizeCwd, ".pi", "context-engineer.json"), JSON.stringify({ resultPolicy: "summarize" }));
-const oversizedJson = JSON.stringify({ items: Array.from({ length: 6000 }, (_, index) => ({ id: index, ok: index % 2 === 0 })) });
-const summarizedResult = await callHook("tool_result", {
-  toolCallId: "summarize-boundary",
-  toolName: "bash",
-  input: { cmd: "emit-json" },
-  content: [{ type: "text", text: oversizedJson }],
-}, summarizeCwd);
-checkHook("explicit summarize policy returns a structural JSON handle", summarizedResult?.details?.ce_offloaded === true && String(summarizedResult?.content?.[0]?.text).includes("JSON object") && String(summarizedResult?.content?.[0]?.text).includes("ctx_read({ id:"));
-
 // ---- Compact acknowledgments and mixed-result previews ----
 console.log("\n=== Boundary UX ===\n");
 for (const [format, text] of [["json", editJson], ["yaml", editYaml]]) {
@@ -598,8 +564,6 @@ for (const [format, text] of [["json", editJson], ["yaml", editYaml]]) {
   checkHook(`${format} complete original diff/patch remains retrievable`, JSON.parse(stored.content).textBlocks[0].text === text);
   const inner = await callHook("tool_result", { ...event, toolCallId: `fabric_ack-inner-${format}`, toolName: "edit" });
   checkHook(`${format} ordinary nested Pi result remains byte-for-byte untouched`, inner === undefined);
-  const inline = await callHook("tool_result", event, inlineCwd);
-  checkHook(`${format} inline escape hatch preserves verbose acknowledgments`, inline === undefined);
 }
 const noCompactCwd = "/tmp/pi-ce-no-edit-compact-" + Date.now();
 mkdirSync(join(noCompactCwd, ".pi"), { recursive: true });

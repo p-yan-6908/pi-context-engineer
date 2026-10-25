@@ -4,6 +4,7 @@
 
 ### Removed
 
+- `resultPolicy` (`inline`, `offload`, `summarize`) and the deprecated `compactStaleResults` and `nestedResultThreshold` keys. No recorded configuration set them, and `enabled: false` covers the inline case. The `/ce explain` command, which restated the README, is gone too.
 - The static preflight analyzer: `strict`, `blockUnboundedReturns`, `explainProgram`, and the context-effect registry and quantitative-policy exports. It could only block a program before it ran, 0.6.0 had already made it advisory by default, and no recorded configuration enabled it; the runtime boundary bounds every actual result. The opt-in runtime size advisory goes with it. CE no longer depends on TypeScript at runtime, and `/ce settings` warns about a config that still sets a removed key.
 - `ctx_remember`, `ctx_recall` and `ctx_forget`, with their persistent memory store. None was called in 295 recorded Pi sessions; Fabric's `memory` provider already recalls session history.
 - `ctx_delegate`, `ctx_summarize` `mode: "model"`, and the child Pi runner, generation-budget extension and Usage accounting they shared. Each tool was called five times across those sessions, mostly as probes, and Fabric's `agents.run` delegates with a fresh context.
@@ -15,7 +16,7 @@
 - The offload notice leads with copyable `ctx_read` calls, offers only the modes the payload supports (`section` with a real section name, `jsonPath` only for JSON), and tells the model to read the handle rather than re-run the call (based on #3 by @e4779).
 - A `fabric_exec` program that reads handles and still overflows gets a narrowing hint, detected from the program source (idea from #4 by @e4779).
 - `ctx_read` gained `section` mode for Fabric sectioned results; `offset`/`length` page within the section.
-- Rewrote the skill as an operational playbook (#1 by @e4779), correcting handle lifetime (workspace store, not session-scoped) and the jsonPath dialect (no wildcards or slices).
+- Rewrote the skill as an operational playbook (#1 by @e4779), correcting handle lifetime (workspace store, not session-scoped), the jsonPath dialect (no wildcards or slices), and where `ctx_offload` returns its handle (`details.id`).
 
 ### Offload follow-up telemetry
 

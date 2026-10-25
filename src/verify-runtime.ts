@@ -40,8 +40,8 @@ try {
       assert.deepEqual(call, original); checks++;
     }
   }
-  for (const policy of ["auto", "inline", "offload", "summarize"]) {
-    const scoped = workspace({ resultPolicy: policy, nestedResultThreshold: 256 });
+  {
+    const scoped = workspace();
     for (const toolName of ["mcp.test.fetch", "extensions.ctx_read", "extensions.fovea_focus"]) {
       const value = { rows: [{ id: 7, text: large }], exact: 123n };
       const nested = event([{ type: "text", text: large }], {
@@ -49,7 +49,7 @@ try {
         details: { kind: "pi-fabric.tool-result-proxy.v1", ref: toolName, result: value },
       });
       const original = structuredClone(nested);
-      check(`${policy}: nested ${toolName} unchanged`, await hook("tool_result", nested, scoped) === undefined);
+      check(`nested ${toolName} unchanged`, await hook("tool_result", nested, scoped) === undefined);
       assert.deepEqual(nested, original); checks++;
       check("consumer still maps rows", nested.details.result.rows.map((row: any) => row.id).join() === "7");
     }
@@ -84,20 +84,7 @@ try {
       check("error recovery preserves every diagnostic", content.length === 1 ? readBack(scoped, err) === large : JSON.parse(readBack(scoped, err)).textBlocks[1].text === large);
     }
   }
-  const source = JSON.stringify({ items: Array.from({ length: 3000 }, (_, i) => ({ id: i })), important: "keep-me" });
-  const summarizedCwd = workspace({ resultPolicy: "summarize" });
-  const summary = await hook("tool_result", event([{ type: "text", text: source }]), summarizedCwd);
-  check("summary policy actually summarizes", summary?.details.ce_summarized && summary.content[0].text.includes("Structural summary:") && summary.content[0].text.includes("Array(3000)"));
-  check("summary original is losslessly addressable", readBack(summarizedCwd, summary) === source);
-  check("summary policy leaves small results alone", await hook("tool_result", event([{ type: "text", text: "small" }]), summarizedCwd) === undefined);
-  const auto = await hook("tool_result", event([{ type: "text", text: source }]), cwd);
-  check("summary and auto are distinct", !auto.details.ce_summarized && auto.content[0].text !== summary.content[0].text);
-
-  const inline = workspace({ resultPolicy: "inline" });
-  for (const isError of [false, true]) check("inline is lossless for all blocks", await hook("tool_result", event(blocks, { isError }), inline) === undefined);
-  const force = workspace({ resultPolicy: "offload" });
-  check("forced offload still works", (await hook("tool_result", event([{ type: "text", text: "small" }]), force))?.details.ce_offloaded);
-  check("ctx_read avoids recursive offload", await hook("tool_result", event([{ type: "text", text: large }], { toolName: "ctx_read" }), force) === undefined);
+  check("ctx_read avoids recursive offload", await hook("tool_result", event([{ type: "text", text: large }], { toolName: "ctx_read" }), cwd) === undefined);
   const brokenStore = workspace();
   writeFileSync(join(brokenStore, ".pi/context-store"), "not a directory");
   check("storage failure keeps original success", await hook("tool_result", event(blocks), brokenStore) === undefined);

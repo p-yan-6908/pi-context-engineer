@@ -15,32 +15,24 @@ import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ContextStore, DEFAULT_CONTEXT_STORE_TTL_MS, MAX_CONTEXT_STORE_BYTES } from "./store.js";
 import { compactErrorOutput, fabricSectionNames, isVerboseEditAcknowledgement, structuralPreview, type PreviewContentType } from "./preview.js";
-import { ceTools, isErrorResult, summarizeText, type ToolContext } from "./tools.js";
+import { ceTools, isErrorResult, type ToolContext } from "./tools.js";
 import { enableFabricContextReadForChild, FABRIC_CONTEXT_READ_TOOL } from "./compat/fabric.js";
 import { ContextTelemetry, REPEATED_OFFLOADED_CALL_NOTE } from "./telemetry.js";
 import { FabricExecutionScopes } from "./execution-scope.js";
 // ---- Config ----
 
-export type ResultPolicy = "auto" | "inline" | "offload" | "summarize";
-
 interface CeConfig {
   enabled?: boolean;
   /** UTF-8 bytes before text results are auto-offloaded. Default: 16384. */
   readOffloadThreshold?: number;
-  /** Automatic boundary behavior: auto, inline, offload, or summarize. Default: auto. */
-  resultPolicy?: ResultPolicy;
   /** UTF-8 bytes before a model-boundary error is compacted. Default: 4096. */
   errorCompactionThreshold?: number;
   /** Maximum UTF-8 bytes retained by a compacted error. Default: 4096. */
   errorCompactionPreviewBytes?: number;
-  /** @deprecated Accepted but ignored. Previously exposed messages stay prefix-stable. */
-  compactStaleResults?: boolean;
   /** Compact successful 2 KB+ edit envelopes while keeping their exact output addressable. */
   compactEditResults?: boolean;
   /** Show an activation notification at each session start. Default: false. */
   notifyOnStart?: boolean;
-  /** @deprecated Ignored: internal Fabric provider values are never rewritten. */
-  nestedResultThreshold?: number;
   /** UTF-8 preview budget retained in an offload handle message. Default: 2048. */
   offloadPreviewBytes?: number;
   /** Optional maximum bytes retained by the context store. */
@@ -50,7 +42,10 @@ interface CeConfig {
 }
 
 /** Settings earlier versions read. Reported so a stale config is not silently ignored. */
-const REMOVED_CONFIG_KEYS = ["strict", "blockUnboundedReturns", "maxReturnTokens", "maxUnprocessedToolCalls", "quantitativePolicy", "policy", "runtimeAdvisoryThreshold"];
+const REMOVED_CONFIG_KEYS = [
+  "strict", "blockUnboundedReturns", "maxReturnTokens", "maxUnprocessedToolCalls", "quantitativePolicy", "policy",
+  "runtimeAdvisoryThreshold", "resultPolicy", "compactStaleResults", "nestedResultThreshold",
+];
 
 function loadConfig(cwd: string): CeConfig {
   return loadConfigWithWarnings(cwd).config;
@@ -108,15 +103,6 @@ const DEFAULT_OFFLOAD_BYTES = 16_384;
 
 function effectiveOffloadThreshold(cfg: CeConfig): number {
   return boundedNumber(cfg.readOffloadThreshold, DEFAULT_OFFLOAD_BYTES, 256);
-}
-
-const DEFAULT_RESULT_POLICY: ResultPolicy = "auto";
-const RESULT_POLICIES = new Set<ResultPolicy>(["auto", "inline", "offload", "summarize"]);
-
-function normalizeResultPolicy(value: unknown): ResultPolicy {
-  return typeof value === "string" && RESULT_POLICIES.has(value as ResultPolicy)
-    ? value as ResultPolicy
-    : DEFAULT_RESULT_POLICY;
 }
 
 function boundedNumber(value: unknown, fallback: number, minimum = 0, maximum = 1_000_000_000): number {
@@ -296,17 +282,9 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     handleReadingCalls.delete(event.toolCallId);
   });
 
-  // ================================================================
-  // Fix 4: Auto-offload large text results via tool_result hook
-  // ================================================================
-  //
-  // When a text result exceeds the threshold, offload the full content to
-  // disk and replace the in-context result with a handle
-  // + preview. The model can use ctx_read to inspect the full content
-  // later without re-reading the file.
-  //
-  // This applies to both the built-in `read` tool and any tool whose
-  // result is text content (including fabric_exec results that are large).
+  // A model-boundary text result over the threshold is stored and replaced
+  // by a handle and preview that ctx_read can expand. This covers any tool,
+  // including the final result of fabric_exec.
 
   const PREVIEW_BYTES = 2048;
   const ERROR_COMPACTION_THRESHOLD = 4096;
@@ -322,8 +300,6 @@ export default function contextEngineer(pi: ExtensionAPI): void {
 
     const cfg = configFor(ctx.cwd);
     if (cfg.enabled === false) return undefined;
-    const resultPolicy = normalizeResultPolicy(cfg.resultPolicy);
-    if (resultPolicy === "inline") return undefined;
 
     const textBlocks = event.content.flatMap((item, index) =>
       item.type === "text" ? [{ index, text: item.text }] : []);
@@ -346,9 +322,8 @@ export default function contextEngineer(pi: ExtensionAPI): void {
       textBlocks.some((block) => isVerboseEditAcknowledgement(block.text));
 
     if (event.isError ? textBytes < errorThreshold :
-      alreadyOffloaded || event.toolName === "ctx_read" ||
-      (resultPolicy === "auto" && providerBounded) ||
-      (resultPolicy !== "offload" && !compactEditAck && textBytes < threshold)) {
+      alreadyOffloaded || event.toolName === "ctx_read" || providerBounded ||
+      (!compactEditAck && textBytes < threshold)) {
       if (event.toolName === "fabric_exec" && textBytes >= 1024) {
         telemetry.record(ctx.cwd, {
           strategy: "PASS", tool: event.toolName, sourceBytes: textBytes, visibleBytes: textBytes,
@@ -380,14 +355,10 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     }
     const recovery = `Full original ${textBlocks.length === 1 ? "text" : "text blocks (with original indices)"}: ${readRecipe(offloaded.id, surface)}`;
     let replacement: string;
-    const compressed = event.isError || resultPolicy === "summarize";
     if (event.isError) {
       // Reserve room for the recovery recipe inside the configured budget.
       const remaining = errorBudget - Buffer.byteLength(recovery, "utf8") - 1;
       replacement = `${remaining > 0 ? compactErrorOutput(diagnosticText, remaining) + "\n" : ""}${recovery}`;
-    } else if (resultPolicy === "summarize") {
-      const summary = JSON.stringify(summarizeText(payload, Math.floor(previewBytes / 4)));
-      replacement = `Structural summary:\n${structuralPreview(summary, previewBytes)}\n${recovery}`;
     } else {
       replacement = formatHandleText(offloaded.id, offloaded.bytes, offloaded.estimatedTokens, payload, previewBytes, surface, offloaded.contentType, readsHandles);
     }
@@ -414,12 +385,11 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     const sourceTokens = Math.ceil(textBytes / 4);
     const visibleTokens = Math.ceil(visibleBytes / 4);
     telemetry.record(ctx.cwd, {
-      strategy: compressed ? "COMPRESS" : "WRITE", tool: event.toolName,
+      strategy: event.isError ? "COMPRESS" : "WRITE", tool: event.toolName,
       sourceBytes: textBytes, visibleBytes, mainTokensPrevented: Math.max(0, sourceTokens - visibleTokens),
       mainTokensInjected: visibleTokens, storeTokensWritten: offloaded.estimatedTokens, handle: offloaded.id,
-      note: event.isError ? "error compacted with exact recovery" : resultPolicy === "summarize"
-        ? "structural boundary summary with exact recovery" : compactEditAck
-          ? "verbose successful edit acknowledgement offloaded" : "large final text result offloaded",
+      note: event.isError ? "error compacted with exact recovery" : compactEditAck
+        ? "verbose successful edit acknowledgement offloaded" : "large final text result offloaded",
     });
     if (!event.isError) rememberOffloadedCall(event.toolName, input, offloaded.id);
     // Details are rendering/state data in native Pi and program data in Fabric.
@@ -430,11 +400,10 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         ...existingDetails,
         ce_offloaded: true, ce_handle: offloaded.id, ce_content_type: offloaded.contentType,
         ce_original_bytes: textBytes, ce_original_tokens: sourceTokens,
-        ce_return_policy: resultPolicy, ce_saved_tokens: Math.max(0, sourceTokens - visibleTokens),
+        ce_saved_tokens: Math.max(0, sourceTokens - visibleTokens),
         ...(textBlocks.length > 1 ? { ce_text_blocks: textBlocks.length } : {}),
         ...(event.isError ? { ce_error_compacted: true, ce_error_original_bytes: textBytes,
           ce_error_original_tokens: sourceTokens, ce_error_compacted_bytes: visibleBytes } : {}),
-        ...(!event.isError && resultPolicy === "summarize" ? { ce_summarized: true } : {}),
         ...(!event.isError && compactEditAck ? { ce_compacted_edit_ack: true } : {}),
       },
     };
@@ -626,32 +595,19 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           enabled: cfg.enabled !== false,
           readOffloadThreshold: effectiveOffloadThreshold(cfg),
           warnings: configWarningsFor(ctx.cwd),
-          nestedResultThreshold: null, // Deprecated: Fabric owns internal transport limits.
-          resultPolicy: normalizeResultPolicy(cfg.resultPolicy),
           errorCompactionThreshold: boundedNumber(cfg.errorCompactionThreshold, ERROR_COMPACTION_THRESHOLD, 256),
           errorCompactionPreviewBytes: boundedNumber(cfg.errorCompactionPreviewBytes, ERROR_COMPACTION_PREVIEW_BYTES, 256, 64_000),
           offloadPreviewBytes: boundedNumber(cfg.offloadPreviewBytes, PREVIEW_BYTES, 256, 4096),
-          compactStaleResults: false, // Legacy field: historical context is never rewritten.
           compactEditResults: cfg.compactEditResults !== false,
           notifyOnStart: cfg.notifyOnStart === true,
           storeMaxBytes: Math.min(MAX_CONTEXT_STORE_BYTES, cfg.storeMaxBytes ?? MAX_CONTEXT_STORE_BYTES),
           storeTtlMs: cfg.storeTtlMs ?? DEFAULT_CONTEXT_STORE_TTL_MS,
         }, null, 2);
-      } else if (command === "explain") {
-        const cfg = configFor(ctx.cwd);
-        const effectiveReadThreshold = effectiveOffloadThreshold(cfg);
-        message = [
-          "Context Engineer is the context governor above Fabric and Fovea.",
-          `Boundary results below ${effectiveReadThreshold} bytes (~${Math.ceil(effectiveReadThreshold / 4)} tokens ASCII-biased) stay inline; larger ones are offloaded to a readable handle. resultPolicy controls inline/offload/summarize overrides.`,
-          "Results are compacted before first exposure; already-exposed offload and ctx_read messages stay unchanged to preserve cacheable prefixes. Use Pi session compaction for accumulated history.",
-          "At the model boundary use ctx_read; inside fabric_exec use extensions.ctx_read.",
-          "Use /ce status, /ce trace, /ce settings, or /ce status --all.",
-        ].join("\n");
       } else if (command === "clear") {
         telemetry.clear(ctx.cwd);
         message = "Context Engineer telemetry cleared for this workspace.";
       } else {
-        message = "Usage: /ce [status|trace|explain|settings|clear] [--all]";
+        message = "Usage: /ce [status|trace|settings|clear] [--all]";
       }
 
       ctx.ui.notify(message, "info");
