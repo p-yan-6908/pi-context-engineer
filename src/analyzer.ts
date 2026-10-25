@@ -7,7 +7,8 @@
  * abstract interpreter rather than a global "some call happened" flag.
  */
 
-import ts from "typescript";
+import { createRequire } from "node:module";
+import type TS from "typescript";
 import {
   contextEffectFor,
   isContextHelperName,
@@ -19,6 +20,13 @@ import {
   type ResolvedBound,
 } from "./context-effects.js";
 import { evaluateReturnBudget, type ContextBoundaryPolicy, type QuantitativeDecision } from "./quantitative-policy.js";
+
+// TypeScript is needed only when a program is analyzed (strict preflight,
+// ce_exec, explainProgram); load it on first use instead of at startup.
+let typescript: typeof TS | undefined;
+const ts = new Proxy({} as typeof TS, {
+  get: (_target, key) => Reflect.get(typescript ??= createRequire(import.meta.url)("typescript") as typeof TS, key),
+});
 
 export type TaintKind =
   | "clean"
@@ -105,7 +113,7 @@ interface Flow {
 }
 
 interface FunctionLike {
-  node: ts.FunctionDeclaration | ts.FunctionExpression | ts.ArrowFunction;
+  node: TS.FunctionDeclaration | TS.FunctionExpression | TS.ArrowFunction;
 }
 
 interface EvalState {
@@ -143,7 +151,7 @@ function effectReason(effect: ContextEffect["kind"]): string {
   }
 }
 
-function nodeLocation(sf: ts.SourceFile, node: ts.Node): ContextProvenanceLocation {
+function nodeLocation(sf: TS.SourceFile, node: TS.Node): ContextProvenanceLocation {
   const position = sf.getLineAndCharacterOfPosition(node.getStart(sf));
   return { line: position.line + 1, column: position.character + 1 };
 }
@@ -226,7 +234,7 @@ function boundedFlow(
   return reducedFlow(kind, operation, retention, true, provenance, bound);
 }
 
-function getCalleeText(expr: ts.Expression, sf: ts.SourceFile): string {
+function getCalleeText(expr: TS.Expression, sf: TS.SourceFile): string {
   return expr.getText(sf).replace(/\s+/g, "");
 }
 
@@ -243,19 +251,19 @@ function isDataToolText(text: string): boolean {
   return effect.kind === "source" || isFoveaText(text);
 }
 
-function isDataToolCall(node: ts.CallExpression, sf: ts.SourceFile): boolean {
+function isDataToolCall(node: TS.CallExpression, sf: TS.SourceFile): boolean {
   return isDataToolText(getCalleeText(node.expression, sf));
 }
 
-function isFoveaCall(node: ts.CallExpression, sf: ts.SourceFile): boolean {
+function isFoveaCall(node: TS.CallExpression, sf: TS.SourceFile): boolean {
   return isFoveaText(getCalleeText(node.expression, sf));
 }
 
-function isFunctionLikeNode(node: ts.Node): node is FunctionLike["node"] {
+function isFunctionLikeNode(node: TS.Node): node is FunctionLike["node"] {
   return ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node);
 }
 
-function unwrap(expr: ts.Expression): ts.Expression {
+function unwrap(expr: TS.Expression): TS.Expression {
   let current = expr;
   while (
     ts.isParenthesizedExpression(current) ||
@@ -275,7 +283,7 @@ interface ConstantScope {
 
 interface ConstantBinding {
   mutable: boolean;
-  initializer?: ts.Expression;
+  initializer?: TS.Expression;
   scope: ConstantScope;
 }
 
@@ -301,7 +309,7 @@ interface EffectBoundResolution {
   reason?: string;
 }
 
-function isLexicalScopeNode(node: ts.Node): boolean {
+function isLexicalScopeNode(node: TS.Node): boolean {
   return ts.isSourceFile(node) ||
     ts.isBlock(node) ||
     isFunctionLikeNode(node) ||
@@ -354,29 +362,29 @@ function joinMaxResolution(expression: string, operands: NumericConstantResoluti
 }
 
 class NumericConstantResolver {
-  private readonly scopes = new WeakMap<ts.Node, ConstantScope>();
+  private readonly scopes = new WeakMap<TS.Node, ConstantScope>();
 
-  constructor(sourceFile: ts.SourceFile) {
+  constructor(sourceFile: TS.SourceFile) {
     const root: ConstantScope = { bindings: new Map() };
     this.visit(sourceFile, root, true);
   }
 
-  resolve(expr: ts.Expression): number | undefined {
+  resolve(expr: TS.Expression): number | undefined {
     const result = this.resolveWithChain(expr);
     return result.kind === "exact" ? result.value : undefined;
   }
 
-  resolveWithChain(expr: ts.Expression): NumericConstantResolution {
+  resolveWithChain(expr: TS.Expression): NumericConstantResolution {
     const scope = this.scopes.get(expr);
     return scope ? this.resolveExactExpression(expr, scope, new Set<ConstantBinding>()) : unknownNumericResolution();
   }
 
-  resolveUpperBound(expr: ts.Expression): NumericConstantResolution {
+  resolveUpperBound(expr: TS.Expression): NumericConstantResolution {
     const scope = this.scopes.get(expr);
     return scope ? this.resolveUpperExpression(expr, scope, new Set<ConstantBinding>()) : unknownNumericResolution();
   }
 
-  private visit(node: ts.Node, parent: ConstantScope, useParent = false): void {
+  private visit(node: TS.Node, parent: ConstantScope, useParent = false): void {
     const scope = useParent ? parent : isLexicalScopeNode(node) ? { parent, bindings: new Map() } : parent;
     this.scopes.set(node, scope);
     if (ts.isFunctionLike(node)) {
@@ -388,8 +396,8 @@ class NumericConstantResolver {
     ts.forEachChild(node, (child) => this.visit(child, scope));
   }
 
-  private collectDirectDeclarations(node: ts.Node, scope: ConstantScope): void {
-    const collect = (current: ts.Node, isRoot: boolean): void => {
+  private collectDirectDeclarations(node: TS.Node, scope: ConstantScope): void {
+    const collect = (current: TS.Node, isRoot: boolean): void => {
       if (!isRoot && isLexicalScopeNode(current)) return;
       if (ts.isVariableStatement(current)) this.addDeclarationList(current.declarationList, scope);
       else if (ts.isVariableDeclarationList(current)) this.addDeclarationList(current, scope);
@@ -398,14 +406,14 @@ class NumericConstantResolver {
     collect(node, true);
   }
 
-  private addDeclarationList(list: ts.VariableDeclarationList, scope: ConstantScope): void {
+  private addDeclarationList(list: TS.VariableDeclarationList, scope: ConstantScope): void {
     const mutable = (list.flags & ts.NodeFlags.Const) === 0;
     for (const declaration of list.declarations) {
       this.addPattern(declaration.name, scope, mutable, ts.isIdentifier(declaration.name) ? declaration.initializer : undefined);
     }
   }
 
-  private addPattern(pattern: ts.BindingName | undefined, scope: ConstantScope, mutable: boolean, initializer?: ts.Expression): void {
+  private addPattern(pattern: TS.BindingName | undefined, scope: ConstantScope, mutable: boolean, initializer?: TS.Expression): void {
     if (!pattern) return;
     if (ts.isIdentifier(pattern)) {
       scope.bindings.set(pattern.text, { mutable, initializer, scope });
@@ -416,7 +424,7 @@ class NumericConstantResolver {
     }
   }
 
-  private resolveExactExpression(expr: ts.Expression, scope: ConstantScope, seen: Set<ConstantBinding>): NumericConstantResolution {
+  private resolveExactExpression(expr: TS.Expression, scope: ConstantScope, seen: Set<ConstantBinding>): NumericConstantResolution {
     const value = unwrap(expr);
     if (ts.isNumericLiteral(value)) {
       const number = Number(value.text.replace(/_/g, ""));
@@ -452,7 +460,7 @@ class NumericConstantResolver {
       : unknownNumericResolution();
   }
 
-  private resolveUpperExpression(expr: ts.Expression, scope: ConstantScope, seen: Set<ConstantBinding>): NumericConstantResolution {
+  private resolveUpperExpression(expr: TS.Expression, scope: ConstantScope, seen: Set<ConstantBinding>): NumericConstantResolution {
     const exact = this.resolveExactExpression(expr, scope, new Set(seen));
     if (exact.kind === "exact") return exact;
     const value = unwrap(expr);
@@ -570,8 +578,8 @@ function elementFlow(receiver: Flow, index?: string): Flow {
 }
 
 function literalNumber(
-  expr: ts.Expression | undefined,
-  sf: ts.SourceFile,
+  expr: TS.Expression | undefined,
+  sf: TS.SourceFile,
   env?: Map<string, Flow>,
 ): number | undefined {
   if (!expr) return undefined;
@@ -591,9 +599,9 @@ function literalNumber(
 }
 
 function objectNumberArgument(
-  call: ts.CallExpression,
+  call: TS.CallExpression,
   name: string,
-  sf: ts.SourceFile,
+  sf: TS.SourceFile,
   env?: Map<string, Flow>,
 ): number | undefined {
   const first = call.arguments[0];
@@ -608,9 +616,9 @@ function objectNumberArgument(
 
 /** Quantitative resolution is deliberately stricter than policy resolution. */
 function objectLiteralNumberArgument(
-  call: ts.CallExpression,
+  call: TS.CallExpression,
   name: string,
-  sf: ts.SourceFile,
+  sf: TS.SourceFile,
   resolver: NumericConstantResolver,
 ): NumericConstantResolution {
   const first = call.arguments[0];
@@ -663,7 +671,7 @@ function derivedBoundReason(
   return `${prefix}\n  max join ${label} bound: max(${values}) = ${resolution.value} ${unit}.`;
 }
 
-function resolveEffectBound(call: ts.CallExpression, effect: ContextEffect, sf: ts.SourceFile, resolver: NumericConstantResolver): EffectBoundResolution {
+function resolveEffectBound(call: TS.CallExpression, effect: ContextEffect, sf: TS.SourceFile, resolver: NumericConstantResolver): EffectBoundResolution {
   const declaration = effect.kind === "select" || effect.kind === "compress" ? effect.bound : undefined;
   if (!declaration) return {};
   const resolution = objectLiteralNumberArgument(call, declaration.name, sf, resolver);
@@ -685,18 +693,18 @@ function resolveEffectBound(call: ts.CallExpression, effect: ContextEffect, sf: 
   return { bound, reason };
 }
 
-function callArgs(call: ts.CallExpression, env: Map<string, Flow>, state: EvalState, sf: ts.SourceFile): Flow[] {
+function callArgs(call: TS.CallExpression, env: Map<string, Flow>, state: EvalState, sf: TS.SourceFile): Flow[] {
   return call.arguments
     .filter((arg) => !ts.isArrowFunction(arg) && !ts.isFunctionExpression(arg))
     .map((arg) => evaluateExpression(arg, env, state, sf));
 }
 
 function evaluateCallback(
-  callback: ts.Expression | undefined,
+  callback: TS.Expression | undefined,
   receiver: Flow,
   env: Map<string, Flow>,
   state: EvalState,
-  sf: ts.SourceFile,
+  sf: TS.SourceFile,
 ): Flow {
   if (!callback || (!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback))) {
     return sourceFlow("unknown", "unknown callback", receiver.retention, receiver.provenance);
@@ -718,11 +726,11 @@ function evaluateCallback(
 }
 
 function evaluateMethodCall(
-  call: ts.CallExpression,
-  property: ts.PropertyAccessExpression,
+  call: TS.CallExpression,
+  property: TS.PropertyAccessExpression,
   env: Map<string, Flow>,
   state: EvalState,
-  sf: ts.SourceFile,
+  sf: TS.SourceFile,
 ): Flow {
   const receiver = evaluateExpression(property.expression, env, state, sf);
   const method = property.name.text;
@@ -808,14 +816,14 @@ function evaluateMethodCall(
     case "then": {
       const callbacks = call.arguments.filter((arg) => ts.isArrowFunction(arg) || ts.isFunctionExpression(arg));
       if (callbacks.length === 0) return { ...receiver, operation: "then preserves source" };
-      const results = callbacks.map((fn) => evaluateCallback(fn as ts.Expression, receiver, env, state, sf));
+      const results = callbacks.map((fn) => evaluateCallback(fn as TS.Expression, receiver, env, state, sf));
       if (results.length === 1) return results[0];
       return combine(results, "then preserves source", true);
     }
     case "catch": {
       const callbacks = call.arguments.filter((arg) => ts.isArrowFunction(arg) || ts.isFunctionExpression(arg));
       if (callbacks.length === 0) return { ...receiver, operation: "catch preserves source" };
-      const handled = callbacks.map((fn) => evaluateCallback(fn as ts.Expression, receiver, env, state, sf));
+      const handled = callbacks.map((fn) => evaluateCallback(fn as TS.Expression, receiver, env, state, sf));
       return combine([receiver, ...handled], "catch preserves source", true);
     }
     case "finally":
@@ -828,7 +836,7 @@ function evaluateMethodCall(
   }
 }
 
-function evaluateCall(call: ts.CallExpression, env: Map<string, Flow>, state: EvalState, sf: ts.SourceFile): Flow {
+function evaluateCall(call: TS.CallExpression, env: Map<string, Flow>, state: EvalState, sf: TS.SourceFile): Flow {
   const name = getCalleeText(call.expression, sf);
   const effect = contextEffectFor(name);
   if (isContextHelperText(name)) {
@@ -939,7 +947,7 @@ function evaluateCall(call: ts.CallExpression, env: Map<string, Flow>, state: Ev
   return sourced ? sourceFlow("unknown", `unknown function ${name}`, 1, sourceProvenance) : cleanFlow(`call ${name}`);
 }
 
-function evaluateExpression(expr: ts.Expression, env: Map<string, Flow>, state: EvalState, sf: ts.SourceFile): Flow {
+function evaluateExpression(expr: TS.Expression, env: Map<string, Flow>, state: EvalState, sf: TS.SourceFile): Flow {
   const value = unwrap(expr);
 
   if (ts.isAwaitExpression(value)) return evaluateExpression(value.expression, env, state, sf);
@@ -947,16 +955,16 @@ function evaluateExpression(expr: ts.Expression, env: Map<string, Flow>, state: 
   if (ts.isNumericLiteral(value)) return cleanFlow("literal", Number(value.text));
   if (ts.isPostfixUnaryExpression(value)) {
     if (value.operator === ts.SyntaxKind.PlusPlusToken || value.operator === ts.SyntaxKind.MinusMinusToken) {
-      const operand = unwrap(value.operand as ts.Expression);
+      const operand = unwrap(value.operand as TS.Expression);
       if (ts.isIdentifier(operand)) return env.get(operand.text) ?? cleanFlow(`identifier ${operand.text}`);
-      return evaluateExpression(value.operand as ts.Expression, env, state, sf);
+      return evaluateExpression(value.operand as TS.Expression, env, state, sf);
     }
   }
   if (ts.isPrefixUnaryExpression(value)) {
     if (value.operator === ts.SyntaxKind.PlusPlusToken || value.operator === ts.SyntaxKind.MinusMinusToken) {
-      const operand = unwrap(value.operand as ts.Expression);
+      const operand = unwrap(value.operand as TS.Expression);
       if (ts.isIdentifier(operand)) return env.get(operand.text) ?? cleanFlow(`identifier ${operand.text}`);
-      return evaluateExpression(value.operand as ts.Expression, env, state, sf);
+      return evaluateExpression(value.operand as TS.Expression, env, state, sf);
     }
     if (ts.isNumericLiteral(value.operand)) {
     const number = Number(value.operand.text);
@@ -1020,7 +1028,7 @@ function evaluateExpression(expr: ts.Expression, env: Map<string, Flow>, state: 
   return cleanFlow("unclassified expression");
 }
 
-function bindPattern(pattern: ts.BindingName, value: Flow, env: Map<string, Flow>, state: EvalState, sf: ts.SourceFile): void {
+function bindPattern(pattern: TS.BindingName, value: Flow, env: Map<string, Flow>, state: EvalState, sf: TS.SourceFile): void {
   if (ts.isIdentifier(pattern)) {
     env.set(pattern.text, value);
     return;
@@ -1042,7 +1050,7 @@ function bindPattern(pattern: ts.BindingName, value: Flow, env: Map<string, Flow
   }
 }
 
-function collectFunctions(node: ts.Node, functions: Map<string, FunctionLike>): void {
+function collectFunctions(node: TS.Node, functions: Map<string, FunctionLike>): void {
   if (ts.isFunctionDeclaration(node) && node.name) functions.set(node.name.text, { node });
   if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer && (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))) {
     functions.set(node.name.text, { node: node.initializer });
@@ -1050,15 +1058,15 @@ function collectFunctions(node: ts.Node, functions: Map<string, FunctionLike>): 
   ts.forEachChild(node, (child) => collectFunctions(child, functions));
 }
 
-function rootIdentifierForWrite(target: ts.Expression): string | undefined {
-  let current: ts.Expression = unwrap(target);
+function rootIdentifierForWrite(target: TS.Expression): string | undefined {
+  let current: TS.Expression = unwrap(target);
   while (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) {
     current = unwrap(current.expression);
   }
   return ts.isIdentifier(current) ? current.text : undefined;
 }
 
-function isCompoundAssignmentKind(kind: ts.SyntaxKind): boolean {
+function isCompoundAssignmentKind(kind: TS.SyntaxKind): boolean {
   switch (kind) {
     case ts.SyntaxKind.PlusEqualsToken:
     case ts.SyntaxKind.MinusEqualsToken:
@@ -1102,7 +1110,7 @@ function taintBaseForContainerWrite(
   env.set(baseName, { ...rhs, operation, provenance });
 }
 
-function applyBinaryBinding(node: ts.BinaryExpression, env: Map<string, Flow>, state: EvalState, sf: ts.SourceFile): void {
+function applyBinaryBinding(node: TS.BinaryExpression, env: Map<string, Flow>, state: EvalState, sf: TS.SourceFile): void {
   const kind = node.operatorToken.kind;
   const isPlain = kind === ts.SyntaxKind.EqualsToken;
   const isCompound = isCompoundAssignmentKind(kind);
@@ -1128,10 +1136,10 @@ function applyBinaryBinding(node: ts.BinaryExpression, env: Map<string, Flow>, s
   taintBaseForContainerWrite(baseName, rhs, env, operation);
 }
 
-function applyUpdateBinding(node: ts.PrefixUnaryExpression | ts.PostfixUnaryExpression, env: Map<string, Flow>): void {
+function applyUpdateBinding(node: TS.PrefixUnaryExpression | TS.PostfixUnaryExpression, env: Map<string, Flow>): void {
   const op = node.operator;
   if (op !== ts.SyntaxKind.PlusPlusToken && op !== ts.SyntaxKind.MinusMinusToken) return;
-  const operand = unwrap(node.operand as ts.Expression);
+  const operand = unwrap(node.operand as TS.Expression);
   if (ts.isIdentifier(operand)) {
     const old = env.get(operand.text) ?? cleanFlow(`identifier ${operand.text}`);
     const combined = combine([old, cleanFlow("increment")], "increment preserves source", true);
@@ -1142,7 +1150,7 @@ function applyUpdateBinding(node: ts.PrefixUnaryExpression | ts.PostfixUnaryExpr
   // clean container holding only a counter stays clean, so no env change.
 }
 
-function visitBindings(node: ts.Node, env: Map<string, Flow>, state: EvalState, sf: ts.SourceFile): void {
+function visitBindings(node: TS.Node, env: Map<string, Flow>, state: EvalState, sf: TS.SourceFile): void {
   if (isFunctionLikeNode(node)) return;
   if (ts.isVariableDeclaration(node) && node.initializer) {
     bindPattern(node.name, evaluateExpression(node.initializer, env, state, sf), env, state, sf);
@@ -1192,10 +1200,10 @@ function visitBindings(node: ts.Node, env: Map<string, Flow>, state: EvalState, 
 }
 
 function visitFunctionStatements(
-  node: ts.Node,
+  node: TS.Node,
   env: Map<string, Flow>,
   state: EvalState,
-  sf: ts.SourceFile,
+  sf: TS.SourceFile,
   returns: Flow[],
 ): void {
   if (isFunctionLikeNode(node) && !ts.isBlock(node)) return;
@@ -1217,7 +1225,7 @@ function evaluateFunction(
   args: Flow[],
   parentEnv: Map<string, Flow>,
   state: EvalState,
-  sf: ts.SourceFile,
+  sf: TS.SourceFile,
 ): Flow {
   const env = new Map(parentEnv);
   fn.parameters.forEach((parameter, index) => {
@@ -1229,8 +1237,8 @@ function evaluateFunction(
   return returns.length > 0 ? combine(returns, "function return", true) : cleanFlow("function");
 }
 
-function collectProgramMetrics(sf: ts.SourceFile, metrics: ProgramMetrics): void {
-  const visit = (node: ts.Node): void => {
+function collectProgramMetrics(sf: TS.SourceFile, metrics: ProgramMetrics): void {
+  const visit = (node: TS.Node): void => {
     if (ts.isCallExpression(node) && isDataToolCall(node, sf)) metrics.toolCalls++;
     if (ts.isIfStatement(node) || ts.isSwitchStatement(node) || ts.isForStatement(node) || ts.isForInStatement(node) || ts.isForOfStatement(node) || ts.isWhileStatement(node) || ts.isDoStatement(node) || ts.isConditionalExpression(node)) metrics.hasLoopOrConditional = true;
     if (ts.isVariableStatement(node)) {
@@ -1243,9 +1251,9 @@ function collectProgramMetrics(sf: ts.SourceFile, metrics: ProgramMetrics): void
   metrics.sourceCalls = metrics.toolCalls;
 }
 
-function topLevelReturns(sf: ts.SourceFile, env: Map<string, Flow>, state: EvalState): Flow[] {
+function topLevelReturns(sf: TS.SourceFile, env: Map<string, Flow>, state: EvalState): Flow[] {
   const returns: Flow[] = [];
-  const visit = (node: ts.Node): void => {
+  const visit = (node: TS.Node): void => {
     if (isFunctionLikeNode(node)) return;
     if (ts.isReturnStatement(node) && node.expression) returns.push(evaluateExpression(node.expression, env, state, sf));
     ts.forEachChild(node, visit);
@@ -1330,7 +1338,7 @@ export function analyzeProgram(source: string, opts: AnalyzerOptions = {}): Anal
   }
   // Use the source text of literal return expressions when available.
   const literalReturns: string[] = [];
-  const collectLiteralReturns = (node: ts.Node): void => {
+  const collectLiteralReturns = (node: TS.Node): void => {
     if (isFunctionLikeNode(node)) return;
     if (ts.isReturnStatement(node) && node.expression) {
       const expression = unwrap(node.expression);

@@ -9,6 +9,11 @@
 - `ctx_read` gained `section` mode for Fabric sectioned results; `offset`/`length` page within the section.
 - Rewrote the skill as an operational playbook (#1 by @e4779), correcting handle lifetime (workspace store, not session-scoped) and the jsonPath dialect (no wildcards or slices).
 
+### Startup and preflight cost
+
+- Default mode no longer runs static analysis on every `fabric_exec`; its advisory verdict was discarded. Analysis runs with `strict`/`blockUnboundedReturns`, `ce_exec`, and `explainProgram`.
+- The analyzer loads TypeScript on first use, cutting CE import time from roughly 300 ms to 90 ms on a local machine; every Pi session and Fabric child that loads CE pays this.
+
 ### Offload follow-up telemetry
 
 - `ctx_read` and `ctx_summarize` events record the handle they read, and repeating a call whose result was offloaded is recorded. Summaries and `/ce status` report `offloadFollowUp`: offloaded handles, handles read back, and repeated calls.

@@ -316,10 +316,10 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   // Fix 2: Intercept fabric_exec via tool_call hook
   // ================================================================
   //
-  // This is the primary enforcement. When the model calls fabric_exec,
-  // we intercept the program BEFORE it runs. If the analyzer detects a
-  // passthrough (raw tool result returned with no processing), runtime-first
-  // mode executes under the actual boundary guard; strict mode blocks.
+  // With strict or blockUnboundedReturns, the analyzer checks the program
+  // BEFORE it runs and blocks a passthrough (raw tool data returned with no
+  // processing). Otherwise nothing acts on the verdict, so analysis is skipped
+  // and the runtime boundary guard handles the actual result.
 
   pi.on("tool_call", async (event, ctx) => {
     const handle = offloadedCalls.get(callKey(event.toolName, event.input));
@@ -348,9 +348,9 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         : undefined;
     if (!program || typeof program !== "string") return undefined;
 
-    const decision = evaluateProgram(program, cfg);
+    const decision = cfg.strict === true || cfg.blockUnboundedReturns === true ? evaluateProgram(program, cfg) : undefined;
 
-    if (decision.tier === "BLOCK") {
+    if (decision?.tier === "BLOCK") {
       telemetry.record(ctx.cwd, {
         strategy: "BLOCK",
         tool: "fabric_exec",

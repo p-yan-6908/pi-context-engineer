@@ -12,7 +12,7 @@ The roles are deliberately separate:
 
 ### Static data-flow gate
 
-`fabric_exec` programs are analyzed before execution. Tool-originated values are tracked through aliases, destructuring, object/array construction, method chains, callbacks, local helper functions, `Promise.all`, and function arguments.
+With `strict` or `blockUnboundedReturns`, `fabric_exec` programs are analyzed before execution; `ce_exec` and `explainProgram` run the same analysis on demand. TypeScript, which the analyzer parses with, loads on first analysis rather than at extension startup. Tool-originated values are tracked through aliases, destructuring, object/array construction, method chains, callbacks, local helper functions, `Promise.all`, and function arguments.
 
 The analyzer distinguishes:
 
@@ -27,7 +27,7 @@ The analyzer distinguishes:
 
 Scalar projections, `some()`/`every()`/`includes()`, one-item selectors such as `find()`, explicit `slice(0, N)`, Fovea `maxTokens`, summaries, and offloads establish bounds. Numeric bounds survive aliases and local helper arguments, and common tool status fields such as `ok`, `exitCode`, and `truncated` are treated as scalars. `map()`, `filter()`, `reduce()`, `Object.entries()`/`values()`, `trim()`, and `replace()` can still retain the full source, so the analyzer marks them unbounded unless a later operation derives an explicit bound.
 
-By default, an uncertain source-bearing return is classified as a warning but **executes silently**. The runtime boundary guard then keeps a small actual result or offloads a large one. Use `ce_exec` when you want the static diagnostic explicitly. This avoids blocking useful work because of a conservative static approximation. Set `strict: true` or `blockUnboundedReturns: true` for fail-closed preflight. Default preflight is advisory even for zero-source projections and estimated oversized returns. Fabric retains authoritative syntax/execution validation; only explicit strict/blocking settings turn CE diagnostics into pre-execution blocks. The number of internal calls is not the primary limit: a Fabric program may make many calls when its boundary result is controlled.
+By default CE skips static preflight, because nothing acts on an advisory verdict: programs run and the runtime boundary guard keeps a small actual result or offloads a large one. Use `ce_exec` when you want the static diagnostic explicitly. This avoids blocking useful work because of a conservative static approximation. Set `strict: true` or `blockUnboundedReturns: true` for fail-closed preflight. With `blockUnboundedReturns` alone, only hard blocks (statically unbounded source returns) stop a program. Fabric retains authoritative syntax/execution validation; only explicit strict/blocking settings turn CE diagnostics into pre-execution blocks. The number of internal calls is not the primary limit: a Fabric program may make many calls when its boundary result is controlled.
 
 ### Runtime boundary guard
 
