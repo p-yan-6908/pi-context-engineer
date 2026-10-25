@@ -11,6 +11,11 @@
 - The `ctx_status` and `ce_exec` tools. `/ce status` and `/ce settings` report the same telemetry and policy to the user, and models called `ctx_status` mostly to inspect CE itself. Telemetry drops its per-runtime scope and child-usage fields.
 - The benchmark harnesses: the deterministic plumbing benchmark (its known-marker checks duplicated `npm test` and measured CE against a baseline that shows every byte), the static-policy benchmark, and the paid paired-effectiveness harness, which was never run. The opt-in real Pi/Fabric smoke test remains as `npm run e2e`.
 
+### Fixes
+
+- When Fabric truncates a `fabric_exec` result over its 50,000-character cap, CE stores the full output from Fabric's artifact instead of the truncated view. Fabric marks that scratch file for cleanup as soon as it writes it, so earlier handles kept only the visible head and tail while the notice claimed the full result was stored. Only a regular `output.txt` in a Fabric output scratch directory under the temp root, with the length the notice states, is read.
+- The store deletes entry files left from the pre-0.4 `<id>.json` layout on first open. Versions 0.4 to 0.6 copied them into blobs but never removed the originals, which then sat outside the TTL, the size cap and cleanup (360 such files across three local stores, all from before 0.4.0). A store still in that layout is no longer migrated; its entries predate 0.4.0 and are dropped. Only files that parse as a legacy entry named after its own id are removed.
+
 ### Offload notices and ctx_read
 
 - The offload notice leads with copyable `ctx_read` calls, offers only the modes the payload supports (`section` with a real section name, `jsonPath` only for JSON), and tells the model to read the handle rather than re-run the call (based on #3 by @e4779).
@@ -24,7 +29,6 @@
 
 ### Fabric child integration
 
-- When Fabric truncates a `fabric_exec` result over its 50,000-character cap, CE stores the full output from Fabric's artifact instead of the truncated view. Fabric marks that scratch file for cleanup as soon as it writes it, so earlier handles kept only the visible head and tail while the notice claimed the full result was stored. Only a regular `output.txt` in a Fabric output scratch directory under the temp root, with the length the notice states, is read.
 - Extension-enabled Fabric Pi children that load CE grant themselves `ctx_read` before Fabric's lazy provider initialization, at every depth. Like Fabric's `agents.childQuestionTools`, the grant is skipped for an explicit empty `tools` list and for `+name`/`-name` lists; a malformed allowlist fails closed.
 - CE no longer offloads to a handle the current process cannot read (a withheld Fabric allowlist, or a Pi `--tools` list without `ctx_read`); the result stays inline and telemetry records why.
 

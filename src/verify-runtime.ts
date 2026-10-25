@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import * as extension from "./index.js";
@@ -85,6 +85,19 @@ try {
     }
   }
   check("ctx_read avoids recursive offload", await hook("tool_result", event([{ type: "text", text: large }], { toolName: "ctx_read" }), cwd) === undefined);
+  {
+    const legacy = workspace();
+    const dir = join(legacy, ".pi/context-store");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "read-0123456789ab.json"), JSON.stringify({ id: "read-0123456789ab", key: "read", data: "old payload" }));
+    writeFileSync(join(dir, "notes.json"), JSON.stringify({ id: "other", key: "k", data: "kept" }));
+    writeFileSync(join(dir, "broken.json"), "{");
+    const store = new ContextStore(legacy);
+    const handle = store.write("fresh", "test", "new payload");
+    check("legacy entry files are deleted, not migrated", !existsSync(join(dir, "read-0123456789ab.json")) && store.list().length === 1);
+    check("unrecognized json files are kept", existsSync(join(dir, "notes.json")) && existsSync(join(dir, "broken.json")));
+    check("store works after legacy cleanup", store.read(handle.id).content === "new payload");
+  }
   const brokenStore = workspace();
   writeFileSync(join(brokenStore, ".pi/context-store"), "not a directory");
   check("storage failure keeps original success", await hook("tool_result", event(blocks), brokenStore) === undefined);

@@ -3,7 +3,7 @@
  *
  * The index contains metadata only. Payloads live in content-addressed blobs so
  * hash lookup, listing, and garbage collection never parse every payload.
- * Legacy <id>.json entries are migrated on first open.
+ * Leftover <id>.json entries from the pre-0.4 layout are deleted on first open.
  */
 
 import { createHash, randomUUID } from "node:crypto";
@@ -12,6 +12,7 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -306,36 +307,45 @@ export class ContextStore {
     if (!initialized) {
       try { chmodSync(this.dir, STORE_DIR_MODE); } catch { /* best effort */ }
       try { chmodSync(this.blobsDir, STORE_DIR_MODE); } catch { /* best effort */ }
+      this.removeLegacyEntries();
       layoutInitCache.add(this.dir);
     }
 
     if (!existsSync(this.indexFile)) {
       this.withLock(() => {
         if (existsSync(this.indexFile)) return;
-        const migrated = this.migrateLegacyEntries();
-        this.writeIndex(migrated);
+        this.writeIndex([]);
       });
     }
   }
 
-  private migrateLegacyEntries(): StoreMetadata[] {
-    const entries: StoreMetadata[] = [];
-    for (const file of readdirSync(this.dir)) {
+  /**
+   * Delete <id>.json entries from the pre-0.4 layout. Versions 0.4 to 0.6
+   * copied them into blobs but never deleted the originals, which then sat
+   * outside the TTL, the size cap and cleanup. A store still in that layout
+   * dates from before 0.4.0, so its entries are dropped rather than migrated.
+   * Only files that parse as a legacy entry named after its own id are removed.
+   */
+  private removeLegacyEntries(): void {
+    let files: string[];
+    try {
+      files = readdirSync(this.dir);
+    } catch {
+      return;
+    }
+    for (const file of files) {
       if (!file.endsWith(".json") || file === "index.json") continue;
+      const path = join(this.dir, file);
       try {
-        const legacyFile = join(this.dir, file);
-        chmodSync(legacyFile, BLOB_MODE);
-        const raw = JSON.parse(readFileSync(legacyFile, "utf8")) as Partial<StoreEntry>;
-        const legacy = this.normalizeLegacyEntry(raw);
-        if (!legacy) continue;
-        const metadata = this.toMetadata(legacy);
-        this.writeBlob(metadata.blobPath, legacy.data);
-        entries.push(metadata);
+        if (!lstatSync(path).isFile()) continue;
+        const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<StoreEntry> | null;
+        if (typeof raw?.id === "string" && typeof raw.key === "string" && typeof raw.data === "string" && `${raw.id}.json` === file) {
+          unlinkSync(path);
+        }
       } catch {
-        // A corrupt legacy entry should not make the entire store unusable.
+        // Leave unreadable or unrecognized files alone.
       }
     }
-    return entries;
   }
 
   private withLock<T>(fn: () => T): T {
@@ -690,28 +700,6 @@ export class ContextStore {
     }
   }
 
-  private normalizeLegacyEntry(raw: Partial<StoreEntry>): StoreEntry | null {
-    if (typeof raw.id !== "string" || typeof raw.key !== "string" || typeof raw.data !== "string") return null;
-    const bytes = Buffer.byteLength(raw.data, "utf8");
-    const created = raw.created ?? new Date().toISOString();
-    return {
-      id: raw.id,
-      key: raw.key,
-      created,
-      updatedAt: raw.updatedAt ?? raw.lastAccessed ?? created,
-      lastAccessed: raw.lastAccessed ?? created,
-      source: raw.source ?? "unknown",
-      contentHash: typeof raw.contentHash === "string" && /^[a-f0-9]{64}$/.test(raw.contentHash)
-        ? raw.contentHash
-        : this.hash(raw.data),
-      contentType: raw.contentType ?? inferContentType(raw.data),
-      bytes,
-      estimatedTokens: raw.estimatedTokens ?? estimateTokens(bytes),
-      ...(raw.expiresAt ? { expiresAt: raw.expiresAt } : {}),
-      data: raw.data,
-    };
-  }
-
   private normalizeMetadata(raw: Partial<StoreMetadata>): StoreMetadata | null {
     if (
       typeof raw.id !== "string" ||
@@ -742,11 +730,6 @@ export class ContextStore {
       ...(typeof raw.expiresAt === "string" ? { expiresAt: raw.expiresAt } : {}),
       blobPath,
     };
-  }
-
-  private toMetadata(entry: StoreEntry): StoreMetadata {
-    const { data: _data, ...metadata } = entry;
-    return { ...metadata, blobPath: entry.contentHash };
   }
 
   private isExpired(entry: StoreMetadata, options = this.options): boolean {
