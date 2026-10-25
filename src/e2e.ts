@@ -4,7 +4,6 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { finalAnswerFromEvents } from "./effectiveness.js";
 
 export interface SmokeScenario {
   name: string;
@@ -53,6 +52,14 @@ export const smokeScenarios: SmokeScenario[] = [
     assert: (answer, results, workspace) => /block/i.test(answer) && results.some(result => result.isError === true) && !existsSync(join(workspace, "blocked-sentinel")),
   },
 ];
+
+/** The last non-empty assistant text in a Pi JSON event stream. */
+function finalAnswerFromEvents(events: readonly any[]): string {
+  const texts = events
+    .filter(event => event?.type === "message_end" && event.message?.role === "assistant")
+    .map(event => (event.message.content ?? []).map((block: any) => block?.type === "text" ? block.text : "").join(""));
+  return texts.reverse().find(text => text.trim()) ?? "";
+}
 
 export function runSmokeTests(): void {
   if (process.env.CE_RUN_E2E !== "1") {

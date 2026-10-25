@@ -24,15 +24,10 @@
     "access": "public"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck src/*.ts bench/*.ts",
+    "typecheck": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck src/*.ts",
     "build": "rm -rf .tmp/pi-ce-build && tsc --outDir .tmp/pi-ce-build --rootDir src --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck src/*.ts",
-    "build:bench": "rm -rf .tmp/pi-ce-bench && tsc --outDir .tmp/pi-ce-bench --rootDir . --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck src/*.ts bench/*.ts",
-    "verify": "npm run build && node .tmp/pi-ce-build/verify.js && node .tmp/pi-ce-build/verify-hooks.js && node .tmp/pi-ce-build/verify-adversarial.js && node .tmp/pi-ce-build/verify-runtime.js && node .tmp/pi-ce-build/verify-child.js && node .tmp/pi-ce-build/verify-remediation.js && npm run verify:effectiveness",
-    "bench": "npm run build:bench && node .tmp/pi-ce-bench/bench/runner.js",
-    "bench:policy": "npm run build:bench && node .tmp/pi-ce-bench/bench/policy.js",
-    "bench:effectiveness": "npm run build:bench && node .tmp/pi-ce-bench/bench/effectiveness.js",
-    "verify:effectiveness": "npm run build:bench && node .tmp/pi-ce-bench/bench/verify-effectiveness.js",
-    "bench:e2e": "npm run build && npm run build:bench && node .tmp/pi-ce-bench/bench/e2e.js",
+    "verify": "npm run build && node .tmp/pi-ce-build/verify.js && node .tmp/pi-ce-build/verify-hooks.js && node .tmp/pi-ce-build/verify-adversarial.js && node .tmp/pi-ce-build/verify-runtime.js && node .tmp/pi-ce-build/verify-child.js && node .tmp/pi-ce-build/verify-remediation.js",
+    "e2e": "npm run build && node .tmp/pi-ce-build/e2e.js",
     "test": "npm run verify"
   },
   "types": [
@@ -43,7 +38,6 @@
   "files": [
     "src",
     "skills",
-    "bench",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"

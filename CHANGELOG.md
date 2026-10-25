@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Removed
+
+- The benchmark harnesses: the deterministic plumbing benchmark (its known-marker checks duplicated `npm test` and measured CE against a baseline that shows every byte), the static-policy benchmark, and the paid paired-effectiveness harness, which was never run. The opt-in real Pi/Fabric smoke test remains as `npm run e2e`.
+
 ### Offload notices and ctx_read
 
 - The offload notice leads with copyable `ctx_read` calls, offers only the modes the payload supports (`section` with a real section name, `jsonPath` only for JSON), and tells the model to read the handle rather than re-run the call (based on #3 by @e4779).

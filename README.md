@@ -103,8 +103,7 @@ Interactive commands:
 
 `offloadFollowUp` (also shown by `/ce status`) reports how many boundary-offloaded handles were later read with `ctx_read`/`ctx_summarize` and how many offloaded calls were repeated anyway. A repeat suggests the preview or notice did not make the handle usable, and the same output was paid for again.
 
-The numbers are approximate context-token estimates, not billing reconciliation or proof of agent effectiveness. Internal helper calls do not count as Main exposure; reading an existing handle does not count the same source as prevented again. Use actual model Usage (including nested calls and cache/cost fields) to evaluate billed savings. `ctx_status` exposes `childCalls`, observed `childUsage`, and `childUsageComplete`; incomplete/missing reports are not zero-cost work. Native standalone calls attach observed Usage on success and failure. Current Fabric capture omits nested tool Usage from native totals, so `childUsageOutsideParent` reports the additional observed usage separately; add it exactly once, not all `childUsage` again. The effectiveness harness performs this accounting from isolated-workspace telemetry.
-
+The numbers are approximate context-token estimates, not billing reconciliation or proof of agent effectiveness. Internal helper calls do not count as Main exposure; reading an existing handle does not count the same source as prevented again. Use actual model Usage (including nested calls and cache/cost fields) to evaluate billed savings. `ctx_status` exposes `childCalls`, observed `childUsage`, and `childUsageComplete`; incomplete/missing reports are not zero-cost work. Native standalone calls attach observed Usage on success and failure. Current Fabric capture omits nested tool Usage from native totals, so `childUsageOutsideParent` reports the additional observed usage separately; add it exactly once, not all `childUsage` again.
 ## Fabric example
 
 ```ts
@@ -306,34 +305,13 @@ The test suite includes more than 50 static data-flow cases plus live hook probe
 
 Run the generated adversarial suite directly with the normal `npm test` command. It fails closed when an unsafe transformation is classified as safe.
 
-## Benchmarking
+## Real Pi/Fabric smoke test
 
-The deterministic plumbing harness compares raw payload exposure with CE addressable storage, bounded selection, and hierarchical summarization. Its known-marker validators and mocked models test mechanics, **not unchanged agent effectiveness**:
-
-```sh
-npm run bench
-```
-
-It covers huge grep/JSON/build-log payloads, repeated reads, parallel provider-like results, Fovea-like source selection, large summaries, and nested-agent handoffs. The default one-warmup/three-iteration run reports median and p95 wall time to `.tmp/context-benchmark.json`; `bench/result.schema.json` defines retained release results with sourceCommit/runtime provenance and per-iteration samples. The v0.5.0 retained workload result is `bench/results/v0.5.0.json`; the frozen v0.4.0 result remains `bench/results/v0.4.0.json` for comparable baseline evidence.
-
-The separate v0.5 quantitative-policy result is `bench/results/v0.5.0-quantitative-policy.json`; it emphasizes maintained legacy parity plus intentional symbolic-cap acceptance, not a misleading performance comparison. Metrics include Main-context exposure (not total token usage), Main input/output/injected tokens, child-model tokens, wall time, disk bytes, selected bytes retrieved, task correctness, quality-adjusted savings, and context efficiency.
-
-Opt-in real runtime smoke tests launch the local `pi` CLI with CE and Fabric extensions. They require a configured model and are intentionally separate from CI's deterministic suite:
+`npm test` is deterministic and offline. An opt-in smoke test launches the local `pi` CLI with CE and Fabric loaded into a throwaway workspace. It needs a configured model and can incur provider usage:
 
 ```sh
-CE_RUN_E2E=1 PI_MODEL=openai-codex/gpt-5.6-luna npm run bench:e2e
+CE_RUN_E2E=1 PI_MODEL=<provider>/<model> npm run e2e
 ```
-
-### Paired agent-effectiveness evaluation
-
-Unlike the plumbing suite, this opt-in harness runs paired CE-on/off agents on isolated copies of multi-file tasks with hidden validators, late evidence, and stale-handle failures. It uses the shipped automatic offload policy, does not supply a retrieval needle, and reports task outcomes, actual observed Usage/cache/cost, latency, recovery calls, and retries. Unknown measurements remain explicitly partial/unavailable. A small fixture suite does not establish general non-inferiority.
-
-```sh
-npm run verify:effectiveness  # offline fixture/scoring/accounting tests; also in npm test
-CE_RUN_EFFECTIVENESS=1 PI_MODEL=openai-codex/gpt-5.6-luna npm run bench:effectiveness
-```
-
-Real runs require explicit opt-in and a configured model; they can incur provider usage. Reports default to `.tmp/context-effectiveness.json`. See [`bench/README.md`](bench/README.md) for options and limitations.
 
 ## License
 

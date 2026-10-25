@@ -22,15 +22,3 @@ jobs:
         run: npm run typecheck
       - name: Verify
         run: npm test
-      # Benchmark is informational only: model/machine variance is expected,
-      # so it never fails CI. Regressions are tracked by comparing retained
-      # artifacts (bench/results/*.json), not by gating merges on bench output.
-      - name: Benchmark
-        run: npm run bench
-        continue-on-error: true
-      - name: Upload benchmark report
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: context-benchmark
-          path: .tmp/context-benchmark.json
