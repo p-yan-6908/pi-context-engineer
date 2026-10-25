@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fabric child integration
+
+- Extension-enabled Fabric Pi children that load CE grant themselves `ctx_read` before Fabric's lazy provider initialization, at every depth. Like Fabric's `agents.childQuestionTools`, the grant is skipped for an explicit empty `tools` list and for `+name`/`-name` lists; a malformed allowlist fails closed.
+- CE no longer offloads to a handle the current process cannot read (a withheld Fabric allowlist, or a Pi `--tools` list without `ctx_read`); the result stays inline and telemetry records why.
+- The isolated `ctx_delegate` fallback loads CE restricted to `ctx_read`, so a delegated child cannot delegate again or write memory. Explicit extension-disabled and non-Pi runners remain opt-outs.
+
 ## 0.6.0
 
 ### Capability-preserving remediation

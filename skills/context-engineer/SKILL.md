@@ -51,7 +51,7 @@ Default policy is runtime-first: an uncertain source-bearing return is classifie
 
 ## Fabric usage
 
-Registered extension tools are available in Fabric code mode through `extensions.*`. Keep full structured results internally; when returning a helper to Main, project its `.text` to avoid serializing the same payload in `content`, `text`, and `details` repeatedly:
+Registered extension tools are available in Fabric code mode through `extensions.*`. When CE is enabled, extension-enabled Fabric Pi children at any depth automatically receive `ctx_read`, so their model-boundary offloads remain readable without repeating `tools: ["ctx_read"]`. The grant is skipped for an explicit empty `tools` list and for `+name`/`-name` lists; CE then keeps results inline instead of offloading. CE's isolated `ctx_delegate` fallback loads CE with `ctx_read` only. Other CE/Fovea extension tools remain opt-in; explicit `extensions: false` and non-Pi runners are intentional opt-outs. Keep full structured results internally; when returning a helper to Main, project its `.text` to avoid serializing the same payload in `content`, `text`, and `details` repeatedly:
 
 ```ts
 const result = await pi.grep({ pattern: "TODO", path: "src" });

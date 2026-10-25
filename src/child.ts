@@ -22,6 +22,8 @@ export interface ChildPiOptions {
   model?: string;
   /** Disable all model tool calls; used for pure summarization. */
   noTools?: boolean;
+  /** Load Context Engineer, restricted to ctx_read, in this otherwise isolated child. */
+  loadContextEngineer?: boolean;
   timeoutMs?: number;
   signal?: AbortSignal;
   /** Requested generation budget; provider caps are exact only where the adapter supports them (Codex uses an approximate stream guard). */
@@ -71,6 +73,9 @@ export class ChildPiError extends Error {
     this.budgetEnforcementFlags = details.budgetEnforcementFlags ?? flagsForBudgetEnforcement(this.budgetEnforcement);
   }
 }
+
+/** Set on a child that loads CE; that CE registers only ctx_read, so it cannot delegate again. */
+export const CONTEXT_ENGINEER_CHILD_ENV = "PI_CONTEXT_ENGINEER_CHILD";
 
 export const DEFAULT_CHILD_TIMEOUT_MS = 120_000;
 export const DEFAULT_CHILD_MAX_TURNS = 8;
@@ -137,6 +142,12 @@ function childBudgetExtensionPath(): string {
   return fileURLToPath(new URL(`./child-budget.${extension}`, import.meta.url));
 }
 
+function contextEngineerExtensionPath(): string {
+  const current = fileURLToPath(import.meta.url);
+  const extension = current.endsWith(".ts") ? "ts" : "js";
+  return fileURLToPath(new URL(`./index.${extension}`, import.meta.url));
+}
+
 function childArgs(promptArgument: string, options: ChildPiOptions, maxTokens: number | undefined, maxTurns: number): string[] {
   const args = [
     "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes",
@@ -149,6 +160,7 @@ function childArgs(promptArgument: string, options: ChildPiOptions, maxTokens: n
   if (options.model) args.push("--model", options.model);
   // Explicit -e paths still load when discovery is disabled. The extension uses
   // Pi's documented before_provider_request hook rather than an invented CLI API.
+  if (options.loadContextEngineer) args.push("--extension", contextEngineerExtensionPath());
   args.push("--extension", childBudgetExtensionPath(), "--ce-child-max-turns", String(maxTurns));
   if (maxTokens !== undefined) args.push("--ce-child-max-tokens", String(maxTokens));
   // Pi documents -- as the option terminator. It also makes prompts beginning
@@ -476,7 +488,7 @@ export async function runChildPiResult(prompt: string, options: ChildPiOptions):
     try {
       child = spawn(process.env.PI_BIN ?? "pi", args, {
         cwd: options.cwd,
-        env: process.env,
+        env: options.loadContextEngineer ? { ...process.env, [CONTEXT_ENGINEER_CHILD_ENV]: "delegate" } : process.env,
         stdio: ["ignore", "pipe", "pipe"],
         // A dedicated POSIX group includes tool subprocesses started by child Pi.
         detached: process.platform !== "win32",

@@ -53,13 +53,17 @@ const focus = await extensions.fovea_focus({
   maxTokens: 500,
 });
 
-return extensions.ctx_summarize({
-  text: focus,
+return (await extensions.ctx_summarize({
+  text: focus.text,
   maxTokens: 300,
-});
+})).text;
 ```
 
 A Fovea call with `maxTokens` is classified as a budgeted `SELECT` operation. Context Engineer does not reproduce Fovea's code graph.
+
+### Fabric child agents
+
+When CE is enabled, each extension-enabled Fabric Pi child that loads CE adds `ctx_read` to its own captured-tool allowlist before Fabric initializes, so the child can read back what CE offloaded in it without the caller listing the helper. This repeats at every depth. Like Fabric's own `agents.childQuestionTools` grant, it is skipped for an explicit empty `tools` list and for `+name`/`-name` lists; a malformed allowlist fails closed. Where no read path exists (a withheld allowlist, or a Pi `--tools` list without `ctx_read`), CE keeps the result inline rather than returning a handle that cannot be read. CE's isolated `ctx_delegate` fallback loads CE restricted to `ctx_read`, so a delegated child cannot delegate again. Other CE and Fovea extension tools remain opt-in; an explicit `extensions: false`/`--no-extensions` request and non-Pi runners are still intentional opt-outs.
 
 ### Context-effect registry (v0.5)
 

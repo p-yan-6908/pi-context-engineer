@@ -18,7 +18,8 @@ import { ContextStore, DEFAULT_CONTEXT_STORE_TTL_MS, MAX_CONTEXT_STORE_BYTES } f
 import { compactErrorOutput, isVerboseEditAcknowledgement, structuralPreview } from "./preview.js";
 import { ceTools, isErrorResult, summarizeText, type ToolContext } from "./tools.js";
 import { evaluateProgram, runtimeAdvisoryLine, type WrapperOptions } from "./wrapper.js";
-import { runChildPiResult } from "./child.js";
+import { CONTEXT_ENGINEER_CHILD_ENV, runChildPiResult } from "./child.js";
+import { enableFabricContextReadForChild, FABRIC_CONTEXT_READ_TOOL } from "./compat/fabric.js";
 import { ContextTelemetry } from "./telemetry.js";
 import { FabricExecutionScopes } from "./execution-scope.js";
 import { DEFAULT_RUNTIME_OFFLOAD_BYTES, resolveRuntimeByteBudget, validateContextBoundaryPolicy, type ContextBoundaryPolicy } from "./quantitative-policy.js";
@@ -218,6 +219,23 @@ function formatHandleText(
 // ---- Extension setup ----
 
 export default function contextEngineer(pi: ExtensionAPI): void {
+  const initialConfig = loadConfigWithWarnings(process.cwd()).config;
+  const fabricContextRead = enableFabricContextReadForChild(initialConfig.enabled !== false);
+  // A ctx_delegate child gets ctx_read only: no recursive delegation, memory
+  // writes, or nested CE programs beneath the parent's deadline.
+  const delegateChild = process.env[CONTEXT_ENGINEER_CHILD_ENV] === "delegate";
+  const registerTool: ExtensionAPI["registerTool"] = (tool) => {
+    if (!delegateChild || tool.name === FABRIC_CONTEXT_READ_TOOL) pi.registerTool(tool);
+  };
+  // The read path a handle for this result can name, or undefined when this
+  // process has none; an unreadable handle would turn offload into data loss.
+  // Pi's --tools allowlist also governs extension tools.
+  const readSurfaceFor = (toolName: string): ReadSurface | undefined => {
+    if (toolName === "fabric_exec") return fabricContextRead ? "fabric" : undefined;
+    const active = pi.getActiveTools?.();
+    if (!active || active.includes(FABRIC_CONTEXT_READ_TOOL)) return "model";
+    return fabricContextRead && active.includes("fabric_exec") ? "fabric" : undefined;
+  };
   const configCache = new Map<string, { mtimeMs: number; config: CeConfig; warnings: string[] }>();
 
   const configFor = (cwd: string): CeConfig => configWithWarnings(cwd).config;
@@ -401,6 +419,16 @@ export default function contextEngineer(pi: ExtensionAPI): void {
       return undefined;
     }
 
+    const surface = readSurfaceFor(event.toolName);
+    if (!surface) {
+      telemetry.record(ctx.cwd, {
+        strategy: "PASS", tool: event.toolName, sourceBytes: textBytes, visibleBytes: textBytes,
+        mainTokensPrevented: 0, mainTokensInjected: Math.ceil(textBytes / 4),
+        note: "kept inline: ctx_read is not available in this process",
+      });
+      return undefined;
+    }
+
     const key = `${event.toolName}-${inputHint(input)}`.replace(/[^a-z0-9-]/gi, "-").slice(0, 48);
     let offloaded: ReturnType<ContextStore["write"]>;
     try {
@@ -410,7 +438,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
       telemetry.recordStorageFailure(ctx.cwd, event.toolName, err);
       return undefined;
     }
-    const recovery = `Full original ${textBlocks.length === 1 ? "text" : "text blocks (with original indices)"}: ${readRecipe(offloaded.id, event.toolName === "fabric_exec" ? "fabric" : "model")}`;
+    const recovery = `Full original ${textBlocks.length === 1 ? "text" : "text blocks (with original indices)"}: ${readRecipe(offloaded.id, surface)}`;
     let replacement: string;
     const compressed = event.isError || resultPolicy === "summarize";
     if (event.isError) {
@@ -421,7 +449,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
       const summary = JSON.stringify(summarizeText(payload, Math.floor(previewBytes / 4)));
       replacement = `Structural summary:\n${structuralPreview(summary, previewBytes)}\n${recovery}`;
     } else {
-      replacement = formatHandleText(offloaded.id, offloaded.bytes, offloaded.estimatedTokens, payload, previewBytes, event.toolName === "fabric_exec" ? "fabric" : "model");
+      replacement = formatHandleText(offloaded.id, offloaded.bytes, offloaded.estimatedTokens, payload, previewBytes, surface);
     }
     // Preserve media positions and a bounded allowance of short independent
     // text notes. The handle retains ALL original text blocks with indices.
@@ -479,7 +507,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   // and handler functions in tools.ts.
 
   for (const def of ceTools) {
-    pi.registerTool({
+    registerTool({
       name: def.name,
       label: def.name,
       description: def.description,
@@ -550,6 +578,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
             timeoutMs: opts?.timeoutMs ?? 90_000,
             maxTokens: opts?.maxTokens ?? 1200,
             maxTurns: opts?.maxTurns ?? 8,
+            loadContextEngineer: toolConfig.enabled !== false,
           }),
           modelCall: (prompt, maxTokens, opts) => child(prompt, {
             cwd: execCtx.cwd,
@@ -622,7 +651,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   // ctx_offload tool (for manual offloading)
   // ================================================================
 
-  pi.registerTool({
+  registerTool({
     name: "ctx_offload",
     label: "ctx_offload",
     description:
@@ -689,7 +718,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   // ctx_status tool (policy introspection for agents)
   // ================================================================
 
-  pi.registerTool({
+  registerTool({
     name: "ctx_status",
     label: "ctx_status",
     description:
@@ -760,7 +789,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   // ce_exec remains useful as an explicit validation tool the model
   // can call to check a program before running it.
 
-  pi.registerTool({
+  registerTool({
     name: "ce_exec",
     label: "ce_exec",
     description:

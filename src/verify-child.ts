@@ -3,16 +3,26 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "no
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import childBudgetExtension, { capProviderPayload, CHILD_MAX_TOKENS_FLAG, CHILD_MAX_TURNS_FLAG, CHILD_BUDGET_METADATA_KEY } from "./child-budget.js";
-import { MAX_CHILD_INLINE_PROMPT_BYTES, MAX_CHILD_STDERR_BYTES, MAX_CHILD_STDOUT_BYTES, runChildPi, runChildPiResult, type Usage } from "./child.js";
+import { CONTEXT_ENGINEER_CHILD_ENV, MAX_CHILD_INLINE_PROMPT_BYTES, MAX_CHILD_STDERR_BYTES, MAX_CHILD_STDOUT_BYTES, runChildPi, runChildPiResult, type Usage } from "./child.js";
 import contextEngineer from "./index.js";
+import { enableFabricContextReadForChild, FABRIC_CONTEXT_READ_TOOL } from "./compat/fabric.js";
 import { ceToolMap } from "./tools.js";
 import { ContextStore } from "./store.js";
 
 const root = mkdtempSync(join(tmpdir(), "ce-child-"));
-const envBefore = { PI_BIN: process.env.PI_BIN, CE_TEST_READY: process.env.CE_TEST_READY, CE_TEST_ARGS: process.env.CE_TEST_ARGS };
+const envBefore = {
+  PI_BIN: process.env.PI_BIN,
+  CE_TEST_READY: process.env.CE_TEST_READY,
+  CE_TEST_ARGS: process.env.CE_TEST_ARGS,
+  CE_TEST_ENV: process.env.CE_TEST_ENV,
+  PI_FABRIC_DEPTH: process.env.PI_FABRIC_DEPTH,
+  PI_FABRIC_TOOL_ALLOWLIST: process.env.PI_FABRIC_TOOL_ALLOWLIST,
+  PI_CONTEXT_ENGINEER_CHILD: process.env.PI_CONTEXT_ENGINEER_CHILD,
+};
 const fixture = join(root, "fake-pi.mjs");
 const ready = join(root, "ready.json");
 const argsFile = join(root, "args.json");
+const envFile = join(root, "env.json");
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 let checks = 0;
 async function waitFor(test: () => boolean, label: string) {
@@ -44,6 +54,53 @@ function fixtureUsage(): Usage {
   };
 }
 try {
+  const fabricEnvBefore = {
+    depth: process.env.PI_FABRIC_DEPTH,
+    allowlist: process.env.PI_FABRIC_TOOL_ALLOWLIST,
+  };
+  const grant = (allowlist: string, enabled = true) => {
+    process.env.PI_FABRIC_TOOL_ALLOWLIST = allowlist;
+    return { permitted: enableFabricContextReadForChild(enabled), allowlist: process.env.PI_FABRIC_TOOL_ALLOWLIST };
+  };
+  process.env.PI_FABRIC_DEPTH = "1";
+  assert.deepEqual(grant('["read","grep","fabric_exec"]'), { permitted: true, allowlist: JSON.stringify(["read", "grep", "fabric_exec", FABRIC_CONTEXT_READ_TOOL]) });
+  assert.equal(enableFabricContextReadForChild(true), true);
+  assert.deepEqual(JSON.parse(process.env.PI_FABRIC_TOOL_ALLOWLIST!), ["read", "grep", "fabric_exec", FABRIC_CONTEXT_READ_TOOL]);
+  assert.deepEqual(grant('["read"]', false), { permitted: false, allowlist: '["read"]' });
+  // Fabric's own child grants skip an explicit empty tool list and +/- modifier lists.
+  assert.deepEqual(grant('["fabric_exec"]'), { permitted: false, allowlist: '["fabric_exec"]' });
+  assert.deepEqual(grant('["+read"]'), { permitted: false, allowlist: '["+read"]' });
+  assert.deepEqual(grant('["ctx_*"]'), { permitted: true, allowlist: '["ctx_*"]' });
+  assert.deepEqual(grant("not-json"), { permitted: false, allowlist: "not-json" });
+  delete process.env.PI_FABRIC_DEPTH;
+  assert.deepEqual(grant('["read"]'), { permitted: true, allowlist: '["read"]' });
+  checks += 9;
+
+  // A child that cannot read a handle keeps the result inline instead.
+  const offloadedText = async (allowlist: string): Promise<string | undefined> => {
+    process.env.PI_FABRIC_DEPTH = "1";
+    process.env.PI_FABRIC_TOOL_ALLOWLIST = allowlist;
+    const handlers: Array<(event: any, ctx: any) => Promise<any>> = [];
+    contextEngineer({ on: (name: string, handler: any) => { if (name === "tool_result") handlers.push(handler); }, registerTool() {}, registerCommand() {} } as any);
+    const event = { toolName: "fabric_exec", toolCallId: "child-call", input: {}, details: {}, isError: false, content: [{ type: "text", text: "x".repeat(40_000) }] };
+    let text: string | undefined;
+    for (const handler of handlers) text = (await handler(event, { cwd: root }))?.content?.[0]?.text ?? text;
+    return text;
+  };
+  assert.equal(await offloadedText('["fabric_exec"]'), undefined);
+  assert.match((await offloadedText('["read","fabric_exec"]')) ?? "", /^\[offloaded to handle "[^"]+"[\s\S]*extensions\.ctx_read/);
+  checks += 2;
+  if (fabricEnvBefore.depth === undefined) delete process.env.PI_FABRIC_DEPTH;
+  else process.env.PI_FABRIC_DEPTH = fabricEnvBefore.depth;
+  if (fabricEnvBefore.allowlist === undefined) delete process.env.PI_FABRIC_TOOL_ALLOWLIST;
+  else process.env.PI_FABRIC_TOOL_ALLOWLIST = fabricEnvBefore.allowlist;
+
+  process.env[CONTEXT_ENGINEER_CHILD_ENV] = "delegate";
+  const delegateTools: string[] = [];
+  contextEngineer({ on() {}, registerTool: (tool: any) => delegateTools.push(tool.name), registerCommand() {} } as any);
+  delete process.env[CONTEXT_ENGINEER_CHILD_ENV];
+  assert.deepEqual(delegateTools, [FABRIC_CONTEXT_READ_TOOL]); checks++;
+
   const cancelled = new AbortController();
   cancelled.abort(new Error("cancel before spawn"));
   process.env.PI_BIN = join(root, "does-not-exist");
@@ -147,6 +204,7 @@ import { spawn } from 'node:child_process';
 const promptArgument = process.argv.at(-1);
 const prompt = promptArgument?.startsWith('@') ? readFileSync(promptArgument.slice(1), 'utf8') : promptArgument;
 if (process.env.CE_TEST_ARGS) writeFileSync(process.env.CE_TEST_ARGS, JSON.stringify(process.argv.slice(2)));
+if (process.env.CE_TEST_ENV) writeFileSync(process.env.CE_TEST_ENV, JSON.stringify({ ceChild: process.env.PI_CONTEXT_ENGINEER_CHILD ?? null }));
 const usage1 = {input:10, output:4, cacheRead:2, cacheWrite:1, totalTokens:16, reasoning:1, cacheWrite1h:1, cost:{input:0.01, output:0.02, cacheRead:0.003, cacheWrite:0.004, total:0.037}};
 const usage2 = {input:20, output:5, cacheRead:3, cacheWrite:0, totalTokens:28, cost:{input:0.02, output:0.025, cacheRead:0.004, cacheWrite:0, total:0.049}};
 const assistant = (text, usage, stopReason='stop', errorMessage, api='openai-completions') => ({role:'assistant', content:[{type:'text', text}], api, provider:'fixture', model:'fixture', ...(usage === undefined ? {} : {usage}), stopReason, ...(errorMessage ? {errorMessage} : {}), timestamp:Date.now()});
@@ -173,6 +231,7 @@ if (prompt === 'failure') { console.error('fixture failure'); process.exit(7); }
     process.env.PI_BIN = fixture;
     process.env.CE_TEST_READY = ready;
     process.env.CE_TEST_ARGS = argsFile;
+    process.env.CE_TEST_ENV = envFile;
 
     assert.equal(await runChildPi("success", { cwd: root, model: "fixture/model", maxTokens: 321, maxTurns: 3 }), "complete"); checks++;
     const childArgs = JSON.parse(readFileSync(argsFile, "utf8")) as string[];
@@ -183,7 +242,18 @@ if (prompt === 'failure') { console.error('fixture failure'); process.exit(7); }
     assert.equal(argValue("--ce-child-max-turns"), "3");
     assert.ok(childArgs.includes("--extension"));
     assert.equal(childArgs[childArgs.indexOf("--") + 1], "success");
-    checks += 6;
+    const extensionPaths = childArgs.flatMap((arg, index) => arg === "--extension" ? [childArgs[index + 1]] : []);
+    assert.equal(extensionPaths.length, 1);
+    assert.match(extensionPaths[0]!, /child-budget\.(?:ts|js)$/);
+    assert.deepEqual(JSON.parse(readFileSync(envFile, "utf8")), { ceChild: null });
+    assert.equal(await runChildPi("success", { cwd: root, loadContextEngineer: true }), "complete");
+    const ceChildArgs = JSON.parse(readFileSync(argsFile, "utf8")) as string[];
+    const ceExtensionPaths = ceChildArgs.flatMap((arg, index) => arg === "--extension" ? [ceChildArgs[index + 1]] : []);
+    assert.equal(ceExtensionPaths.length, 2);
+    assert.match(ceExtensionPaths[0]!, /index\.(?:ts|js)$/);
+    assert.match(ceExtensionPaths[1]!, /child-budget\.(?:ts|js)$/);
+    assert.deepEqual(JSON.parse(readFileSync(envFile, "utf8")), { ceChild: "delegate" });
+    checks += 13;
 
     assert.equal(await runChildPi("-leading", { cwd: root, maxTokens: 321, maxTurns: 1 }), "dash-safe");
     const dashArgs = JSON.parse(readFileSync(argsFile, "utf8")) as string[];
@@ -304,6 +374,17 @@ if (prompt === 'failure') { console.error('fixture failure'); process.exit(7); }
       const params = name === "ctx_delegate" ? { prompt: "tree" } : { text: "long text", mode: "model" };
       const result = tools.get(name).execute("child", params, name === "ctx_delegate" ? abort.signal : undefined, undefined, { cwd: root, signal: abort.signal });
       const toolPids = await readyPids();
+      const delegatedArgs = JSON.parse(readFileSync(argsFile, "utf8")) as string[];
+      const delegatedExtensions = delegatedArgs.flatMap((arg, index) => arg === "--extension" ? [delegatedArgs[index + 1]] : []);
+      const delegatedEnv = JSON.parse(readFileSync(envFile, "utf8"));
+      if (name === "ctx_delegate") {
+        assert.equal(delegatedExtensions.length, 2);
+        assert.match(delegatedExtensions[0]!, /index\.(?:ts|js)$/);
+        assert.deepEqual(delegatedEnv, { ceChild: "delegate" });
+      } else {
+        assert.equal(delegatedExtensions.length, 1);
+        assert.deepEqual(delegatedEnv, { ceChild: null });
+      }
       abort.abort(new Error("parent cancelled"));
       await assert.rejects(result, /parent cancelled/); checks++;
       await stopped(toolPids);

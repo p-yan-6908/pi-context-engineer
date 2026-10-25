@@ -38,6 +38,60 @@ export const FABRIC_NESTED_TOOL_CALL_ID_PREFIX = typeof protocol?.FABRIC_NESTED_
   ? protocol.FABRIC_NESTED_TOOL_CALL_ID_PREFIX
   : "fabric_";
 
+// PI_FABRIC_DEPTH is part of Fabric's documented child environment contract;
+// the allowlist variable is internal, so its use stays in this module.
+const FABRIC_DEPTH_ENV = "PI_FABRIC_DEPTH";
+const FABRIC_TOOL_ALLOWLIST_ENV = "PI_FABRIC_TOOL_ALLOWLIST";
+const FABRIC_EXEC_TOOL = "fabric_exec";
+export const FABRIC_CONTEXT_READ_TOOL = "ctx_read";
+
+/** Fabric's allowlist matching: exact names, or `*` wildcards. */
+function allowlistPermits(entries: readonly string[], name: string): boolean {
+  return entries.some(entry => entry.includes("*")
+    ? new RegExp(`^${entry.split("*").map(part => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`, "s").test(name)
+    : entry === name);
+}
+
+/**
+ * Fabric's child allowlist is intentionally fail-closed. When CE is enabled,
+ * however, an extension-enabled child must be able to recover an input that
+ * CE offloaded at the model boundary. This is the narrow, read-only CE
+ * exception; other optional CE/Fovea tools remain governed by Fabric. Fabric
+ * creates its runtime lazily, so this runs during extension setup before the
+ * child-side captured provider is constructed. The parent-side allowlist is
+ * not changed. Every extension-enabled descendant that loads CE repeats this.
+ *
+ * The grant follows Fabric's own `agents.childQuestionTools` rule: it is
+ * skipped for an explicit empty `tools` list and for `+name`/`-name` lists.
+ * A malformed allowlist fails closed, as it does in Fabric.
+ *
+ * Returns whether nested `extensions.ctx_read` is permitted afterwards; CE
+ * must not offload to a handle this process cannot read back.
+ */
+export function enableFabricContextReadForChild(enabled: boolean): boolean {
+  if (!(Number(process.env[FABRIC_DEPTH_ENV]) > 0)) return true;
+
+  const raw = process.env[FABRIC_TOOL_ALLOWLIST_ENV];
+  if (raw === undefined) return true;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+  if (!Array.isArray(parsed) || !parsed.every((name): name is string => typeof name === "string")) return false;
+  if (allowlistPermits(parsed, FABRIC_CONTEXT_READ_TOOL)) return true;
+
+  const requested = parsed.filter(name => name !== FABRIC_EXEC_TOOL);
+  if (!enabled || requested.length === 0 || requested.some(name => name.startsWith("+") || name.startsWith("-"))) return false;
+
+  process.env[FABRIC_TOOL_ALLOWLIST_ENV] = JSON.stringify([
+    ...parsed,
+    FABRIC_CONTEXT_READ_TOOL,
+  ]);
+  return true;
+}
+
 /**
  * Normalize a nested Fabric result proxy before QuickJS sees it. The official
  * parser is preferred when available; the exact v1 envelope remains supported
