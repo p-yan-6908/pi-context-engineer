@@ -577,19 +577,15 @@ if (!summarizeTool) {
   console.log("[FAIL] ctx_summarize is not registered");
   toolFailures++;
 } else {
-  let modelCalls = 0;
   const toolContext = {
     store: { read: () => ({ content: "", truncated: false }) },
     workspaceRoot: process.cwd(),
-    callTool: async () => ({}),
-    spawnAgent: async () => "",
-    modelCall: async () => { modelCalls++; return "model summary"; },
   } as any;
   const codeText = Array.from({ length: 120 }, (_, index) => `export function item${index}() { return ${index}; }`).join("\\n");
   const codeSummary = await summarizeTool.handler({ text: codeText, mode: "code", maxTokens: 120 }, toolContext);
   const codeRecord = codeSummary && typeof codeSummary === "object" ? codeSummary as Record<string, unknown> : {};
   const codeBytes = Buffer.byteLength(JSON.stringify(codeSummary), "utf8");
-  const codeOk = codeRecord.mode === "code" && codeRecord.kind === "code" && modelCalls === 0 && codeBytes <= 120 * 4;
+  const codeOk = codeRecord.mode === "code" && codeRecord.kind === "code" && codeBytes <= 120 * 4;
   console.log(`${codeOk ? "[ok]" : "[FAIL]"} ctx_summarize code mode is deterministic and bounded (${codeBytes} bytes)`);
   if (!codeOk) toolFailures++;
   const objectText = JSON.stringify(Object.fromEntries(Array.from({ length: 80 }, (_, index) => [`key${index}`, "x".repeat(180)])));
@@ -605,39 +601,5 @@ if (!summarizeTool) {
   if (!invalidOk) toolFailures++;
 }
 
-const delegateTool = ceToolMap.get("ctx_delegate");
-if (!delegateTool) {
-  console.log("[FAIL] ctx_delegate is not registered");
-  toolFailures++;
-} else {
-  let delegatedPrompt = "";
-  let delegatedTimeout = 0;
-  let recoveredDelegate = "";
-  const delegateContext = {
-    store: { write: (_key: string, _source: string, data: string) => { recoveredDelegate = data; return { id: "delegate-proof" }; } },
-    workspaceRoot: process.cwd(),
-    callTool: async () => ({}),
-    spawnAgent: async (prompt: string, opts?: { timeoutMs?: number }) => {
-      delegatedPrompt = prompt;
-      delegatedTimeout = opts?.timeoutMs ?? 0;
-      return "z".repeat(5000);
-    },
-    modelCall: async () => "",
-  } as any;
-  const delegated = await delegateTool.handler(
-    { prompt: "Audit the project", maxTokens: 100, timeoutSeconds: 500 },
-    delegateContext,
-  ) as Record<string, unknown>;
-  const delegateOk =
-    typeof delegated.result === "string" &&
-    Buffer.byteLength(delegated.result, "utf8") <= 400 &&
-    delegated.truncated === true &&
-    delegated.timeoutSeconds === 110 &&
-    delegatedTimeout === 110_000 &&
-    delegatedPrompt.includes("under 100 tokens") && recoveredDelegate.length === 5000 &&
-    (delegated.recovery as { id?: string })?.id === "delegate-proof";
-  console.log(`${delegateOk ? "[ok]" : "[FAIL]"} ctx_delegate bounds output and nested deadline`);
-  if (!delegateOk) toolFailures++;
-}
 console.log(`Tool checks: ${toolFailures === 0 ? "passed" : `${toolFailures} failed`}.`);
 process.exit(failed + wrapperFailures + toolFailures + scopeFailures + registryFailures + quantitativeFailures + differentialFailures + explanationFailures + aliasFailures + symbolicFailures + v05PolicyFailures + policyBoundaryFailures > 0 ? 1 : 0);

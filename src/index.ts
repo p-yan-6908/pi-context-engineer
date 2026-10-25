@@ -5,21 +5,19 @@
  * Initial model-facing results are budgeted, summarized, or offloaded with
  * exact recovery. Already-exposed messages and all internal Fabric values
  * remain untouched. Search semantics belong to Pi/Fabric, not this extension.
- * Standalone ctx_* helpers provide explicit selection, storage and isolation.
+ * ctx_read, ctx_summarize and ctx_offload provide explicit selection,
+ * compression and storage.
  */
 
 import { createHash } from "node:crypto";
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { Usage } from "@earendil-works/pi-ai";
-import { mergeUsage, readUsage } from "./usage.js";
 import { Type } from "typebox";
 import { ContextStore, DEFAULT_CONTEXT_STORE_TTL_MS, MAX_CONTEXT_STORE_BYTES } from "./store.js";
 import { compactErrorOutput, fabricSectionNames, isVerboseEditAcknowledgement, structuralPreview, type PreviewContentType } from "./preview.js";
 import { ceTools, isErrorResult, summarizeText, type ToolContext } from "./tools.js";
 import { evaluateProgram, runtimeAdvisoryLine, type WrapperOptions } from "./wrapper.js";
-import { CONTEXT_ENGINEER_CHILD_ENV, runChildPiResult } from "./child.js";
 import { enableFabricContextReadForChild, FABRIC_CONTEXT_READ_TOOL } from "./compat/fabric.js";
 import { ContextTelemetry, REPEATED_OFFLOADED_CALL_NOTE } from "./telemetry.js";
 import { FabricExecutionScopes } from "./execution-scope.js";
@@ -86,7 +84,7 @@ function loadConfig(cwd: string): CeConfig {
   return loadConfigWithWarnings(cwd).config;
 }
 
-/** Load config without throwing; bad JSON and invalid policy become warnings surfaced via ctx_status. */
+/** Load config without throwing; bad JSON and invalid policy become warnings surfaced by /ce settings. */
 function loadConfigWithWarnings(cwd: string): { config: CeConfig; warnings: string[] } {
   const warnings: string[] = [];
   const configPath = resolve(cwd, ".pi", "context-engineer.json");
@@ -170,12 +168,6 @@ function isProviderBounded(toolName: string, input: Record<string, unknown>, tex
     const maxTokens = typeof input.maxTokens === "number" ? input.maxTokens : undefined;
     if (maxTokens !== undefined && textLength <= maxTokens * 4) return true;
   }
-  // Budgeted ctx_recall declares maxTokens (default 1000 in tools.ts); exempt like fovea when actual fits.
-  if (/^(?:ctx_recall|extensions\.ctx_recall)$/.test(toolName)) {
-    const raw = (input as Record<string, unknown>).maxTokens;
-    const maxTokens = typeof raw === "number" ? raw : 1000;
-    if (Number.isFinite(maxTokens) && maxTokens >= 0 && textLength <= Math.floor(maxTokens) * 4) return true;
-  }
   return false;
 }
 
@@ -183,11 +175,10 @@ function inputHint(input: Record<string, unknown>): string {
   return String(input.path ?? input.pattern ?? input.command ?? input.script ?? input.code ?? input.query ?? "result");
 }
 
-function strategyForTool(toolName: string): "WRITE" | "SELECT" | "COMPRESS" | "ISOLATE" | "PASS" {
+function strategyForTool(toolName: string): "WRITE" | "SELECT" | "COMPRESS" | "PASS" {
   if (/offload/.test(toolName)) return "WRITE";
-  if (/read|grep|fovea|select|recall/.test(toolName)) return "SELECT";
+  if (/read|grep|fovea|select/.test(toolName)) return "SELECT";
   if (/summar|compress/.test(toolName)) return "COMPRESS";
-  if (/delegat|agent/.test(toolName)) return "ISOLATE";
   return "PASS";
 }
 
@@ -234,12 +225,6 @@ function formatHandleText(
 export default function contextEngineer(pi: ExtensionAPI): void {
   const initialConfig = loadConfigWithWarnings(process.cwd()).config;
   const fabricContextRead = enableFabricContextReadForChild(initialConfig.enabled !== false);
-  // A ctx_delegate child gets ctx_read only: no recursive delegation, memory
-  // writes, or nested CE programs beneath the parent's deadline.
-  const delegateChild = process.env[CONTEXT_ENGINEER_CHILD_ENV] === "delegate";
-  const registerTool: ExtensionAPI["registerTool"] = (tool) => {
-    if (!delegateChild || tool.name === FABRIC_CONTEXT_READ_TOOL) pi.registerTool(tool);
-  };
   // The read path a handle for this result can name, or undefined when this
   // process has none; an unreadable handle would turn offload into data loss.
   // Pi's --tools allowlist also governs extension tools.
@@ -286,20 +271,6 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     if (offloadedCalls.size > 256) offloadedCalls.delete(offloadedCalls.keys().next().value!);
   };
   const telemetry = new ContextTelemetry();
-  const failedChildUsage = new Map<string, { usage?: Usage; complete: boolean }>();
-  // execute must throw on failure. Restore measured usage through Pi's
-  // supported middleware instead of marking a failed tool as successful.
-  pi.on("tool_result", async (event) => {
-    const pending = failedChildUsage.get(event.toolCallId);
-    if (!pending) return undefined;
-    failedChildUsage.delete(event.toolCallId);
-    const usage = event.usage ?? pending.usage;
-    return {
-      ...(usage ? { usage } : {}),
-      details: { ...asRecord(event.details), ce_child_usage_complete: pending.complete },
-    };
-  });
-
   const storeFor = (cwd: string, cfg: CeConfig): ContextStore => new ContextStore(
     cwd,
     ".pi/context-store",
@@ -542,12 +513,11 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   // ================================================================
   // Standalone CE tools
   // ================================================================
-  // These are available for the model to call directly. They cover all
-  // four CE strategies. The tools are thin wrappers around the store
-  // and handler functions in tools.ts.
+  // Thin wrappers around the store and handler functions in tools.ts,
+  // callable directly or as extensions.* inside Fabric programs.
 
   for (const def of ceTools) {
-    registerTool({
+    pi.registerTool({
       name: def.name,
       label: def.name,
       description: def.description,
@@ -567,77 +537,17 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           })
         )
       ),
-      async execute(_id, params, signal, _onUpdate, execCtx) {
-        const currentModel = execCtx.model
-          ? `${execCtx.model.provider}/${execCtx.model.id}`
-          : undefined;
+      async execute(_id, params, _signal, _onUpdate, execCtx) {
         const toolConfig = configFor(execCtx.cwd);
-        let childUsage: Usage | undefined;
-        let childCalls = 0;
-        let childUsageComplete = true;
-        let childOutputTruncated = false;
-        const childBudgetModes = new Set<string>();
         const nested = fabricExecutions.isNestedToolResult(_id);
-        const captureUsage = (result: { usage?: unknown; usageComplete?: boolean; outputTruncated?: boolean; budgetEnforcement?: string }) => {
-          childOutputTruncated ||= result.outputTruncated === true;
-          if (result.budgetEnforcement) childBudgetModes.add(result.budgetEnforcement);
-          const observed = readUsage(result.usage);
-          const complete = observed !== undefined && result.usageComplete !== false;
-          childUsage = mergeUsage(childUsage, observed);
-          childUsageComplete &&= complete;
-          telemetry.record(execCtx.cwd, {
-            strategy: "ISOLATE", tool: def.name,
-            internalTokensProcessed: observed?.totalTokens, mainTokensInjected: 0, mainTokensPrevented: 0,
-            childUsage: observed, childUsageComplete: complete, usageInParent: !nested,
-            note: nested ? "child usage outside native totals (Fabric capture)" : "child usage included via native tool Usage",
-          });
-        };
-        const child = async (prompt: string, options: Parameters<typeof runChildPiResult>[1]): Promise<string> => {
-          childCalls++;
-          try {
-            const result = await runChildPiResult(prompt, options);
-            captureUsage(result);
-            return result.text;
-          } catch (error) {
-            captureUsage((error ?? {}) as { usage?: unknown; usageComplete?: boolean; outputTruncated?: boolean; budgetEnforcement?: string });
-            throw error;
-          }
-        };
         const toolCtx: ToolContext = {
           store: storeFor(execCtx.cwd, toolConfig),
           workspaceRoot: execCtx.cwd,
-          signal: signal ?? execCtx.signal,
           maxReturnBytes: effectiveOffloadThreshold(toolConfig),
-          callTool: async () => {
-            throw new Error("callTool is only available inside a Fabric program; use pi.* or extensions.* there.");
-          },
-          spawnAgent: (prompt, opts) => child(prompt, {
-            cwd: execCtx.cwd,
-            signal: signal ?? execCtx.signal,
-            model: opts?.model ?? currentModel,
-            timeoutMs: opts?.timeoutMs ?? 90_000,
-            maxTokens: opts?.maxTokens ?? 1200,
-            maxTurns: opts?.maxTurns ?? 8,
-            loadContextEngineer: toolConfig.enabled !== false,
-          }),
-          modelCall: (prompt, maxTokens, opts) => child(prompt, {
-            cwd: execCtx.cwd,
-            signal: opts?.signal ?? signal ?? execCtx.signal,
-            model: currentModel,
-            noTools: true,
-            maxTokens: maxTokens ?? 500,
-            maxTurns: 1,
-            timeoutMs: 90_000,
-          }),
         };
 
         try {
-          const handled = await def.handler(params, toolCtx);
-          const result = childCalls && asRecord(handled) ? {
-            ...asRecord(handled),
-            ...(childOutputTruncated ? { childOutputTruncated: true } : {}),
-            ...(childBudgetModes.has("stream") ? { generationBudget: { enforcement: "stream", approximate: true, mayOvershoot: true } } : {}),
-          } : handled;
+          const result = await def.handler(params, toolCtx);
           const serialized = typeof result === "string" ? result : JSON.stringify(result, null, 2);
           if (isErrorResult(result)) throw new Error(serialized);
           const resultRecord = result && typeof result === "object" ? result as Record<string, unknown> : undefined;
@@ -651,8 +561,8 @@ export default function contextEngineer(pi: ExtensionAPI): void {
             // An explicit read/summary is not a second prevention of the source
             // already offloaded. Nested helper results are not Main exposure.
             mainTokensPrevented: 0,
-            mainTokensInjected: fabricExecutions.isNestedToolResult(_id) ? 0 : Math.ceil(Buffer.byteLength(serialized, "utf8") / 4),
-            note: fabricExecutions.isNestedToolResult(_id) ? "internal CE helper result" : "CE helper result",
+            mainTokensInjected: nested ? 0 : Math.ceil(Buffer.byteLength(serialized, "utf8") / 4),
+            note: nested ? "internal CE helper result" : "CE helper result",
             ...(typeof (params as { id?: unknown }).id === "string" ? { handle: (params as { id: string }).id } : {}),
           });
           // Preserve exact structured helper values, including nested Fabric consumers.
@@ -662,27 +572,18 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           const isOffloadHandle = !!maybeHandle && typeof maybeHandle.id === "string" && (typeof handleBytes === "number" || typeof handleTokens === "number" || typeof maybeHandle.preview === "string");
           return {
             content: [{ type: "text" as const, text: serialized }],
-            ...(childUsage ? { usage: childUsage } : {}),
             details: isOffloadHandle
               ? {
                   tool: def.name,
                   result,
-                  ...(childCalls ? { ce_child_calls: childCalls, ce_child_usage: childUsage, ce_child_usage_complete: childUsageComplete, ce_child_budget_enforcement: [...childBudgetModes], ce_child_output_truncated: childOutputTruncated } : {}),
                   id: maybeHandle.id as string,
                   ...(typeof handleBytes === "number" ? { bytes: handleBytes as number } : {}),
                   ...(typeof handleTokens === "number" ? { estimatedTokens: handleTokens as number } : {}),
                 }
-              : { tool: def.name, result, ...(childCalls ? { ce_child_calls: childCalls, ce_child_usage: childUsage, ce_child_usage_complete: childUsageComplete, ce_child_budget_enforcement: [...childBudgetModes], ce_child_output_truncated: childOutputTruncated } : {}) },
+              : { tool: def.name, result },
           };
         } catch (err) {
-          // Fabric currently drops captured Usage; telemetry above keeps it
-          // independently visible without guessing at concurrent parent IDs.
-          if (childCalls && !nested) {
-            failedChildUsage.set(_id, { usage: childUsage, complete: childUsageComplete });
-            if (failedChildUsage.size > 256) failedChildUsage.delete(failedChildUsage.keys().next().value!);
-          }
-          throw Object.assign(new Error(`Tool ${def.name} failed: ${err instanceof Error ? err.message : String(err)}`, { cause: err }),
-            childCalls ? { usage: childUsage, usageComplete: childUsageComplete } : {});
+          throw new Error(`Tool ${def.name} failed: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
         }
       },
     });
@@ -692,7 +593,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   // ctx_offload tool (for manual offloading)
   // ================================================================
 
-  registerTool({
+  pi.registerTool({
     name: "ctx_offload",
     label: "ctx_offload",
     description:
@@ -756,145 +657,6 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   });
 
   // ================================================================
-  // ctx_status tool (policy introspection for agents)
-  // ================================================================
-
-  registerTool({
-    name: "ctx_status",
-    label: "ctx_status",
-    description:
-      "Report context-engineer policy state: enabled, strict mode, result policy, " +
-      "offload/error thresholds, and token savings for one scope. Compact by default; detail=full includes all scopes and diagnostic breakdowns.",
-    parameters: Type.Object({
-      scope: Type.Optional(Type.Union([
-        Type.Literal("runtime"),
-        Type.Literal("session"),
-        Type.Literal("lifetime"),
-      ], { description: "Telemetry scope to report. Default: session." })),
-      detail: Type.Optional(Type.Union([Type.Literal("compact"), Type.Literal("full")], {
-        description: "Compact (default) returns one scope without per-event/per-strategy breakdowns; full restores all three scopes and diagnostics.",
-      })),
-    }),
-    async execute(_id, params, _signal, _onUpdate, execCtx) {
-      const cfg = configFor(execCtx.cwd);
-      const requestedScope = (params as { scope?: unknown }).scope;
-      const scope = requestedScope === "runtime" || requestedScope === "lifetime" ? requestedScope : "session";
-      const full = (params as { detail?: unknown }).detail === "full";
-      // Default status reads only the requested scope, not the lifetime event log three times.
-      const summaries = new Map<string, ReturnType<ContextTelemetry["summary"]>>();
-      const getSummary = (selected: "runtime" | "session" | "lifetime") => {
-        if (!summaries.has(selected)) summaries.set(selected, selected === "runtime"
-          ? telemetry.runtimeSummary(execCtx.cwd) : telemetry.summary(execCtx.cwd, selected === "lifetime"));
-        return summaries.get(selected)!;
-      };
-      const selectedSummary = getSummary(scope);
-      const { byStrategy: _byStrategy, largest: _largest, ...compactSummary } = selectedSummary;
-      const summary = full ? selectedSummary : compactSummary;
-      const effectiveReadThreshold = effectiveOffloadThreshold(cfg);
-      const warnings = configWarningsFor(execCtx.cwd);
-      const body = {
-        enabled: cfg.enabled !== false,
-        strict: cfg.strict ?? false,
-        resultPolicy: normalizeResultPolicy(cfg.resultPolicy),
-        readOffloadThreshold: effectiveReadThreshold,
-        nestedResultThreshold: null, // Deprecated: Fabric owns internal transport limits.
-        errorCompactionThreshold: boundedNumber(cfg.errorCompactionThreshold, ERROR_COMPACTION_THRESHOLD, 256),
-        errorCompactionPreviewBytes: boundedNumber(cfg.errorCompactionPreviewBytes, ERROR_COMPACTION_PREVIEW_BYTES, 256, 64_000),
-        runtimeAdvisoryThreshold: cfg.runtimeAdvisoryThreshold ?? 0,
-        blockUnboundedReturns: cfg.strict === true || cfg.blockUnboundedReturns === true,
-        compactStaleResults: false, // Legacy field: historical context is never rewritten.
-        compactEditResults: cfg.compactEditResults !== false,
-        notifyOnStart: cfg.notifyOnStart === true,
-        offloadPreviewBytes: boundedNumber(cfg.offloadPreviewBytes, PREVIEW_BYTES, 256, 4096),
-        storeTtlMs: cfg.storeTtlMs ?? DEFAULT_CONTEXT_STORE_TTL_MS,
-        storeMaxBytes: Math.min(MAX_CONTEXT_STORE_BYTES, cfg.storeMaxBytes ?? MAX_CONTEXT_STORE_BYTES),
-        maxReturnTokens: cfg.maxReturnTokens ?? 4000,
-        telemetryScope: scope,
-        warnings,
-        policy: `runtime guard executes uncertain programs and auto-offloads actual ${effectiveReadThreshold}-byte+ boundary results (~${Math.ceil(effectiveReadThreshold / 4)} tokens ASCII-biased); static maxBytes 8KB unifies via policy.maxBytes; strict/blockUnboundedReturns restores fail-closed preflight`,
-        detail: full ? "full" : "compact",
-        summary,
-        ...(full ? { runtime: getSummary("runtime"), session: getSummary("session"), lifetime: getSummary("lifetime") } : {}),
-      };
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(body, null, 2) }],
-        details: body,
-      };
-    },
-  });
-
-  // ================================================================
-  // ce_exec tool (pre-flight validation gate)
-  // ================================================================
-  // Even though we now intercept fabric_exec directly via tool_call,
-  // ce_exec remains useful as an explicit validation tool the model
-  // can call to check a program before running it.
-
-  registerTool({
-    name: "ce_exec",
-    label: "ce_exec",
-    description:
-      "Validate a fabric_exec TypeScript program for context engineering compliance. " +
-      "Programs that return raw tool results without processing are flagged. " +
-      "Returns PASS/WARN/BLOCK with guidance. The fabric_exec tool itself is now " +
-      "also intercepted automatically — this tool is for pre-checking.",
-    parameters: Type.Object({
-      program: Type.String({ description: "TypeScript program to validate." }),
-    }),
-    async execute(_id, params, _signal, _onUpdate, execCtx) {
-      const program = params.program as string;
-      const cfg = configFor(execCtx.cwd);
-
-      if (cfg.enabled === false) {
-        throw new Error("context-engineer is disabled by config.");
-      }
-
-      const decision = evaluateProgram(program, cfg);
-
-      if (decision.tier === "BLOCK") {
-        return {
-          // A BLOCK diagnostic is a successful validation, not an execution.
-          content: [{ type: "text" as const, text: decision.guidance }],
-          details: {
-            tier: "BLOCK",
-            blocked: true,
-            hardBlock: decision.analysis.hardBlock,
-            toolCalls: decision.analysis.metrics.toolCalls,
-            rawReturn: decision.analysis.metrics.returnIsRawToolResult,
-            returnTaint: decision.analysis.metrics.returnTaint,
-            reductionRatio: decision.analysis.metrics.estimatedReductionRatio,
-            provablyBounded: decision.analysis.metrics.provablyBounded,
-            returnIsReduced: decision.analysis.metrics.returnIsReduced,
-            transformationCount: decision.analysis.metrics.transformationCount,
-            boundedSelectionCalls: decision.analysis.metrics.boundedSelectionCalls,
-            hasProcessing: decision.analysis.metrics.hasProcessingBetweenToolAndReturn,
-          },
-        };
-      }
-
-      const message = decision.tier === "WARN"
-        ? `Program passed analysis with a warning:\n${decision.guidance}\n\nSafe to run via fabric_exec.`
-        : "Program passed context-engineering analysis. Safe to run via fabric_exec.";
-
-      return {
-        content: [{ type: "text" as const, text: message }],
-        details: {
-          blocked: false,
-          tier: decision.tier,
-          hardBlock: decision.analysis.hardBlock,
-          toolCalls: decision.analysis.metrics.toolCalls,
-          rawReturn: decision.analysis.metrics.returnIsRawToolResult,
-          returnTaint: decision.analysis.metrics.returnTaint,
-          reductionRatio: decision.analysis.metrics.estimatedReductionRatio,
-          boundedSelectionCalls: decision.analysis.metrics.boundedSelectionCalls,
-          hasProcessing: decision.analysis.metrics.hasProcessingBetweenToolAndReturn,
-          estimatedReturnTokens: decision.analysis.metrics.estimatedReturnTokens,
-        },
-      };
-    },
-  });
-
-  // ================================================================
   // Observability commands
   // ================================================================
 
@@ -914,7 +676,6 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           .map(([name, bucket]) => `  ${name.padEnd(8)} ${bucket.mainTokensPrevented.toLocaleString()} Main tokens prevented (${bucket.events} event${bucket.events === 1 ? "" : "s"})`);
         message = [
           `Context Engineer${allSessions ? " (all sessions)" : " (current session)"}`,
-          `Internal provider work: ${summary.internalTokensProcessed.toLocaleString()} tokens`,
           `Main tokens prevented: ${summary.mainTokensPrevented.toLocaleString()}`,
           `Main tokens injected: ${summary.mainTokensInjected.toLocaleString()}`,
           `Store tokens written: ${summary.storeTokensWritten.toLocaleString()}`,
@@ -928,7 +689,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         const events = telemetry.recent(ctx.cwd, 20, allSessions);
         message = events.length === 0
           ? "No Context Engineer events recorded."
-          : events.map((event) => `${event.timestamp.slice(11, 19)} ${event.strategy.padEnd(8)} ${event.tool} internal=${event.internalTokensProcessed} prevented=${event.mainTokensPrevented} injected=${event.mainTokensInjected} store=${event.storeTokensWritten}${event.note ? ` — ${event.note}` : ""}`).join("\n");
+          : events.map((event) => `${event.timestamp.slice(11, 19)} ${event.strategy.padEnd(8)} ${event.tool} prevented=${event.mainTokensPrevented} injected=${event.mainTokensInjected} store=${event.storeTokensWritten}${event.note ? ` — ${event.note}` : ""}`).join("\n");
       } else if (command === "settings") {
         const cfg = configFor(ctx.cwd);
         message = JSON.stringify({
@@ -958,7 +719,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           `The default runtime guard executes statically uncertain programs, keeps small results, and offloads actual ${effectiveReadThreshold}-byte+ boundary payloads (~${Math.ceil(effectiveReadThreshold / 4)} tokens ASCII-biased); policy.maxBytes unifies static/runtime byte budgets; resultPolicy controls inline/offload/summarize overrides.`,
           "Set strict=true or blockUnboundedReturns=true for fail-closed preflight. Explicit scalar projections, bounded selections, summaries, and offloads pass silently.",
           "Results are compacted before first exposure; already-exposed offload and ctx_read messages stay unchanged to preserve cacheable prefixes. Use Pi session compaction for accumulated history.",
-          "ctx_status reports runtime/session/lifetime savings; ce_exec pre-checks a program. At the model boundary use ctx_read; inside fabric_exec use extensions.ctx_read.",
+          "At the model boundary use ctx_read; inside fabric_exec use extensions.ctx_read.",
           "Use /ce status, /ce trace, /ce settings, or /ce status --all.",
         ].join("\n");
       } else if (command === "clear") {
@@ -977,7 +738,6 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   // ================================================================
 
   pi.on("session_start", async (_event, ctx) => {
-    failedChildUsage.clear();
     fabricExecutions.clear();
     handleReadingCalls.clear();
     offloadedCalls.clear();

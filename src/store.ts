@@ -27,7 +27,6 @@ import { fabricSection, fabricSectionNames, inferContentType, structuralPreview,
 
 export const DEFAULT_CONTEXT_STORE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 export const MAX_CONTEXT_STORE_BYTES = 500_000_000;
-export const DEFAULT_MEMORY_STORE_MAX_BYTES = 5_000_000;
 
 /** Extendable secret patterns redacted from previews and error text. */
 export const SECRET_REDACT_PATTERNS: RegExp[] = [
@@ -81,10 +80,6 @@ export interface StoreOptions {
 export interface StoreWriteOptions {
   contentType?: StoreEntry["contentType"];
   expiresAt?: string;
-  /** Replace an existing entry with the same key. */
-  upsert?: boolean;
-  /** Deduplicate identical content by hash. Defaults to true. */
-  deduplicate?: boolean;
 }
 
 export interface ReadOptions {
@@ -206,7 +201,7 @@ export class ContextStore {
     this.ensureLayout();
   }
 
-  /** Write a payload, deduplicating identical content by hash unless disabled. */
+  /** Write a payload, deduplicating identical content by hash. */
   write(
     key: string,
     source: string,
@@ -221,12 +216,7 @@ export class ContextStore {
       entries = this.cleanEntries(entries);
 
       const now = new Date().toISOString();
-      const existingByKey = writeOptions.upsert ? entries.find((entry) => entry.key === key) : undefined;
-      if (existingByKey) entries = entries.filter((entry) => entry.id !== existingByKey.id);
-
-      const existingByHash = writeOptions.deduplicate === false
-        ? undefined
-        : entries.find((entry) => entry.contentHash === contentHash && !this.isExpired(entry));
+      const existingByHash = entries.find((entry) => entry.contentHash === contentHash && !this.isExpired(entry));
       if (existingByHash) {
         existingByHash.lastAccessed = now;
         existingByHash.updatedAt = now;
@@ -315,25 +305,6 @@ export class ContextStore {
       return entries
         .map(({ blobPath: _blobPath, ...meta }) => meta)
         .sort((a, b) => b.created.localeCompare(a.created));
-    });
-  }
-
-  /** Remove expired entries and, when configured, oldest entries over budget. */
-  gc(options: StoreOptions = this.options, protectedId?: string): { removed: number; bytes: number } {
-    return this.withLock(() => {
-      const { removed, bytes } = this.gcLocked(protectedId, options);
-      return { removed, bytes };
-    });
-  }
-
-  delete(id: string): boolean {
-    return this.withLock(() => {
-      const entries = this.loadAll();
-      const remaining = entries.filter((entry) => entry.id !== id);
-      if (remaining.length === entries.length) return false;
-      this.writeIndex(remaining);
-      this.pruneUnreferencedBlobs(remaining);
-      return true;
     });
   }
 
@@ -827,29 +798,6 @@ export class ContextStore {
     return `${slug}-${contentHash.slice(0, 8)}-${suffix}`.toLowerCase().replace(/[^a-z0-9-]/g, "-");
   }
 }
-
-/**
- * Per-cwd ContextStore cache; avoids mkdir/chmod + index parsing per tool_result.
- * TTL sweep + byte-cap LRU eviction still run on write with the newest handle
- * protected (see gcLocked). Old handle IDs remain readable (lookup by equality).
- */
-export function cachedContextStore(workspaceRoot: string, relativeDir = ".pi/context-store", options: StoreOptions = {}): ContextStore {
-  const resolved = resolve(workspaceRoot, relativeDir);
-  const ttlMs = normalizeTtlMs(options.ttlMs);
-  const maxBytes = normalizeMaxBytes(options.maxBytes);
-  const key = `${resolved}::${ttlMs}::${maxBytes}`;
-  const hit = storeInstanceCache.get(key);
-  if (hit) return hit.store;
-  const store = new ContextStore(workspaceRoot, relativeDir, { ttlMs, maxBytes });
-  if (storeInstanceCache.size >= 32) {
-    const oldest = storeInstanceCache.keys().next();
-    if (!oldest.done) storeInstanceCache.delete(oldest.value);
-  }
-  storeInstanceCache.set(key, { store, ttlMs, maxBytes });
-  return store;
-}
-
-const storeInstanceCache = new Map<string, { store: ContextStore; ttlMs: number; maxBytes: number }>();
 
 function parseJsonPath(path: string): Array<string | number> | string {
   const input = path.trim();

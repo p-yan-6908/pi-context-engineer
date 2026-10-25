@@ -26,7 +26,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck src/*.ts",
     "build": "rm -rf .tmp/pi-ce-build && tsc --outDir .tmp/pi-ce-build --rootDir src --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck src/*.ts",
-    "verify": "npm run build && node .tmp/pi-ce-build/verify.js && node .tmp/pi-ce-build/verify-hooks.js && node .tmp/pi-ce-build/verify-adversarial.js && node .tmp/pi-ce-build/verify-runtime.js && node .tmp/pi-ce-build/verify-child.js && node .tmp/pi-ce-build/verify-remediation.js",
+    "verify": "npm run build && node .tmp/pi-ce-build/verify.js && node .tmp/pi-ce-build/verify-hooks.js && node .tmp/pi-ce-build/verify-adversarial.js && node .tmp/pi-ce-build/verify-runtime.js && node .tmp/pi-ce-build/verify-fabric-child.js && node .tmp/pi-ce-build/verify-remediation.js",
     "e2e": "npm run build && node .tmp/pi-ce-build/e2e.js",
     "test": "npm run verify"
   },
@@ -67,15 +67,9 @@
       "./skills"
     ],
     "providesTools": [
-      "ce_exec",
       "ctx_read",
       "ctx_summarize",
-      "ctx_remember",
-      "ctx_recall",
-      "ctx_forget",
-      "ctx_delegate",
-      "ctx_offload",
-      "ctx_status"
+      "ctx_offload"
     ]
   }
 }

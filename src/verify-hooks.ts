@@ -4,7 +4,7 @@
  */
 
 import contextEngineer from "./index.js";
-import { ContextStore, DEFAULT_CONTEXT_STORE_TTL_MS, DEFAULT_MEMORY_STORE_MAX_BYTES, MAX_CONTEXT_STORE_BYTES } from "./store.js";
+import { ContextStore, DEFAULT_CONTEXT_STORE_TTL_MS, MAX_CONTEXT_STORE_BYTES } from "./store.js";
 import { ceToolMap } from "./tools.js";
 import { ContextTelemetry } from "./telemetry.js";
 import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, utimesSync } from "node:fs";
@@ -184,8 +184,6 @@ for (const compactStaleResults of [true, false]) {
   mkdirSync(join(legacyCwd, ".pi"), { recursive: true });
   writeFileSync(join(legacyCwd, ".pi", "context-engineer.json"), JSON.stringify({ compactStaleResults }));
   await checkStableContextPrefix(`legacy compactStaleResults=${compactStaleResults}`, [addressableMessage], legacyCwd);
-  const status = await registeredTools.get("ctx_status").execute("legacy-status", {}, undefined, undefined, { cwd: legacyCwd });
-  checkHook(`legacy setting ${compactStaleResults}: status reports effective false`, JSON.parse(status.content[0].text).compactStaleResults === false);
   let settings = "";
   await registeredCommands.get("ce").handler("settings", { cwd: legacyCwd, ui: { notify: (text: string) => { settings = text; } } });
   checkHook(`legacy setting ${compactStaleResults}: settings reports effective false`, JSON.parse(settings).compactStaleResults === false);
@@ -468,54 +466,16 @@ checkCtl(
     (statSync(join(blobDir, blobName),).mode & 0o777) === 0o600,
 );
 
-const memoryCwd = "/tmp/pi-ce-memory-" + Date.now();
-const memoryContext: any = {
-  workspaceRoot: memoryCwd,
-  store: new ContextStore(memoryCwd),
-  callTool: async () => undefined,
-  spawnAgent: async () => "",
-  modelCall: async () => "",
-};
-const rememberDef = ceToolMap.get("ctx_remember");
-const recallDef = ceToolMap.get("ctx_recall");
-const forgetDef = ceToolMap.get("ctx_forget");
-checkCtl("ctx_forget is registered", Boolean(forgetDef));
-if (rememberDef && recallDef && forgetDef) {
-  const firstMemory = await rememberDef.handler({ fact: "first", key: "decision" }, memoryContext) as { id?: string };
-  const secondMemory = await rememberDef.handler({ fact: "second", key: "decision" }, memoryContext) as { id?: string };
-  const recalled = await recallDef.handler({}, memoryContext) as { facts: string[]; count: number };
-  const reopenedBeforeForget = new ContextStore(memoryCwd, ".pi/agent/context-store", { ttlMs: 0, maxBytes: DEFAULT_MEMORY_STORE_MAX_BYTES });
-  checkCtl("remembered facts persist with no TTL and named writes upsert", firstMemory.id !== secondMemory.id && recalled.count === 1 && recalled.facts[0] === "second" && reopenedBeforeForget.list().length === 1 && reopenedBeforeForget.list()[0].updatedAt !== undefined);
-  const forgotten = await forgetDef.handler({ key: "decision" }, memoryContext) as { count: number };
-  const reopenedAfterForget = new ContextStore(memoryCwd, ".pi/agent/context-store", { ttlMs: 0, maxBytes: DEFAULT_MEMORY_STORE_MAX_BYTES });
-  checkCtl("ctx_forget removes named remembered facts", forgotten.count === 1 && reopenedAfterForget.list().length === 0);
-}
-
-const summaryDef = ceToolMap.get("ctx_summarize");
-if (summaryDef) {
-  const prompts: string[] = [];
-  const summary = await summaryDef.handler({ text: "x".repeat(12000), mode: "model", maxTokens: 128, maxInputTokens: 1024 }, {
-    ...memoryContext,
-    modelCall: async (prompt: string) => { prompts.push(prompt); return "bounded summary"; },
-  }) as { chunks: number; maxInputTokens: number; strategy: string };
-  checkCtl(
-    "model summarization declares and honors an input budget",
-    summary.strategy === "hierarchical" && summary.chunks > 1 && summary.maxInputTokens === 1024 &&
-      prompts.every((prompt) => Buffer.byteLength(prompt, "utf8") <= 4096),
-    `prompts=${prompts.length}, maxPromptBytes=${Math.max(...prompts.map((prompt) => Buffer.byteLength(prompt, "utf8")), 0)}`,
-  );
-}
-
 const budgetStore = new ContextStore("/tmp/pi-ce-budget-" + Date.now(), ".pi/context-store", { maxBytes: 10 });
 const retained = budgetStore.write("retained", "bash", "payload larger than budget");
 checkCtl("newest handle remains valid under a tiny disk budget", budgetStore.has(retained.id));
 const telemetryCwd = "/tmp/pi-ce-telemetry-" + Date.now();
 const telemetry = new ContextTelemetry();
 telemetry.record(telemetryCwd, { strategy: "WRITE", tool: "read", sourceBytes: 40000, visibleBytes: 2200, storeTokensWritten: 10000, note: "payload sizes only" });
-telemetry.record(telemetryCwd, { strategy: "WRITE", tool: "fabric_exec", sourceTokens: 10000, visibleTokens: 100, internalTokensProcessed: 10000, mainTokensPrevented: 0, mainTokensInjected: 0, storeTokensWritten: 10000, note: "internal provider accounting" });
+telemetry.record(telemetryCwd, { strategy: "WRITE", tool: "fabric_exec", sourceTokens: 10000, visibleTokens: 100, mainTokensPrevented: 0, mainTokensInjected: 0, storeTokensWritten: 10000, note: "nested store accounting" });
 const telemetrySummary = telemetry.summary(telemetryCwd);
 checkCtl("telemetry reports saved tokens", telemetrySummary.savedTokens > 0 && telemetrySummary.byStrategy.WRITE?.events === 2);
-checkCtl("telemetry separates internal work from Main savings", telemetrySummary.internalTokensProcessed === 10000 && telemetrySummary.mainTokensPrevented === telemetrySummary.savedTokens && telemetrySummary.mainTokensInjected > 0 && telemetrySummary.storeTokensWritten === 20000);
+checkCtl("telemetry separates stored tokens from Main savings", telemetrySummary.mainTokensPrevented === telemetrySummary.savedTokens && telemetrySummary.mainTokensInjected > 0 && telemetrySummary.storeTokensWritten === 20000);
 const legacyCwd = "/tmp/pi-ce-legacy-telemetry-" + Date.now();
 mkdirSync(join(legacyCwd, ".pi/context-store"), { recursive: true });
 writeFileSync(join(legacyCwd, ".pi/context-store/context-events.jsonl"), JSON.stringify({ version: 1, timestamp: new Date().toISOString(), sessionId: "legacy", strategy: "WRITE", tool: "read", sourceBytes: 4000, visibleBytes: 400, sourceTokens: 1000, visibleTokens: 100, savedTokens: 900 }) + "\n");
@@ -531,7 +491,7 @@ runtimeB.record(sharedTelemetryCwd, { strategy: "WRITE", tool: "runtime-b", sour
 const sharedSession = runtimeA.summary(sharedTelemetryCwd);
 const sharedLifetime = runtimeA.summary(sharedTelemetryCwd, true);
 checkCtl("telemetry session scope spans extension runtimes", sharedSession.events === 2 && sharedSession.mainTokensPrevented === 270 && sharedSession.scope === "session");
-checkCtl("telemetry exposes distinct runtime and lifetime scopes", runtimeA.runtimeSummary(sharedTelemetryCwd).events === 1 && sharedLifetime.events === 2 && sharedLifetime.scope === "lifetime");
+checkCtl("telemetry exposes a lifetime scope", sharedLifetime.events === 2 && sharedLifetime.scope === "lifetime");
 
 // ---- ctx_offload signature ergonomics (session regressions) ----
 
@@ -691,43 +651,6 @@ checkHook("large mixed boundary preserves independently useful nested facts", mi
 checkHook("mixed boundary still stores the entire exact payload", new ContextStore(hookCwd).read(mixedResult.details.ce_handle, { length: Buffer.byteLength(mixedBoundary) }).content === mixedBoundary);
 const selectedMixed = new ContextStore(hookCwd).read(mixedResult.details.ce_handle, { jsonPath: "$.check.path" });
 checkHook("preview field paths can be selected through ctx_read", selectedMixed.content === '"library.blend"');
-
-// ---- ctx_status reports policy state ----
-
-console.log("\n=== ctx_status ===\n");
-const statusDef = registeredTools.get("ctx_status");
-checkCtl("ctx_status tool is registered", Boolean(statusDef));
-if (statusDef) {
-  const st = await statusDef.execute("st1", {}, undefined, undefined, { cwd: capCwd });
-  const parsed = JSON.parse(st.content[0].text);
-  checkCtl(
-    "ctx_status exposes policy and one compact scope by default",
-    parsed.enabled === true && parsed.resultPolicy === "auto" && parsed.compactEditResults === true && parsed.compactStaleResults === false && typeof parsed.readOffloadThreshold === "number" && typeof parsed.policy === "string" && parsed.detail === "compact" && parsed.telemetryScope === "session" && typeof parsed.summary?.mainTokensPrevented === "number" && parsed.summary?.byStrategy === undefined && parsed.summary?.largest === undefined && parsed.runtime === undefined && parsed.session === undefined && parsed.lifetime === undefined,
-  );
-  const statusBytes = Buffer.byteLength(JSON.stringify(st));
-  checkCtl("compact status envelope fits comfortably below default offload budget", statusBytes < 6000, `bytes=${statusBytes}`);
-  const fullStatus = await statusDef.execute("st-full", { detail: "full" }, undefined, undefined, { cwd: capCwd });
-  const full = JSON.parse(fullStatus.content[0].text);
-  checkCtl("full detail restores all telemetry scopes and breakdowns", full.detail === "full" && typeof full.runtime?.events === "number" && typeof full.session?.mainTokensPrevented === "number" && typeof full.lifetime?.storeTokensWritten === "number" && typeof full.summary?.byStrategy === "object");
-  checkCtl("compact status materially reduces the full envelope", statusBytes < Buffer.byteLength(JSON.stringify(fullStatus)) * .65);
-  const boundaryStatus = await callHook("tool_result", { toolCallId: "compact-status-boundary", toolName: "fabric_exec", input: {}, content: [{ type: "text", text: JSON.stringify(st) }] });
-  checkCtl("compact status does not offload itself at the default boundary", boundaryStatus === undefined);
-  for (const scope of ["runtime", "session", "lifetime"]) {
-    const status = await statusDef.execute(`st-${scope}`, { scope }, undefined, undefined, { cwd: capCwd });
-    const body = JSON.parse(status.content[0].text);
-    checkCtl(`compact status selects ${scope} without sibling scopes`, body.telemetryScope === scope && body.summary?.scope === scope && body.runtime === undefined && body.session === undefined && body.lifetime === undefined);
-  }
-  let summaryCalls = 0;
-  const originalSummary = ContextTelemetry.prototype.summary;
-  ContextTelemetry.prototype.summary = function (...args) { summaryCalls++; return originalSummary.apply(this, args); };
-  try {
-    await statusDef.execute("st-count", {}, undefined, undefined, { cwd: capCwd });
-    checkCtl("default status computes only the requested scope", summaryCalls === 1, `summary calls=${summaryCalls}`);
-  } finally { ContextTelemetry.prototype.summary = originalSummary; }
-  const lifetimeFull = await statusDef.execute("st2", { scope: "lifetime", detail: "full" }, undefined, undefined, { cwd: capCwd });
-  const lifetimeParsed = JSON.parse(lifetimeFull.content[0].text);
-  checkCtl("full status can emphasize lifetime telemetry", lifetimeParsed.telemetryScope === "lifetime" && lifetimeParsed.summary?.scope === "lifetime" && lifetimeParsed.lifetime?.scope === "lifetime");
-}
 
 // ---- Quiet session startup ----
 

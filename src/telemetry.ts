@@ -5,7 +5,6 @@
  * they never contain prompts, source text, command arguments, or tool payloads.
  *
  * The accounting domains are deliberately separate:
- *   - internalTokensProcessed: work kept inside a provider/runtime;
  *   - mainTokensPrevented: potential Main-bound tokens withheld by CE;
  *   - mainTokensInjected: tokens actually shown to Main;
  *   - storeTokensWritten: payload tokens persisted for later retrieval.
@@ -14,30 +13,17 @@
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import type { Usage } from "@earendil-works/pi-ai";
-import { mergeUsage, readUsage } from "./usage.js";
 
 /** Note on a call repeated after its result was offloaded; see offloadFollowUp. */
 export const REPEATED_OFFLOADED_CALL_NOTE = "repeated a call whose result is already offloaded";
 
-export type ContextStrategy = "PASS" | "WARN" | "BLOCK" | "WRITE" | "SELECT" | "COMPRESS" | "ISOLATE";
-export type TelemetryScope = "runtime" | "session" | "lifetime";
+export type ContextStrategy = "PASS" | "WARN" | "BLOCK" | "WRITE" | "SELECT" | "COMPRESS";
+export type TelemetryScope = "session" | "lifetime";
 
-export interface ChildUsageFields {
-  /** Actual provider-reported usage, not a byte/token estimate. */
-  childUsage?: Usage;
-  /** False means some or all usage was unavailable, never free work. */
-  childUsageComplete?: boolean;
-  /** False for Fabric captures that drop nested Usage from native session totals. */
-  usageInParent?: boolean;
-}
-
-export interface ContextEvent extends ChildUsageFields {
+export interface ContextEvent {
   version: 2;
   timestamp: string;
   sessionId: string;
-  /** Runtime/extension-instance identity; old event files may omit it. */
-  runtimeId?: string;
   strategy: ContextStrategy;
   tool: string;
   /** Legacy payload-size fields retained for compatibility. */
@@ -47,7 +33,6 @@ export interface ContextEvent extends ChildUsageFields {
   visibleTokens: number;
   /** Legacy alias for mainTokensPrevented. */
   savedTokens: number;
-  internalTokensProcessed: number;
   mainTokensPrevented: number;
   mainTokensInjected: number;
   storeTokensWritten: number;
@@ -61,7 +46,6 @@ export interface StrategySummary {
   sourceTokens: number;
   visibleTokens: number;
   savedTokens: number;
-  internalTokensProcessed: number;
   mainTokensPrevented: number;
   mainTokensInjected: number;
   storeTokensWritten: number;
@@ -70,14 +54,12 @@ export interface StrategySummary {
 export interface ContextSummary {
   scope?: TelemetryScope;
   sessionId?: string;
-  runtimeId?: string;
   events: number;
   /** Legacy aggregate fields. */
   sourceTokens: number;
   visibleTokens: number;
   savedTokens: number;
   /** Explicit accounting domains. */
-  internalTokensProcessed: number;
   mainTokensPrevented: number;
   mainTokensInjected: number;
   storeTokensWritten: number;
@@ -85,24 +67,18 @@ export interface ContextSummary {
   reductionRatio: number;
   mainContextReductionRatio: number;
   byStrategy: Record<string, StrategySummary>;
-  childCalls: number;
-  childUsage?: Usage;
-  childUsageComplete?: boolean;
-  /** Add only this usage to native parent totals to avoid double counting. */
-  childUsageOutsideParent?: Usage;
   /** Whether boundary offloads were used: distinct handles, handles later read, and repeated source calls. */
   offloadFollowUp: { handles: number; handlesRead: number; repeatedCalls: number };
   largest?: ContextEvent;
 }
 
-export interface RecentContextEvent extends ChildUsageFields {
+export interface RecentContextEvent {
   timestamp: string;
   strategy: ContextStrategy;
   tool: string;
   sourceTokens: number;
   visibleTokens: number;
   savedTokens: number;
-  internalTokensProcessed: number;
   mainTokensPrevented: number;
   mainTokensInjected: number;
   storeTokensWritten: number;
@@ -118,23 +94,13 @@ function safeNumber(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
 }
 
-function childUsageFields(value: { childUsage?: unknown; childUsageComplete?: unknown; usageInParent?: unknown }): ChildUsageFields {
-  if (value.childUsageComplete === undefined && value.childUsage === undefined) return {};
-  const childUsage = readUsage(value.childUsage);
-  return {
-    ...(childUsage ? { childUsage } : {}),
-    childUsageComplete: childUsage !== undefined && value.childUsageComplete === true,
-    ...(typeof value.usageInParent === "boolean" ? { usageInParent: value.usageInParent } : {}),
-  };
-}
-
 function isStrategy(value: unknown): value is ContextStrategy {
-  return typeof value === "string" && ["PASS", "WARN", "BLOCK", "WRITE", "SELECT", "COMPRESS", "ISOLATE"].includes(value);
+  return typeof value === "string" && ["PASS", "WARN", "BLOCK", "WRITE", "SELECT", "COMPRESS"].includes(value);
 }
 
 export class ContextTelemetry {
-  readonly runtimeId = `${Date.now().toString(36)}-${process.pid.toString(36)}-${randomUUID()}`;
-  private activeSessionId = this.runtimeId;
+  /** Until session_start binds the host session, events belong to this runtime. */
+  private activeSessionId = `${Date.now().toString(36)}-${process.pid.toString(36)}-${randomUUID()}`;
   private readonly maxEvents = 5000;
 
   get sessionId(): string {
@@ -149,14 +115,13 @@ export class ContextTelemetry {
 
   record(
     workspaceRoot: string,
-    event: ChildUsageFields & {
+    event: {
       strategy: ContextStrategy;
       tool: string;
       sourceBytes?: number;
       visibleBytes?: number;
       sourceTokens?: number;
       visibleTokens?: number;
-      internalTokensProcessed?: number;
       mainTokensPrevented?: number;
       mainTokensInjected?: number;
       storeTokensWritten?: number;
@@ -180,7 +145,6 @@ export class ContextTelemetry {
         version: 2,
         timestamp: new Date().toISOString(),
         sessionId: this.sessionId,
-        runtimeId: this.runtimeId,
         strategy: event.strategy,
         tool: event.tool.slice(0, 120),
         sourceBytes,
@@ -188,11 +152,9 @@ export class ContextTelemetry {
         sourceTokens,
         visibleTokens,
         savedTokens: mainTokensPrevented,
-        internalTokensProcessed: safeNumber(event.internalTokensProcessed),
         mainTokensPrevented,
         mainTokensInjected,
         storeTokensWritten: safeNumber(event.storeTokensWritten),
-        ...childUsageFields(event),
         ...(event.provider ? { provider: event.provider.slice(0, 80) } : {}),
         ...(event.handle ? { handle: event.handle.slice(0, 120) } : {}),
         ...(event.note ? { note: event.note.replace(/[\r\n]+/g, " ").slice(0, 240) } : {}),
@@ -231,24 +193,12 @@ export class ContextTelemetry {
     return this.summarizeScope(workspaceRoot, allSessions ? "lifetime" : "session");
   }
 
-  /** Events produced by this extension runtime only. */
-  runtimeSummary(workspaceRoot: string): ContextSummary {
-    return this.summarizeScope(workspaceRoot, "runtime");
-  }
-
   private summarizeScope(workspaceRoot: string, scope: TelemetryScope): ContextSummary {
-    const events = this.read(workspaceRoot).filter((event) =>
-      scope === "lifetime"
-        ? true
-        : scope === "runtime"
-          ? event.runtimeId === this.runtimeId || (!event.runtimeId && event.sessionId === this.sessionId)
-          : event.sessionId === this.sessionId,
-    );
+    const events = this.read(workspaceRoot).filter((event) => scope === "lifetime" || event.sessionId === this.sessionId);
     const byStrategy: Record<string, StrategySummary> = {};
     let sourceTokens = 0;
     let visibleTokens = 0;
     let savedTokens = 0;
-    let internalTokensProcessed = 0;
     let mainTokensPrevented = 0;
     let mainTokensInjected = 0;
     let storeTokensWritten = 0;
@@ -258,7 +208,6 @@ export class ContextTelemetry {
       sourceTokens += event.sourceTokens;
       visibleTokens += event.visibleTokens;
       savedTokens += event.savedTokens;
-      internalTokensProcessed += event.internalTokensProcessed;
       mainTokensPrevented += event.mainTokensPrevented;
       mainTokensInjected += event.mainTokensInjected;
       storeTokensWritten += event.storeTokensWritten;
@@ -267,7 +216,6 @@ export class ContextTelemetry {
         sourceTokens: 0,
         visibleTokens: 0,
         savedTokens: 0,
-        internalTokensProcessed: 0,
         mainTokensPrevented: 0,
         mainTokensInjected: 0,
         storeTokensWritten: 0,
@@ -276,7 +224,6 @@ export class ContextTelemetry {
       bucket.sourceTokens += event.sourceTokens;
       bucket.visibleTokens += event.visibleTokens;
       bucket.savedTokens += event.savedTokens;
-      bucket.internalTokensProcessed += event.internalTokensProcessed;
       bucket.mainTokensPrevented += event.mainTokensPrevented;
       bucket.mainTokensInjected += event.mainTokensInjected;
       bucket.storeTokensWritten += event.storeTokensWritten;
@@ -291,30 +238,21 @@ export class ContextTelemetry {
       handlesRead: [...offloadHandles].filter(handle => readHandles.has(handle)).length,
       repeatedCalls: events.filter(event => event.note === REPEATED_OFFLOADED_CALL_NOTE).length,
     };
-    const childEvents = events.filter(event => event.childUsageComplete !== undefined);
-    const childUsage = mergeUsage(...childEvents.map(event => event.childUsage));
-    const childUsageOutsideParent = mergeUsage(...childEvents.filter(event => event.usageInParent === false).map(event => event.childUsage));
     const potentialMainTokens = mainTokensPrevented + mainTokensInjected;
     const mainContextReductionRatio = potentialMainTokens > 0 ? mainTokensPrevented / potentialMainTokens : 0;
     return {
       scope,
       ...(scope !== "lifetime" ? { sessionId: this.sessionId } : {}),
-      ...(scope === "runtime" ? { runtimeId: this.runtimeId } : {}),
       events: events.length,
       sourceTokens,
       visibleTokens,
       savedTokens,
-      internalTokensProcessed,
       mainTokensPrevented,
       mainTokensInjected,
       storeTokensWritten,
       reductionRatio: mainContextReductionRatio,
       mainContextReductionRatio,
       byStrategy,
-      childCalls: childEvents.length,
-      ...(childUsage ? { childUsage } : {}),
-      ...(childEvents.length ? { childUsageComplete: childEvents.every(event => event.childUsageComplete === true) } : {}),
-      ...(childUsageOutsideParent ? { childUsageOutsideParent } : {}),
       offloadFollowUp,
       ...(largest ? { largest } : {}),
     };
@@ -331,11 +269,9 @@ export class ContextTelemetry {
         sourceTokens: event.sourceTokens,
         visibleTokens: event.visibleTokens,
         savedTokens: event.savedTokens,
-        internalTokensProcessed: event.internalTokensProcessed,
         mainTokensPrevented: event.mainTokensPrevented,
         mainTokensInjected: event.mainTokensInjected,
         storeTokensWritten: event.storeTokensWritten,
-        ...childUsageFields(event),
         ...(event.note ? { note: event.note } : {}),
         ...(event.handle ? { handle: event.handle } : {}),
       }));
@@ -384,7 +320,6 @@ export class ContextTelemetry {
       version: 2,
       timestamp: typeof raw.timestamp === "string" ? raw.timestamp : new Date(0).toISOString(),
       sessionId: raw.sessionId,
-      runtimeId: typeof raw.runtimeId === "string" ? raw.runtimeId : raw.sessionId,
       strategy: raw.strategy,
       tool: typeof raw.tool === "string" ? raw.tool.slice(0, 120) : "unknown",
       sourceBytes,
@@ -392,11 +327,9 @@ export class ContextTelemetry {
       sourceTokens,
       visibleTokens,
       savedTokens: mainTokensPrevented,
-      internalTokensProcessed: safeNumber(raw.internalTokensProcessed),
       mainTokensPrevented,
       mainTokensInjected: raw.mainTokensInjected === undefined ? visibleTokens : safeNumber(raw.mainTokensInjected),
       storeTokensWritten: safeNumber(raw.storeTokensWritten),
-      ...childUsageFields(raw),
       ...(typeof raw.provider === "string" ? { provider: raw.provider } : {}),
       ...(typeof raw.handle === "string" ? { handle: raw.handle } : {}),
       ...(typeof raw.note === "string" ? { note: raw.note } : {}),

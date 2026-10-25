@@ -4,6 +4,9 @@
 
 ### Removed
 
+- `ctx_remember`, `ctx_recall` and `ctx_forget`, with their persistent memory store. None was called in 295 recorded Pi sessions; Fabric's `memory` provider already recalls session history.
+- `ctx_delegate`, `ctx_summarize` `mode: "model"`, and the child Pi runner, generation-budget extension and Usage accounting they shared. Each tool was called five times across those sessions, mostly as probes, and Fabric's `agents.run` delegates with a fresh context.
+- The `ctx_status` and `ce_exec` tools. `/ce status` and `/ce settings` report the same telemetry and policy to the user, and models called `ctx_status` mostly to inspect CE itself. Telemetry drops its per-runtime scope and child-usage fields.
 - The benchmark harnesses: the deterministic plumbing benchmark (its known-marker checks duplicated `npm test` and measured CE against a baseline that shows every byte), the static-policy benchmark, and the paid paired-effectiveness harness, which was never run. The opt-in real Pi/Fabric smoke test remains as `npm run e2e`.
 
 ### Offload notices and ctx_read
@@ -15,7 +18,7 @@
 
 ### Startup and preflight cost
 
-- Default mode no longer runs static analysis on every `fabric_exec`; its advisory verdict was discarded. Analysis runs with `strict`/`blockUnboundedReturns`, `ce_exec`, and `explainProgram`.
+- Default mode no longer runs static analysis on every `fabric_exec`; its advisory verdict was discarded. Analysis runs with `strict`/`blockUnboundedReturns` and `explainProgram`.
 - The analyzer loads TypeScript on first use, cutting CE import time from roughly 300 ms to 90 ms on a local machine; every Pi session and Fabric child that loads CE pays this.
 
 ### Offload follow-up telemetry
@@ -26,7 +29,6 @@
 
 - Extension-enabled Fabric Pi children that load CE grant themselves `ctx_read` before Fabric's lazy provider initialization, at every depth. Like Fabric's `agents.childQuestionTools`, the grant is skipped for an explicit empty `tools` list and for `+name`/`-name` lists; a malformed allowlist fails closed.
 - CE no longer offloads to a handle the current process cannot read (a withheld Fabric allowlist, or a Pi `--tools` list without `ctx_read`); the result stays inline and telemetry records why.
-- The isolated `ctx_delegate` fallback loads CE restricted to `ctx_read`, so a delegated child cannot delegate again or write memory. Explicit extension-disabled and non-Pi runners remain opt-outs.
 
 ## 0.6.0
 

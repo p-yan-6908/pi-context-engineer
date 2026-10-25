@@ -15,7 +15,6 @@ import contextEngineer from "./index.js";
 import { FABRIC_NESTED_TOOL_CALL_ID_PREFIX } from "./compat/fabric.js";
 import { ContextStore } from "./store.js";
 import { ContextTelemetry } from "./telemetry.js";
-import { mergeUsage, readUsage } from "./usage.js";
 import { ceToolMap, isErrorResult, type ToolContext } from "./tools.js";
 
 /**
@@ -59,10 +58,6 @@ function makeToolContext(
   return {
     store,
     workspaceRoot: root,
-    signal: undefined,
-    callTool: async () => ({}),
-    spawnAgent: async () => "",
-    modelCall: async () => "",
     ...overrides,
   };
 }
@@ -75,18 +70,6 @@ function exactStored(store: ContextStore, id: string): string {
   equal(result.bytesRead, probe.totalBytes, `recovery covers all bytes for ${id}`);
   check(result.truncated === false, `recovery is not truncated for ${id}`);
   return result.content;
-}
-
-function boundarySource(): string {
-  // maxInputTokens=1024 gives the implementation a 2048-byte input budget and
-  // a 2045-byte store request. This places the third byte of 😀 at the first
-  // requested boundary, forcing UTF-8 expansion rather than replacement text.
-  const prefix = "p".repeat(2043) + "😀";
-  const records = Array.from(
-    { length: 300 },
-    (_, index) => `\nError: source-record-${index} — payload 😀 ${"x".repeat(19)}`,
-  ).join("");
-  return prefix + records;
 }
 
 function readTelemetry(root: string): Array<Record<string, any>> {
@@ -209,234 +192,6 @@ async function testStoreAndToolReads(): Promise<void> {
   equal(structural.kind, "json-object", "structural summary recognizes JSON objects");
   equal(structural.keys, 2, "structural summary retains object shape");
 
-  const rememberedFact = "Error: remembered fact is valid data 😀";
-  const remembered = await tool("ctx_remember").handler(
-    { fact: rememberedFact, key: "incident" },
-    makeToolContext(root, store),
-  ) as Record<string, any>;
-  const memoryStore = new ContextStore(root, ".pi/agent/context-store", { ttlMs: 0 });
-  const rememberedRead = memoryStore.read(remembered.id as string, { offset: 0, length: Buffer.byteLength(rememberedFact, "utf8") });
-  check(rememberedRead.ok === true, "an Error:-prefixed remembered fact has ReadResult.ok=true");
-  equal(rememberedRead.content, rememberedFact, "remembered fact is stored without error-text rewriting");
-
-  const recalled = await tool("ctx_recall").handler(
-    { query: "Error:", limit: 20, maxTokens: 1000 },
-    makeToolContext(root, store),
-  ) as Record<string, any>;
-  check(recalled.isError !== true, "recall of an Error:-prefixed fact is successful");
-  check((recalled.facts as string[]).includes(rememberedFact), "recall returns the Error:-prefixed remembered fact");
-}
-
-async function testModelSummaryBudgets(): Promise<void> {
-  const root = tempRoot("ce-remediation-model-");
-  const store = new ContextStore(root, ".store", { ttlMs: 0 });
-  const summarize = tool("ctx_summarize");
-  const source = boundarySource();
-  const sourceBytes = Buffer.byteLength(source, "utf8");
-  const buffer = Buffer.from(source, "utf8");
-  check((buffer[2045] & 0xc0) === 0x80, "model fixture places an emoji continuation byte at the input boundary");
-
-  const calls: Array<{ prompt: string; maxTokens?: number; signal?: AbortSignal }> = [];
-  const context = makeToolContext(root, store, {
-    modelCall: async (prompt, maxTokens, options) => {
-      if (!options?.signal) throw new Error("modelCall did not receive a cancellation signal");
-      calls.push({ prompt, maxTokens, signal: options.signal });
-      // Force every partial and final response through the implementation's
-      // output cap; reductions must still make progress without a token leak.
-      return "VERBOSE MOCK RESPONSE — ".repeat(2_000);
-    },
-  });
-  const result = await summarize.handler(
-    {
-      text: source,
-      mode: "model",
-      strategy: "hierarchical",
-      maxInputTokens: 1024,
-      maxTokens: 1024,
-      maxChunks: 16,
-      maxCalls: 128,
-    },
-    context,
-  ) as Record<string, any>;
-
-  check(!isErrorResult(result), "bounded hierarchical model summary succeeds");
-  equal(result.mode, "model", "model summary reports model mode");
-  check(result.chunks > 1, "unicode fixture requires multiple model-input chunks");
-  equal(result.totalBytes, sourceBytes, "model summary reports the complete source byte size");
-  equal(result.coveredBytes, sourceBytes, "hierarchical summary covers every source byte");
-  check(result.complete === true, "hierarchical summary is complete");
-  equal(result.modelCalls, calls.length, "modelCalls telemetry matches actual fake calls");
-  check(calls.length <= 2 * result.chunks - 1, "hierarchical reduction converges in at most 2*n-1 model calls");
-  check(calls.every((call) => call.signal?.aborted === false), "normal model calls receive live cancellation signals");
-  check(Buffer.byteLength(result.summary, "utf8") <= 1024 * 4, "verbose model output is bounded to maxTokens");
-  equal(exactStored(store, result.recovery.id), source, "model summary recovery exactly reconstructs the whole source");
-
-  const overflowSource = source + "\n" + "z".repeat(7_000);
-  let overflowCalls = 0;
-  const overflow = await summarize.handler(
-    {
-      text: overflowSource,
-      mode: "model",
-      strategy: "hierarchical",
-      maxInputTokens: 1024,
-      maxTokens: 1024,
-      maxChunks: 2,
-      maxCalls: 128,
-    },
-    makeToolContext(root, store, { modelCall: async () => { overflowCalls++; return "should not run"; } }),
-  ) as Record<string, any>;
-  check(isErrorResult(overflow), "input beyond maxChunks returns an explicit handler error");
-  equal(overflow.code, "summary_input_budget_exceeded", "maxChunks overflow has the documented error code");
-  equal(overflowCalls, 0, "maxChunks overflow performs no model calls");
-  check(!Object.prototype.hasOwnProperty.call(overflow, "summary"), "maxChunks overflow has no implicit prefix summary");
-  check(overflow.recovery && typeof overflow.recovery.id === "string", "maxChunks overflow includes source recovery");
-  equal(exactStored(store, overflow.recovery.id), overflowSource, "maxChunks overflow recovery is exact");
-
-  const direct = await summarize.handler(
-    {
-      text: overflowSource,
-      mode: "model",
-      strategy: "direct",
-      maxInputTokens: 1024,
-      maxTokens: 1024,
-    },
-    makeToolContext(root, store, { modelCall: async () => "direct response" }),
-  ) as Record<string, any>;
-  check(!isErrorResult(direct), "explicit direct strategy succeeds on a large source");
-  check(direct.inputTruncated === true, "direct strategy reports input truncation");
-  check(direct.coveredBytes > 0 && direct.coveredBytes < direct.totalBytes, "direct strategy reports a strict covered-byte prefix");
-  equal(direct.nextOffset, direct.coveredBytes, "direct strategy reports the next recovery offset");
-  equal(direct.modelCalls, 1, "direct strategy uses one model call");
-  equal(exactStored(store, direct.recovery.id), overflowSource, "direct strategy retains exact source recovery");
-
-  const budgeted = await summarize.handler(
-    {
-      text: source,
-      mode: "model",
-      strategy: "hierarchical",
-      maxInputTokens: 1024,
-      maxTokens: 1024,
-      maxChunks: 16,
-      maxCalls: 1,
-    },
-    makeToolContext(root, store, { modelCall: async () => "partial" }),
-  ) as Record<string, any>;
-  check(isErrorResult(budgeted), "low maxCalls returns an explicit handler error");
-  equal(budgeted.code, "summary_call_budget_exceeded", "low maxCalls has the documented error code");
-  equal(budgeted.requiredCalls, 2 * result.chunks - 1, "fail-fast budget reports the exact binary reduction call count");
-  equal(budgeted.modelCalls, 0, "low maxCalls fails before spending any model call");
-  check(budgeted.recovery && typeof budgeted.recovery.id === "string", "low maxCalls includes source recovery");
-  equal(exactStored(store, budgeted.recovery.id), source, "low maxCalls recovery is exact");
-
-  // An already-aborted request must fail before inline input is written or
-  // even probed. A throwing spy makes an accidental pre-abort store access
-  // observable without relying on filesystem timing.
-  const preAborted = new AbortController();
-  preAborted.abort(new Error("pre-aborted summary"));
-  const preAbortStoreCalls: string[] = [];
-  const preAbortStore = {
-    write: () => { preAbortStoreCalls.push("write"); throw new Error("unexpected pre-abort write"); },
-    read: () => { preAbortStoreCalls.push("read"); throw new Error("unexpected pre-abort read"); },
-  } as unknown as ContextStore;
-  await assert.rejects(
-    () => summarize.handler(
-      { text: source, mode: "model", strategy: "hierarchical", maxInputTokens: 1024, maxTokens: 1024 },
-      makeToolContext(root, preAbortStore, { signal: preAborted.signal, modelCall: async () => "must not run" }),
-    ),
-    /pre-aborted summary/,
-  );
-  checks++;
-  equal(preAbortStoreCalls, [], "pre-aborted model summary does not write or read source input");
-
-  const cancelledRoot = tempRoot("ce-remediation-cancel-");
-  const cancelledStore = new ContextStore(cancelledRoot, ".store", { ttlMs: 0 });
-  const parent = new AbortController();
-  let cancelledCalls = 0;
-  let thirdSignal: AbortSignal | undefined;
-  const cancellation = summarize.handler(
-    {
-      text: source,
-      mode: "model",
-      strategy: "hierarchical",
-      maxInputTokens: 1024,
-      maxTokens: 1024,
-      maxChunks: 16,
-      maxCalls: 128,
-    },
-    makeToolContext(cancelledRoot, cancelledStore, {
-      signal: parent.signal,
-      modelCall: async (_prompt, _maxTokens, options) => {
-        cancelledCalls++;
-        if (cancelledCalls === 3) {
-          thirdSignal = options?.signal;
-          parent.abort(new Error("cancel on third model call"));
-          return "late third response";
-        }
-        return "partial";
-      },
-    }),
-  );
-  await assert.rejects(cancellation, /cancel on third model call/);
-  checks++;
-  equal(cancelledCalls, 3, "cancellation stops immediately at the third model call");
-  check(thirdSignal?.aborted === true, "parent cancellation reaches the third modelCall opts.signal");
-}
-
-async function testUsageAndTelemetry(): Promise<void> {
-  const usageA: any = {
-    input: 11, output: 7, cacheRead: 2, cacheWrite: 1, totalTokens: 21, reasoning: 3, cacheWrite1h: 1,
-    cost: { input: 0.11, output: 0.07, cacheRead: 0.02, cacheWrite: 0.01, total: 0.21 },
-  };
-  const usageB: any = {
-    input: 5, output: 4, cacheRead: 0, cacheWrite: 2, totalTokens: 11, reasoning: 2, cacheWrite1h: 4,
-    cost: { input: 0.05, output: 0.04, cacheRead: 0, cacheWrite: 0.02, total: 0.11 },
-  };
-  const usageSnapshot = structuredClone(usageA);
-  equal(readUsage(usageA), usageA, "readUsage accepts a complete provider Usage report");
-  equal(usageA, usageSnapshot, "readUsage does not mutate a provider Usage report");
-  check(readUsage(undefined) === undefined, "readUsage treats absent usage as unknown");
-  check(readUsage({ ...usageA, totalTokens: -1 }) === undefined, "readUsage rejects negative token counts");
-  check(readUsage({ ...usageA, cost: { ...usageA.cost, total: Number.NaN } }) === undefined, "readUsage rejects non-finite costs");
-  check(readUsage({ ...usageA, cost: undefined }) === undefined, "readUsage rejects incomplete cost reports");
-
-  const merged = mergeUsage(usageA, usageB);
-  // Normalize only for the human-readable decimal comparison; mergeUsage must
-  // retain ordinary JavaScript arithmetic rather than inventing a rounding policy.
-  const normalizedMerged = merged && { ...merged, cost: { ...merged.cost, output: Number(merged.cost.output.toFixed(12)) } };
-  equal(normalizedMerged, {
-    input: 16, output: 11, cacheRead: 2, cacheWrite: 3, totalTokens: 32, reasoning: 5, cacheWrite1h: 5,
-    cost: { input: 0.16, output: 0.11, cacheRead: 0.02, cacheWrite: 0.03, total: 0.32 },
-  }, "mergeUsage sums observed token, optional, and cost fields");
-  check(mergeUsage(undefined, undefined) === undefined, "mergeUsage does not fabricate zero usage");
-  equal(mergeUsage(usageA), usageA, "mergeUsage preserves a single observed report");
-
-  const root = tempRoot("ce-remediation-telemetry-");
-  const telemetry = new ContextTelemetry();
-  telemetry.setSessionId("usage-regression-session");
-  telemetry.record(root, {
-    strategy: "ISOLATE", tool: "ctx_delegate-success",
-    childUsage: usageA, childUsageComplete: true, usageInParent: true,
-    internalTokensProcessed: usageA.totalTokens,
-  });
-  telemetry.record(root, {
-    strategy: "ISOLATE", tool: "ctx_delegate-failed",
-    childUsage: usageB, childUsageComplete: false, usageInParent: false,
-    internalTokensProcessed: usageB.totalTokens,
-  });
-  telemetry.record(root, {
-    strategy: "ISOLATE", tool: "ctx_delegate-no-report",
-    childUsageComplete: false, usageInParent: false,
-  });
-
-  const summary = telemetry.summary(root);
-  equal(summary.childCalls, 3, "telemetry counts complete and incomplete child calls");
-  equal(summary.childUsage, merged, "telemetry summary merges every observed child Usage");
-  equal(summary.childUsageComplete, false, "telemetry summary reports incomplete child usage conservatively");
-  equal(summary.childUsageOutsideParent, usageB, "telemetry isolates only usage missing from native parent totals");
-  check(summary.childUsageOutsideParent?.input !== usageA.input, "usage included in the native parent is not double-counted outside it");
-  const recent = telemetry.recent(root, 10);
-  check(recent.some((event) => event.tool === "ctx_delegate-success" && event.usageInParent === true), "recent telemetry retains usageInParent=true");
-  check(recent.some((event) => event.tool === "ctx_delegate-failed" && event.childUsageComplete === false && event.usageInParent === false), "recent telemetry retains failed child usage flags");
 }
 
 interface RegisteredTool {
@@ -463,8 +218,7 @@ async function testBoundaryAndRegisteredTools(): Promise<void> {
 
   async function hook(name: string, event: any, cwd = root, extra: Record<string, any> = {}): Promise<any> {
     // Pi runs every matching middleware in registration order. Each returned
-    // field patches the current event before the next handler sees it; returning
-    // only the last handler's value would lose the early failed-usage patch.
+    // field patches the current event before the next handler sees it.
     const current: any = { ...event };
     let modified = false;
     for (const handler of hooks.get(name) ?? []) {
@@ -485,18 +239,14 @@ async function testBoundaryAndRegisteredTools(): Promise<void> {
     sessionManager: { getSessionId: () => "remediation-session" },
   });
 
-  const names = ["ctx_read", "ctx_summarize", "ctx_remember", "ctx_recall", "ctx_forget", "ctx_delegate", "ctx_offload", "ctx_status", "ce_exec"];
-  for (const name of names) check(registered.has(name), `registered tool exists: ${name}`);
+  equal([...registered.keys()].sort(), ["ctx_offload", "ctx_read", "ctx_summarize"], "only the used CE tools are registered");
 
   const readSchema = registered.get("ctx_read")!.parameters;
   equal(readSchema.type, "object", "ctx_read registers an object schema");
   for (const name of ["regex", "ignoreCase"]) equal(readSchema.properties[name].type, "boolean", `ctx_read.${name} is Boolean in the registered schema`);
   for (const name of ["offset", "length", "contextLines", "maxMatches"]) equal(readSchema.properties[name].type, "integer", `ctx_read.${name} is Integer in the registered schema`);
   const summarySchema = registered.get("ctx_summarize")!.parameters;
-  for (const name of ["maxTokens", "maxInputTokens", "maxChunks", "maxCalls", "timeoutSeconds"]) equal(summarySchema.properties[name].type, "integer", `ctx_summarize.${name} is Integer in the registered schema`);
-  const recallSchema = registered.get("ctx_recall")!.parameters;
-  equal(recallSchema.properties.limit.type, "integer", "ctx_recall.limit is Integer in the registered schema");
-  equal(recallSchema.properties.maxTokens.type, "integer", "ctx_recall.maxTokens is Integer in the registered schema");
+  equal(summarySchema.properties.maxTokens.type, "integer", "ctx_summarize.maxTokens is Integer in the registered schema");
 
   const execContext = (signal?: AbortSignal) => ({ cwd: root, signal, model: undefined });
   const execute = (name: string, id: string, params: Record<string, unknown>, signal?: AbortSignal) =>
@@ -555,20 +305,6 @@ async function testBoundaryAndRegisteredTools(): Promise<void> {
   const arrayRead = await successful("ctx_read", "successful-array-read", { id: arrayHandle.id, jsonPath: "$" });
   equal(arrayRead.details.result.selectedType, "array", "registered JSON-path read identifies arrays");
   equal(JSON.parse(arrayRead.details.result.content).length, 8, "registered JSON-path read preserves arrays larger than five");
-
-  for (let index = 0; index < 7; index++) {
-    await successful("ctx_remember", `remember-${index}`, {
-      key: `long-fact-${index}`,
-      fact: `Error: long remembered fact ${index} 😀 ${"fact-value-".repeat(35)}`,
-    });
-  }
-  const recalled = await successful("ctx_recall", "successful-recall", {
-    query: "Error: long remembered fact",
-    limit: 20,
-    maxTokens: 10_000,
-  });
-  equal(recalled.details.result.facts.length, 7, "registered recall returns all seven long facts");
-  check(recalled.details.result.facts.every((fact: string) => fact.startsWith("Error:")), "registered recall preserves Error:-prefixed long facts");
 
   const summaryArray = Array.from({ length: 8 }, (_, index) => ({ index, value: `Error: summary-${index}` }));
   const summary = await successful("ctx_summarize", "successful-summary", {
@@ -668,159 +404,6 @@ async function testBoundaryAndRegisteredTools(): Promise<void> {
   check(readEvents.some((event) => event.mainTokensInjected > 0), "ordinary ctx_read exposure is accounted as injected, not prevented");
   check(readEvents.find((event) => event.handle === undefined || event.mainTokensInjected === 0) !== undefined, "nested helper ctx_read does not inject Main tokens");
   equal(prevented(afterRegisteredReads), savingsBeforeHelpers, "helpers and repeated ctx_read add no new Main savings");
-}
-
-async function testNativeChildUsage(): Promise<void> {
-  // The repository's existing verify-child suite covers the process tree and
-  // parser in detail. This focused probe exercises the index wrapper: successful
-  // child Usage must reach native Pi, failed Usage must survive the early
-  // tool_result middleware, and Fabric captures must be marked outside parent
-  // totals. The fixture never contacts a provider.
-  if (process.platform === "win32") {
-    console.log("Native child usage propagation: POSIX executable fixture skipped on Windows");
-    return;
-  }
-
-  const root = tempRoot("ce-remediation-child-usage-");
-  const fixture = join(root, "fake-child-pi.mjs");
-  const usage: any = {
-    input: 13, output: 5, cacheRead: 2, cacheWrite: 1, totalTokens: 21,
-    reasoning: 1, cacheWrite1h: 1,
-    cost: { input: 0.013, output: 0.025, cacheRead: 0.002, cacheWrite: 0.001, total: 0.041 },
-  };
-  writeFileSync(fixture, `#!/usr/bin/env node
-const usage = ${JSON.stringify(usage)};
-const emit = (event) => console.log(JSON.stringify(event));
-const assistant = (text, reportedUsage = usage) => ({
-  role: "assistant", content: [{ type: "text", text }], api: "openai-completions",
-  provider: "fixture", model: "fixture", usage: reportedUsage, stopReason: "stop", timestamp: Date.now()
-});
-if (process.env.CE_REMEDIATION_CHILD_MODE === "failure") {
-  emit({ type: "turn_start", turnIndex: 0 });
-  emit({ type: "message_start", message: assistant("", undefined) });
-  emit({ type: "message_update", usage });
-  console.error("fixture child failure after usage");
-  process.exit(7);
-}
-emit({ type: "turn_start", turnIndex: 0 });
-const final = assistant("fixture child success");
-if (process.env.CE_REMEDIATION_CHILD_MODE === "length") final.stopReason = "length";
-if (process.env.CE_REMEDIATION_CHILD_MODE === "codex") final.api = "openai-codex-responses";
-emit({ type: "agent_end", messages: [final] });
-`, { mode: 0o700 });
-  const previousPiBin = process.env.PI_BIN;
-  const previousMode = process.env.CE_REMEDIATION_CHILD_MODE;
-  const hooks = new Map<string, Array<(event: any, context: any) => Promise<any>>>();
-  const registered = new Map<string, RegisteredTool>();
-  contextEngineer({
-    on(name: string, handler: (event: any, context: any) => Promise<any>) {
-      const list = hooks.get(name) ?? [];
-      list.push(handler);
-      hooks.set(name, list);
-    },
-    registerTool(definition: RegisteredTool) { registered.set(definition.name, definition); },
-    registerCommand() {},
-  } as any);
-
-  // Match Pi's native ExtensionRunner: all handlers see the accumulated event
-  // and each patch is applied before the next handler runs.
-  async function applyToolResult(event: any): Promise<any> {
-    const current: any = { ...event };
-    let modified = false;
-    for (const handler of hooks.get("tool_result") ?? []) {
-      const patch = await handler(current, { cwd: root });
-      if (!patch) continue;
-      if (patch.content !== undefined) { current.content = patch.content; modified = true; }
-      if (patch.details !== undefined) { current.details = patch.details; modified = true; }
-      if (patch.isError !== undefined) { current.isError = patch.isError; modified = true; }
-      if (patch.usage !== undefined) { current.usage = patch.usage; modified = true; }
-    }
-    return modified
-      ? { content: current.content, details: current.details, isError: current.isError, usage: current.usage }
-      : undefined;
-  }
-  const execute = (id: string, params: Record<string, unknown>) =>
-    registered.get("ctx_delegate")!.execute(id, params, undefined, undefined, { cwd: root, signal: undefined, model: undefined });
-
-  process.env.PI_BIN = fixture;
-  try {
-    process.env.CE_REMEDIATION_CHILD_MODE = "success";
-    const success = await execute("native-child-success", { prompt: "success", maxTokens: 64, maxTurns: 1 });
-    equal(success.usage, usage, "successful registered child propagates measured Usage to native Pi");
-    equal(success.details.ce_child_calls, 1, "successful child result reports child call count");
-    equal(success.details.ce_child_usage, usage, "successful child details retain measured Usage");
-    equal(success.details.ce_child_usage_complete, true, "successful child result marks Usage complete");
-
-    process.env.CE_REMEDIATION_CHILD_MODE = "success";
-    await execute(`${FABRIC_NESTED_TOOL_CALL_ID_PREFIX}nested-child-success`, { prompt: "nested success", maxTokens: 64, maxTurns: 1 });
-
-    process.env.CE_REMEDIATION_CHILD_MODE = "length";
-    const lengthLimited = await execute("native-child-length", { prompt: "length", maxTokens: 64, maxTurns: 1 });
-    equal(JSON.parse(lengthLimited.content[0].text).childOutputTruncated, true, "provider-length truncation is visible to Main, not only hidden in details");
-    process.env.CE_REMEDIATION_CHILD_MODE = "codex";
-    const codex = await execute("native-child-codex", { prompt: "codex", maxTokens: 64, maxTurns: 1 });
-    equal(JSON.parse(codex.content[0].text).generationBudget, { enforcement: "stream", approximate: true, mayOvershoot: true }, "Codex streamed guard is not presented as an exact billed-token cap");
-
-    process.env.CE_REMEDIATION_CHILD_MODE = "failure";
-    const failedId = "native-child-failure";
-    let failedError: any;
-    try { await execute(failedId, { prompt: "failure", maxTokens: 64, maxTurns: 1 }); }
-    catch (error) { failedError = error; }
-    check(failedError instanceof Error, "failed registered child rejects instead of returning success");
-    equal(failedError.usage, usage, "failed child error retains partial measured Usage");
-    equal(failedError.usageComplete, false, "failed child error marks Usage incomplete");
-
-    const failedEvent: any = {
-      toolCallId: failedId,
-      toolName: "ctx_delegate",
-      input: { prompt: "failure" },
-      details: { preserved: { nested: true } },
-      content: [{ type: "text", text: "fixture child failure" }],
-      isError: true,
-    };
-    const failedSnapshot = structuredClone(failedEvent);
-    const failedPatch = await applyToolResult(failedEvent);
-    check(failedPatch?.isError === true, "failed native tool_result remains an error after usage patching");
-    equal(failedPatch?.usage, usage, "early failed-child tool_result hook restores measured Usage");
-    equal(failedPatch?.details?.preserved, failedSnapshot.details.preserved, "early usage patch preserves prior tool details");
-    equal(failedPatch?.details?.ce_child_usage_complete, false, "early usage patch exposes incomplete Usage metadata");
-    equal(failedEvent, failedSnapshot, "native middleware emulation does not mutate the original failed event");
-
-    process.env.CE_REMEDIATION_CHILD_MODE = "failure";
-    const nestedFailedId = `${FABRIC_NESTED_TOOL_CALL_ID_PREFIX}nested-child-failure`;
-    try { await execute(nestedFailedId, { prompt: "nested failure", maxTokens: 64, maxTurns: 1 }); }
-    catch (error) { check(error instanceof Error, "nested Fabric child failure still rejects"); }
-
-    const childEvents = readTelemetry(root).filter((event) => event.tool === "ctx_delegate" && event.childUsage !== undefined);
-    check(childEvents.some((event) => event.childUsageComplete === true && event.usageInParent === true), "native child telemetry marks successful Usage as included in parent");
-    check(childEvents.some((event) => event.childUsageComplete === false && event.usageInParent === true), "native child telemetry records failed partial Usage");
-    check(childEvents.some((event) => event.usageInParent === false), "Fabric child telemetry marks captured Usage outside parent totals");
-    const fabricEvent = childEvents.find((event) => event.usageInParent === false);
-    equal(fabricEvent?.childUsage, usage, "Fabric outside-parent telemetry retains the captured Usage for benchmark accounting");
-  } finally {
-    if (previousPiBin === undefined) delete process.env.PI_BIN; else process.env.PI_BIN = previousPiBin;
-    if (previousMode === undefined) delete process.env.CE_REMEDIATION_CHILD_MODE; else process.env.CE_REMEDIATION_CHILD_MODE = previousMode;
-  }
-}
-
-async function testWholeSummaryDeadline(): Promise<void> {
-  const root = tempRoot("ce-remediation-deadline-");
-  const store = new ContextStore(root);
-  let calls = 0;
-  let childSignal: AbortSignal | undefined;
-  const source = "Evidence must survive a hung model callback.";
-  const result = await tool("ctx_summarize").handler({ text: source, mode: "model", timeoutSeconds: 10 }, makeToolContext(root, store, {
-    modelCall: async (_prompt, _tokens, options) => {
-      calls++;
-      childSignal = options?.signal;
-      // Deliberately ignore the signal: the wrapper must still enforce its deadline.
-      return new Promise<string>(() => {});
-    },
-  })) as Record<string, any>;
-  equal(result.code, "summary_timeout", "whole-operation deadline stops a hung model callback");
-  equal(calls, 1, "timeout never starts another model call");
-  check(childSignal?.aborted === true, "deadline reaches the child's signal");
-  equal(exactStored(store, result.recovery.id), source, "timeout retains exact input recovery");
 }
 
 async function testNativePiErrorSignal(): Promise<void> {
@@ -990,12 +573,8 @@ try {
   await testStoreAndToolReads();
   await testOffloadFollowUpTelemetry();
   await testSectionReadsAndOffloadNotice();
-  await testModelSummaryBudgets();
-  await testUsageAndTelemetry();
   await testBoundaryAndRegisteredTools();
-  await testNativeChildUsage();
   await testNativePiErrorSignal();
-  await testWholeSummaryDeadline();
   console.log(`Remediation regression: ${checks} checks passed`);
 } catch (error) {
   process.exitCode = 1;

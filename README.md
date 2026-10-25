@@ -12,7 +12,7 @@ The roles are deliberately separate:
 
 ### Static data-flow gate
 
-With `strict` or `blockUnboundedReturns`, `fabric_exec` programs are analyzed before execution; `ce_exec` and `explainProgram` run the same analysis on demand. TypeScript, which the analyzer parses with, loads on first analysis rather than at extension startup. Tool-originated values are tracked through aliases, destructuring, object/array construction, method chains, callbacks, local helper functions, `Promise.all`, and function arguments.
+With `strict` or `blockUnboundedReturns`, `fabric_exec` programs are analyzed before execution; `explainProgram` runs the same analysis on demand. TypeScript, which the analyzer parses with, loads on first analysis rather than at extension startup. Tool-originated values are tracked through aliases, destructuring, object/array construction, method chains, callbacks, local helper functions, `Promise.all`, and function arguments.
 
 The analyzer distinguishes:
 
@@ -27,7 +27,7 @@ The analyzer distinguishes:
 
 Scalar projections, `some()`/`every()`/`includes()`, one-item selectors such as `find()`, explicit `slice(0, N)`, Fovea `maxTokens`, summaries, and offloads establish bounds. Numeric bounds survive aliases and local helper arguments, and common tool status fields such as `ok`, `exitCode`, and `truncated` are treated as scalars. `map()`, `filter()`, `reduce()`, `Object.entries()`/`values()`, `trim()`, and `replace()` can still retain the full source, so the analyzer marks them unbounded unless a later operation derives an explicit bound.
 
-By default CE skips static preflight, because nothing acts on an advisory verdict: programs run and the runtime boundary guard keeps a small actual result or offloads a large one. Use `ce_exec` when you want the static diagnostic explicitly. This avoids blocking useful work because of a conservative static approximation. Set `strict: true` or `blockUnboundedReturns: true` for fail-closed preflight. With `blockUnboundedReturns` alone, only hard blocks (statically unbounded source returns) stop a program. Fabric retains authoritative syntax/execution validation; only explicit strict/blocking settings turn CE diagnostics into pre-execution blocks. The number of internal calls is not the primary limit: a Fabric program may make many calls when its boundary result is controlled.
+By default CE skips static preflight, because nothing acts on an advisory verdict: programs run and the runtime boundary guard keeps a small actual result or offloads a large one. Use `explainProgram` when you want the static diagnostic explicitly. This avoids blocking useful work because of a conservative static approximation. Set `strict: true` or `blockUnboundedReturns: true` for fail-closed preflight. With `blockUnboundedReturns` alone, only hard blocks (statically unbounded source returns) stop a program. Fabric retains authoritative syntax/execution validation; only explicit strict/blocking settings turn CE diagnostics into pre-execution blocks. The number of internal calls is not the primary limit: a Fabric program may make many calls when its boundary result is controlled.
 
 ### Runtime boundary guard
 
@@ -63,7 +63,7 @@ A Fovea call with `maxTokens` is classified as a budgeted `SELECT` operation. Co
 
 ### Fabric child agents
 
-When CE is enabled, each extension-enabled Fabric Pi child that loads CE adds `ctx_read` to its own captured-tool allowlist before Fabric initializes, so the child can read back what CE offloaded in it without the caller listing the helper. This repeats at every depth. Like Fabric's own `agents.childQuestionTools` grant, it is skipped for an explicit empty `tools` list and for `+name`/`-name` lists; a malformed allowlist fails closed. Where no read path exists (a withheld allowlist, or a Pi `--tools` list without `ctx_read`), CE keeps the result inline rather than returning a handle that cannot be read. CE's isolated `ctx_delegate` fallback loads CE restricted to `ctx_read`, so a delegated child cannot delegate again. Other CE and Fovea extension tools remain opt-in; an explicit `extensions: false`/`--no-extensions` request and non-Pi runners are still intentional opt-outs.
+When CE is enabled, each extension-enabled Fabric Pi child that loads CE adds `ctx_read` to its own captured-tool allowlist before Fabric initializes, so the child can read back what CE offloaded in it without the caller listing the helper. This repeats at every depth. Like Fabric's own `agents.childQuestionTools` grant, it is skipped for an explicit empty `tools` list and for `+name`/`-name` lists; a malformed allowlist fails closed. Where no read path exists (a withheld allowlist, or a Pi `--tools` list without `ctx_read`), CE keeps the result inline rather than returning a handle that cannot be read. Other CE and Fovea extension tools remain opt-in; an explicit `extensions: false`/`--no-extensions` request and non-Pi runners are still intentional opt-outs.
 
 ### Context-effect registry (v0.5)
 
@@ -88,7 +88,7 @@ Stored payloads include content hashes, provenance/source, content type, creatio
 
 ### Telemetry
 
-The extension records sizes and strategies—not prompts or payloads—in `.pi/context-store/context-events.jsonl`. Metrics separate `internalTokensProcessed`, `mainTokensPrevented`, `mainTokensInjected`, and `storeTokensWritten`; the legacy `savedTokens` field aliases Main-context prevention for compatibility. Telemetry is scoped by extension runtime, host Pi session, or workspace lifetime; `ctx_status` defaults to a compact report for the selected scope (session by default), without repeated sibling scopes or per-event/per-strategy diagnostics. A fresh runtime can still request session/lifetime activity from earlier runtimes. Use `ctx_status({ scope: "lifetime", detail: "full" })` for all three scopes and diagnostic breakdowns. Existing consumers of `.runtime`, `.session`, or `.lifetime` should request `detail: "full"`; compact callers use `.summary`.
+The extension records sizes and strategies—not prompts or payloads—in `.pi/context-store/context-events.jsonl`. Metrics separate `mainTokensPrevented`, `mainTokensInjected`, and `storeTokensWritten`; the legacy `savedTokens` field aliases Main-context prevention for compatibility. `/ce status` reports the current Pi session, and `--all` covers every session recorded in the workspace.
 
 Interactive commands:
 
@@ -103,7 +103,8 @@ Interactive commands:
 
 `offloadFollowUp` (also shown by `/ce status`) reports how many boundary-offloaded handles were later read with `ctx_read`/`ctx_summarize` and how many offloaded calls were repeated anyway. A repeat suggests the preview or notice did not make the handle usable, and the same output was paid for again.
 
-The numbers are approximate context-token estimates, not billing reconciliation or proof of agent effectiveness. Internal helper calls do not count as Main exposure; reading an existing handle does not count the same source as prevented again. Use actual model Usage (including nested calls and cache/cost fields) to evaluate billed savings. `ctx_status` exposes `childCalls`, observed `childUsage`, and `childUsageComplete`; incomplete/missing reports are not zero-cost work. Native standalone calls attach observed Usage on success and failure. Current Fabric capture omits nested tool Usage from native totals, so `childUsageOutsideParent` reports the additional observed usage separately; add it exactly once, not all `childUsage` again.
+The numbers are approximate context-token estimates, not billing reconciliation or proof of agent effectiveness. Internal helper calls do not count as Main exposure, and reading an existing handle does not count the same source as prevented again.
+
 ## Fabric example
 
 ```ts
@@ -121,9 +122,8 @@ return (await extensions.ctx_summarize({
 
 - `structural` (default) — free deterministic JSON/text extraction.
 - `code` — free deterministic code-aware extraction of imports, signatures, and head/tail windows.
-- `model` — isolated no-tools semantic summarization; large inputs are chunked and reduced hierarchically.
 
-Unknown modes reject at the registered Pi tool boundary. `maxTokens` is an approximate UTF-8 return budget, clamped to 64–4000. Model mode also accepts `maxInputTokens` (default 32000 approximate source tokens per child), `maxChunks` (default 16, maximum 64), `maxCalls` (default twice `maxChunks`, maximum 128), and a whole-operation `timeoutSeconds` (default 90, range 10–110). Binary reduction guarantees progress; no redundant final model call is made. Model-source data, including inline input, has an exact `recovery` handle. `strategy: "direct"` explicitly selects a prefix and reports `complete`, `coveredBytes`, `totalBytes`, and `nextOffset`; it is never an implicit fallback. Prefer deterministic `code` or `structural` unless semantic compression is needed.
+Unknown modes reject at the registered Pi tool boundary. `maxTokens` is an approximate UTF-8 return budget, clamped to 64–4000.
 
 Offloaded results include a copyable `ctx_read({ id, offset, length })` example at the model boundary; inside Fabric code use `extensions.ctx_read(...)`. Use `query` for literal matches or `jsonPath` for focused JSON values.
 
@@ -146,12 +146,8 @@ Use the returned handle with `ctx_read` to retrieve a range, literal matches, or
 The registered tools are callable directly by the model and inside Fabric through `extensions.*`:
 
 - `ctx_read` — select a range, literal matches, or a JSON path from a stored handle
-- `ctx_summarize` — free structural/code compression or isolated no-tools model compression
-- `ctx_remember` / `ctx_recall` / `ctx_forget` — persistent project facts with bounded recall, named upserts, and deletion
-- `ctx_delegate` — isolated child Pi with `maxTokens`, `maxTurns` (default 8, range 1–32), a nested-safe deadline, bounded process-output buffers, and parent cancellation. Supported adapters receive real generation caps. Codex has no supported server output-cap field, so it uses an explicitly approximate streaming guard instead; `generationBudget` reports this limitation and billed output may overshoot or be unknown on cancellation. `childOutputTruncated: true` exposes provider-length truncation. Oversized returned text has an exact recovery handle. Pure summaries disable tools/project context and use a minimal prompt. Timeout/abort terminates process trees, escalating to SIGKILL on POSIX.
+- `ctx_summarize` — free structural/code compression
 - `ctx_offload` — manual Write operation
-- `ctx_status` — current policy thresholds and observed savings
-- `ce_exec` — explicit static preflight (`PASS`, `WARN`, or `BLOCK`)
 
 For Fabric-native orchestration and recursive decomposition, call Fabric's `agents.*` APIs directly when available.
 
@@ -204,7 +200,7 @@ All options live in `.pi/context-engineer.json` (field names are exact `CeConfig
 | `quantitativePolicy.maxBytes` / `policy.maxBytes` | number (bytes) | `8192` | Static preflight budget; also unifies the runtime offload budget when `readOffloadThreshold` is unset (see `resolveRuntimeByteBudget`). Max 1,000,000,000. |
 | `quantitativePolicy.maxTokens` / `policy.maxTokens` | number | `4000` | Token budget for token-unit bounds. Max 1,000,000,000. |
 | `quantitativePolicy.maxCharacters` / `policy.maxCharacters` | number | `8192` | Character budget (UTF-16 code units). Max 1,000,000,000. |
-| `readOffloadThreshold` | number (bytes) | `16384` | Runtime auto-offload budget; wins over `policy.maxBytes` when set. Clamped to 256–1,000,000,000; clamps surface via `ctx_status` warnings. |
+| `readOffloadThreshold` | number (bytes) | `16384` | Runtime auto-offload budget; wins over `policy.maxBytes` when set. Clamped to 256–1,000,000,000; clamps surface via `/ce settings` warnings. |
 | `resultPolicy` | `"auto" \| "inline" \| "offload" \| "summarize"` | `"auto"` | `auto` previews/offloads by threshold; `inline` preserves all results (including errors); `offload` forces handles for successful results; `summarize` uses threshold-based deterministic structural compression with exact recovery (no model call). |
 | `errorCompactionThreshold` | number (bytes) | `4096` | Model-boundary errors at/above this size are compacted (min 256). |
 | `errorCompactionPreviewBytes` | number (bytes) | `4096` | Visible budget retained by a compacted error, including the recovery recipe (256–64,000). |
@@ -213,20 +209,20 @@ All options live in `.pi/context-engineer.json` (field names are exact `CeConfig
 | `compactEditResults` | boolean | `true` | Compact recognized verbose 2 KB+ successful edit envelopes (diff/patch) into an acknowledgment + recovery handle. Set `false` to keep them inline. |
 | `notifyOnStart` | boolean | `false` | Opt into the session-start toast. |
 | `storeMaxBytes` | number (bytes) | `500000000` | Transient store cap; cannot exceed 500 MB. Newest write is never evicted; over-budget writes evict oldest first (LRU) after TTL sweep. |
-| `storeTtlMs` | number (ms) | `604800000` | Transient entry TTL (1 week). Remembered facts use a separate persistent namespace (no TTL, 5 MB budget). |
+| `storeTtlMs` | number (ms) | `604800000` | Transient entry TTL (1 week). |
 | `compactStaleResults` | boolean | deprecated, ignored | Always effective `false`; already-exposed messages stay prefix-stable. Accepted so old configs still load. |
 | `nestedResultThreshold` | number | deprecated, ignored | Always effective `null`; internal Fabric provider values are never rewritten. Accepted so old configs still load. |
 
-Bad JSON in `.pi/context-engineer.json` does not throw: defaults load and a warning surfaces via `ctx_status`. Out-of-range numeric budgets are clamped (floored, min/max) with a `ctx_status` warning instead of failing startup.
+Bad JSON in `.pi/context-engineer.json` does not throw: defaults load and a warning surfaces in `/ce settings`. Out-of-range numeric budgets are clamped (floored, min/max) with a `/ce settings` warning instead of failing startup.
 
 ### Bytes vs tokens
 
-Prefer byte budgets. Static preflight defaults to 8 KB (`quantitativePolicy.maxBytes`) while the runtime auto-offload default is 16 KB (`readOffloadThreshold` / `DEFAULT_RUNTIME_OFFLOAD_BYTES`) because static estimates are conservative upper bounds and runtime measures actual UTF-8 bytes. Token equivalents are heuristic: ~4 chars/token, so 16 KB ≈ 4,000 tokens for ASCII. Multibyte UTF-8 inflates bytes faster than the heuristic implies, and boundary messages report bytes with the ASCII-biased token estimate in parentheses. Invalid `policy` objects are ignored with a `ctx_status` warning; per-budget maximum is 1,000,000,000.
+Prefer byte budgets. Static preflight defaults to 8 KB (`quantitativePolicy.maxBytes`) while the runtime auto-offload default is 16 KB (`readOffloadThreshold` / `DEFAULT_RUNTIME_OFFLOAD_BYTES`) because static estimates are conservative upper bounds and runtime measures actual UTF-8 bytes. Token equivalents are heuristic: ~4 chars/token, so 16 KB ≈ 4,000 tokens for ASCII. Multibyte UTF-8 inflates bytes faster than the heuristic implies, and boundary messages report bytes with the ASCII-biased token estimate in parentheses. Invalid `policy` objects are ignored with a `/ce settings` warning; per-budget maximum is 1,000,000,000.
 
 ### Selection and compression notes
 
-- `ctx_read({ query })` is literal and case-sensitive by default. Set `regex: true` for a per-line JavaScript RegExp and/or `ignoreCase: true`. Invalid regex and storage failures reject at the Pi tool boundary with structured error diagnostics; internal handlers use `{ error, code, isError: true }`. Storage uses explicit `ok` status, so payloads and remembered facts beginning `Error:` remain valid evidence. Regex/ignore-case scans are bounded and report scan truncation.
-- Hierarchical inputs exceeding `maxChunks` fail **before model calls**, with `summary_input_budget_exceeded` and an exact recovery handle. Narrow the input or explicitly raise the budget; no first-chunk-only summary is substituted. Stored input reads stop after enough chunks to detect overflow. Structural/code stored summaries inspect a bounded 512 KB prefix and report truncation. Summaries are lossy navigation aids; recover original evidence when exact details matter.
+- `ctx_read({ query })` is literal and case-sensitive by default. Set `regex: true` for a per-line JavaScript RegExp and/or `ignoreCase: true`. Invalid regex and storage failures reject at the Pi tool boundary with structured error diagnostics; internal handlers use `{ error, code, isError: true }`. Storage uses explicit `ok` status, so payloads beginning `Error:` remain valid evidence. Regex/ignore-case scans are bounded and report scan truncation.
+- Structural/code summaries of a stored payload inspect a bounded 512 KB prefix and report truncation. Summaries are lossy navigation aids; recover original evidence when exact details matter.
 
 Project configuration is re-read when the file's modification time changes, so tuning does not require an extension reload. `/ce settings` shows effective values, including defaults.
 
@@ -239,7 +235,7 @@ Project configuration is re-read when the file's modification time changes, so t
 - `compactEditResults` (default `true`) additionally offloads recognized successful 2 KB+ edit envelopes containing a verbose diff/patch. Set it to `false` to keep those results inline below the normal threshold. `resultPolicy: "inline"` still bypasses all successful-result rewriting.
 - `notifyOnStart` controls the session-start toast, which is off by default.
 
-Transient context-store entries default to one week (`604800000` ms) and 500 MB (`500000000` bytes). Remembered facts use a separate persistent store with no TTL and a 5 MB budget. Configured transient storage budgets cannot exceed the 500 MB cap. Payloads use a metadata index plus content-addressed private blobs; writes are atomic and cleanup removes expired, dangling, and over-budget entries.
+Transient context-store entries default to one week (`604800000` ms) and 500 MB (`500000000` bytes). Configured transient storage budgets cannot exceed the 500 MB cap. Payloads use a metadata index plus content-addressed private blobs; writes are atomic and cleanup removes expired, dangling, and over-budget entries.
 
 ## Install in Pi
 
@@ -297,7 +293,7 @@ The test suite includes more than 50 static data-flow cases plus live hook probe
 - nested Fabric provider proxies
 - intermediate-result preservation, including large MCP/Fovea/CE provider proxies under every result policy
 - automatic final offload, prefix-stable previews across retries and branches, legacy config compatibility, serialized `ctx_read` envelope caps, and bounded query work
-- runtime-first versus strict preflight, bounded delegation, and deterministic `ctx_summarize` modes
+- runtime-first versus strict preflight and deterministic `ctx_summarize` modes
 - content deduplication, UTF-8 ranges, unchanged grep inputs (including valid ripgrep-only regex syntax), and lossless multi-text/error recovery
 - generated adversarial transformations for aliases, destructuring, callbacks, async wrappers, computed access, loops, and Promise aggregates
 - the explicit `src/context-effects.ts` registry used by the analyzer for source/select/compress/offload policy metadata, including current providers and PowerShell/process tools

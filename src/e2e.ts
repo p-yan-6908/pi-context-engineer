@@ -15,7 +15,6 @@ export interface SmokeScenario {
 
 const readCommand = `node -e 'process.stdout.write("x".repeat(5000) + "E2E-READ-MARKER" + "x".repeat(15000))'`;
 const readProgram = `const raw = await pi.bash({ cmd: ${JSON.stringify(readCommand)} }); return raw;`;
-const summaryProgram = `const text = "E2E-SUMMARY-MARKER\\n" + "x".repeat(12000); return (await extensions.ctx_summarize({ text, mode: "model", maxTokens: 120, maxInputTokens: 2048, maxChunks: 4, maxCalls: 8 })).text;`;
 const policyProgram = `const raw = await pi.bash({ cmd: "printf 100000" }); const limit = Math.min(Number(raw.output), 3000); return { marker: "E2E-POLICY-ALLOW", limit };`;
 const blockedProgram = `return await pi.bash({ cmd: "touch blocked-sentinel" });`;
 
@@ -26,17 +25,6 @@ export const smokeScenarios: SmokeScenario[] = [
     prompt: `Run this code in fabric_exec: ${readProgram} Then use another fabric_exec call with extensions.ctx_read and the returned handle to locate the marker in the stored payload. Return the recovered marker and state that recovery succeeded. Additional bounded reads are allowed.`,
     assert: (answer, results) => answer.includes("E2E-READ-MARKER") && /recover/i.test(answer) &&
       results.some(result => result.details?.ce_offloaded === true) && results.filter(result => result.isError !== true).length >= 2,
-  },
-  {
-    name: "hierarchical bounded summary",
-    program: summaryProgram,
-    prompt: `Run this code in fabric_exec: ${summaryProgram} Report the returned marker, strategy, chunks, and modelCalls. Do not claim success if the helper returned an error.`,
-    assert: (answer, results) => answer.includes("E2E-SUMMARY-MARKER") && /hierarch/i.test(answer) && results.some(result =>
-      result.isError !== true && (result.content ?? []).some((block: any) => {
-        if (block.type !== "text") return false;
-        try { const value = JSON.parse(block.text); return value.strategy === "hierarchical" && value.complete === true && value.chunks > 1 && value.modelCalls > 1; }
-        catch { return false; }
-      })),
   },
   {
     name: "small numeric projection executes under runtime-first policy",

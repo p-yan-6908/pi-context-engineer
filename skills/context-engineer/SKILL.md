@@ -110,16 +110,12 @@ const first = await extensions.ctx_read({ id: h.id, jsonPath: "$.items[0].name" 
 ```
 
 **R3 — `ctx_summarize` with deterministic modes.** `structural` and `code` are
-deterministic (no model call); `model` spends an isolated model call — use it
-only when semantics demand it:
+deterministic and make no model call:
 
 ```ts
 const s = await extensions.ctx_summarize({ text: raw, mode: "structural", maxTokens: 2000 });
 return s.text; // project to .text — don't re-serialize the envelope
 ```
-
-**R4 — `ctx_remember` for cross-session lessons only** (for example,
-prompting quirks of a subagent), not for facts derivable from code.
 
 ## Failures → recovery
 
@@ -139,8 +135,7 @@ When CE is enabled, extension-enabled Fabric Pi children at any depth
 automatically receive `ctx_read`, so their offload handles stay readable
 without `tools: ["ctx_read"]`. The grant is skipped for an explicit empty
 `tools` list and for `+name`/`-name` lists; CE then keeps results inline
-instead of offloading. CE's isolated `ctx_delegate` fallback loads CE with
-`ctx_read` only. Other CE/Fovea extension tools remain opt-in; explicit
+instead of offloading. Other CE/Fovea extension tools remain opt-in; explicit
 `extensions: false` and non-Pi runners are intentional opt-outs.
 
 ## Boundaries
@@ -151,8 +146,7 @@ instead of offloading. CE's isolated `ctx_delegate` fallback loads CE with
   belongs to grep/Fovea.
 - **Not a gate to fight.** By default nothing is blocked: small results pass
   through untouched and large ones are offloaded after they run. Static
-  preflight runs only with `strict` or `blockUnboundedReturns`; `ce_exec`
-  runs the same diagnostic on demand.
+  preflight runs only with `strict` or `blockUnboundedReturns`.
 
 ## Tools
 
@@ -160,11 +154,7 @@ instead of offloading. CE's isolated `ctx_delegate` fallback loads CE with
 |---|---|
 | `ctx_read` | pull slices, sections, or JSON values from a handle (the workhorse) |
 | `ctx_offload` | manually park a large payload → handle |
-| `ctx_summarize` | deterministic (`structural`/`code`) or semantic (`model`) compression |
-| `ctx_remember` / `ctx_recall` / `ctx_forget` | persistent project facts: write, bounded recall, delete |
-| `ctx_status` | policy thresholds and observed context savings |
-| `ctx_delegate` | move separable work to an isolated child Pi |
-| `ce_exec` | explicit static boundary diagnostic |
+| `ctx_summarize` | deterministic (`structural`/`code`) compression |
 
 ## Configuration
 
