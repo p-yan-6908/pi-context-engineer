@@ -23,7 +23,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
-import { inferContentType, structuralPreview, type PreviewContentType } from "./preview.js";
+import { fabricSection, fabricSectionNames, inferContentType, structuralPreview, type PreviewContentType } from "./preview.js";
 
 export const DEFAULT_CONTEXT_STORE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 export const MAX_CONTEXT_STORE_BYTES = 500_000_000;
@@ -96,6 +96,8 @@ export interface ReadOptions {
   query?: string;
   /** Dot/bracket JSON path, for example `$.results[0].name`. */
   jsonPath?: string;
+  /** Fabric section name; offset/length then page within that section. */
+  section?: string;
   /** Lines of context around each query match. */
   contextLines?: number;
   /** Maximum matching windows to format while still counting every match. */
@@ -114,6 +116,9 @@ export interface ReadResult {
   jsonPath?: string;
   /** Runtime type of the selected JSON value. */
   selectedType?: string;
+  /** Selected Fabric section; offset, nextOffset and sectionBytes are relative to it. */
+  section?: string;
+  sectionBytes?: number;
   bytesRead: number;
   /** Actual byte offset used for a ranged read. */
   offset?: number;
@@ -287,6 +292,11 @@ export class ContextStore {
       if (opts.jsonPath !== undefined) {
         const data = readFileSync(blob, "utf8");
         return this.readJsonPath(entry, data, opts);
+      }
+
+      if (opts.section !== undefined) {
+        const data = readFileSync(blob, "utf8");
+        return this.readSection(entry, data, opts);
       }
 
       if (opts.query !== undefined) {
@@ -598,6 +608,48 @@ export class ContextStore {
       bytesRead: Buffer.byteLength(content, "utf8"),
       content,
       truncated: false,
+    };
+  }
+
+  private readSection(entry: StoreMetadata, data: string, opts: ReadOptions): ReadResult {
+    const section = opts.section ?? "";
+    const names = fabricSectionNames(data);
+    const selected = names ? fabricSection(data, section) : undefined;
+    if (!selected) {
+      return {
+        ...this.baseResult(entry),
+        section,
+        ok: false,
+        content: names
+          ? `Error: stored result "${entry.id}" has no section ${JSON.stringify(section)}; available: ${names.slice(0, 24).map((name) => JSON.stringify(name)).join(", ")}.`
+          : `Error: stored result "${entry.id}" is not a Fabric sectioned result; use query or offset/length.`,
+        bytesRead: 0,
+        truncated: false,
+      };
+    }
+
+    const bytes = Buffer.from(selected.text, "utf8");
+    const sectionBytes = bytes.byteLength;
+    const requestedOffset = Math.max(0, Math.min(sectionBytes, Math.floor(Number(opts.offset) || 0)));
+    const requestedLength = Math.max(0, Math.floor(Number(opts.length ?? DEFAULT_PREVIEW_BYTES * 4) || 0));
+    // Expand to complete code points, as ranged reads do.
+    let start = requestedOffset;
+    while (start > 0 && start < sectionBytes && (bytes[start] & 0xc0) === 0x80) start--;
+    let end = Math.min(sectionBytes, requestedOffset + requestedLength);
+    while (end < sectionBytes && (bytes[end] & 0xc0) === 0x80) end++;
+    const content = bytes.subarray(start, end).toString("utf8");
+    const truncated = end < sectionBytes;
+    return {
+      ...this.baseResult(entry),
+      section,
+      sectionBytes,
+      bytesRead: end - start,
+      offset: start,
+      ...(truncated ? { nextOffset: end } : {}),
+      content: truncated
+        ? content + `\n... [${sectionBytes - end} more section bytes, use ctx_read with section and offset=${end} to continue]`
+        : content,
+      truncated,
     };
   }
 

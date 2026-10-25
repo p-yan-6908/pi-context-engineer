@@ -2,11 +2,11 @@
 name: context-engineer
 description: >-
   Operational playbook for the context-engineer extension — the model boundary
-  that auto-offloads oversized tool results into session-scoped handles and
-  serves slices back through ctx_read. Load when a tool result returns as a
-  handle or "see section" preview, when choosing a ctx_read access mode
-  (query / offset / length / jsonPath / section), when a ctx_* call fails
-  (invalid JSON for jsonPath, stale handle, invalid bracket segment), when
+  that auto-offloads oversized tool results into stored handles and serves
+  slices back through ctx_read. Load when a tool result returns as a handle or
+  a "see section" preview, when choosing a ctx_read access mode (query /
+  offset+length / section / jsonPath), when a ctx_* call fails (not valid JSON
+  for jsonPath, missing or expired handle, invalid bracket segment), when
   offloading or summarizing a large payload, or when deciding whether to
   aggregate in-guest instead of offloading. NOT for cross-session history
   (use the memory/session layer) or corpus-wide search (use grep).
@@ -15,92 +15,98 @@ description: >-
 # context-engineer — the model-boundary playbook
 
 context-engineer (CE) keeps oversized data out of the model window. The main
-event is **automatic**: a tool result above the offload threshold (~16 KB)
-never reaches you verbatim — you get a short structural preview plus a
+event is **automatic**: a tool result above the offload threshold (16 KB by
+default) never reaches you verbatim — you get a structural preview plus a
 handle, and you pull back exactly the slice you need. Everything below is
 about doing that well.
-
-Field stats that shape this playbook: `ctx_read` is ~91% of all CE traffic;
-auto-offload outnumbers manual `ctx_offload` 55:1; ~10% of calls fail — almost
-all on one mistake: wrong access mode for the handle type (§ Rule #1).
 
 ## Mental model
 
 - **Auto-offload is the main path.** When a `fabric_exec` / `pi.*` / `mcp.*`
-  return is huge, expect preview + handle. That is the tool working, not an error.
-- **Handles are session-scoped.** The store does not survive a restart. A stale
-  handle fails with `no stored result with id` — re-offload the source.
-- **Handles nest.** A `ctx_read` return can itself come back sectioned. Read raw
-  slices with `offset`/`length`; never fight the handle by re-reading the raw
-  source or hand-chunking data into mesh.
+  return is huge, expect preview + handle. That is the tool working, not an
+  error. The notice lists the `ctx_read` calls that fit that payload.
+- **Read the handle; do not re-run the call.** The full result is stored.
+  Re-running pays for the same output again and may repeat side effects.
+- **Handles live in the workspace store** (`.pi/context-store/`, one week and
+  500 MB by default). `no stored result with id` means the handle expired, was
+  evicted, or belongs to another working directory; only then re-run the source.
+- **Handles nest.** If a program that reads handles returns too much, its
+  return is offloaded again and the notice says so. Narrow the selection
+  instead of reading the new handle back whole.
 
 ## Decision tree: a big result came back as a handle
 
 1. **Is the preview enough?** Often it is. Don't read handles you don't need.
-2. **Need one field name or any text occurrence?** → `query` (text search over
-   the handle; good for field names, error strings, per-tool counters).
-3. **Need a bounded window?** → `offset` + `length` (e.g. the first 4 KB).
-4. **Need a named part?** → `section` (sectioned previews expose named parts).
-5. **Need precise JSON nodes?** → `jsonPath` — but only if the handle content
-   is JSON (§ Rule #1 below).
+2. **Need a field name or any text occurrence?** → `query` (literal line
+   search; `regex: true` for a pattern, `ignoreCase: true` to fold case).
+3. **Need a bounded window?** → `offset` + `length`; continue at `nextOffset`.
+4. **Need a named part of a Fabric sectioned result?** → `section`, using a
+   name from the preview's section list; `offset`/`length` page inside it.
+5. **Need precise JSON values?** → `jsonPath`, only when the payload is JSON
+   (Rule #1).
 6. **Need a digest rather than a slice?** → `ctx_summarize`
    (`structural` / `code`).
 
-## Rule #1: handle type decides the access mode
+## Rule #1: payload type decides the access mode
 
-| Handle origin | Content shape | Works | Breaks |
-|---|---|---|---|
-| Auto-offloaded tool result | sectioned text / YAML preview | `query`, `section`, `offset`+`length` | `jsonPath` |
-| `ctx_offload` of a JSON payload | JSON | `jsonPath`, `query`, `offset`+`length` | — |
-| `ctx_offload` of text | text | `query`, `offset`+`length` | `jsonPath` |
+| Payload | Works | Breaks |
+|---|---|---|
+| Fabric sectioned result (preview lists `Section "…"` entries) | `section`, `query`, `offset`+`length` | `jsonPath` |
+| JSON, including multi-block handles stored as `{ textBlocks }` | `jsonPath`, `query`, `offset`+`length` | `section` |
+| Plain text, logs, code | `query`, `offset`+`length` | `jsonPath`, `section` |
 
-`jsonPath` against a text handle is the dominant field error:
-`stored result is not valid JSON; jsonPath cannot be selected`. There is no
-type probe — read the preview first: if it reads like YAML or prose, don't
-reach for `jsonPath`.
+`jsonPath` on a non-JSON handle fails with `stored result ... is not valid
+JSON`. Automatic offload notices offer `jsonPath` only for JSON payloads and
+`section` only for sectioned ones. For a manual `ctx_offload` handle, read the
+preview first.
 
 ## ctx_read — the workhorse
+
+Inside `fabric_exec`, call `extensions.ctx_read(...)`; at the model boundary,
+call `ctx_read` directly.
 
 ```ts
 // search: a field name or any occurrence inside the handle
 await extensions.ctx_read({ id, query: "perTool" });
 
-// byte-range: bounded windows
+// byte range: bounded windows; continue at nextOffset
 await extensions.ctx_read({ id, offset: 0, length: 4000 });
 
-// named section of a sectioned preview
-await extensions.ctx_read({ id, section: "proposal" });
+// one section of a Fabric sectioned result, paged inside the section
+await extensions.ctx_read({ id, section: "details.diff", offset: 0, length: 4000 });
 
-// JSON node access (JSON handles only)
+// JSON value access (JSON handles only)
 await extensions.ctx_read({ id, jsonPath: "$.details.result.text" });
 ```
 
-jsonPath dialect: `$.a.b`, `$.a[0].b`, `$.a[*].b`. **No slices** —
-`$.hits[0:5].text` fails with `invalid bracket segment "0:5"`. Iterate indices
-or use `query`.
+jsonPath dialect: `$.a.b`, `$.a[0].b`, `$.a["odd key"]`. **No wildcards or
+slices** — `$.hits[*].text` and `$.hits[0:5].text` fail with
+`invalid bracket segment`. Read indices one at a time, or use `query`.
 
 ## Field recipes
 
 **R0 — aggregate in-guest before offloading.** The cheapest byte is the one
 you never store: project large structured input to a compact representation
-(tree, counts, filtered rows) inside the guest and return it. Offload is the
-fallback, not step one.
+(counts, filtered rows, the fields you need) inside the guest and return it.
+Offload is the fallback, not step one.
 
-**R1 — auto-offloaded result → slice reads** (≈half of all CE traffic). The
-preview is already in context; pull the rest on demand:
+**R1 — auto-offloaded result → slice reads.** The preview is already in
+context; pull the rest on demand:
 
 ```ts
 const slice = await extensions.ctx_read({ id, offset: 0, length: 4000 });
 const field = await extensions.ctx_read({ id, query: "perTool" });
 ```
 
-If a `ctx_read` result itself comes back as a handle — your slice was too big: narrow the window (`length`), tighten the `query`, or aggregate in-guest and return a digest.
+If a program that reads handles comes back as a handle itself, the selection
+was too big: shrink `length`, tighten `query`, read one `section`, or
+aggregate in-guest and return a digest.
 
 **R2 — heavy external JSON → `ctx_offload` + `jsonPath`:**
 
 ```ts
-const h = await extensions.ctx_offload({ key: "pixso-dsl", source: "pixso-remote", data: txt });
-const nodes = await extensions.ctx_read({ id: h.id, jsonPath: "$.dsl.pixDslNodes[*].name" });
+const h = await extensions.ctx_offload({ key: "api-response", source: "mcp", data: txt });
+const first = await extensions.ctx_read({ id: h.id, jsonPath: "$.items[0].name" });
 ```
 
 **R3 — `ctx_summarize` with deterministic modes.** `structural` and `code` are
@@ -112,48 +118,56 @@ const s = await extensions.ctx_summarize({ text: raw, mode: "structural", maxTok
 return s.text; // project to .text — don't re-serialize the envelope
 ```
 
-**R4 — `ctx_remember` for cross-session lessons only** (e.g. prompting quirks
-of a vision subagent), not for facts derivable from code.
-
-Always call from guest code with the `extensions.` prefix:
-`extensions.ctx_read(...)`.
+**R4 — `ctx_remember` for cross-session lessons only** (for example,
+prompting quirks of a subagent), not for facts derivable from code.
 
 ## Failures → recovery
 
 | Error | Root cause | Fix |
 |---|---|---|
-| `stored result is not valid JSON; jsonPath cannot be selected` | `jsonPath` on a text/YAML handle | switch to `query` / `section` / `offset`+`length` |
-| `JSON path was not found in stored result` | structure differs from expectation | read a small window first, then re-path |
-| `invalid bracket segment "0:5"` | slice syntax unsupported | `$.a[0].b` per index, or `query` |
-| `no stored result with id` | stale handle from an earlier session | re-offload the source |
-| result isn't a string (`.slice is not a function`) | mode returned an object | take the field you need, or use `offset`/`length` |
+| `stored result ... is not valid JSON` | `jsonPath` on a text or sectioned handle | switch to `section` / `query` / `offset`+`length` |
+| `JSON path ... was not found` | structure differs from expectation | read a small window first, then re-path |
+| `invalid bracket segment "0:5"` or `"*"` | slices and wildcards are unsupported | `$.a[0].b` per index, or `query` |
+| `has no section "…"; available: …` | wrong section name | use a name from the error or the preview |
+| `is not a Fabric sectioned result` | `section` on a plain or JSON handle | `query` / `offset`+`length` / `jsonPath` |
+| `no stored result with id` / `has expired` | expired, evicted, or another working directory | re-run the source call |
+| result isn't a string (`.slice is not a function`) | the helper returned an envelope | take `.content` / `.text`, or use `offset`/`length` |
+
+## Fabric child agents
+
+When CE is enabled, extension-enabled Fabric Pi children at any depth
+automatically receive `ctx_read`, so their offload handles stay readable
+without `tools: ["ctx_read"]`. The grant is skipped for an explicit empty
+`tools` list and for `+name`/`-name` lists; CE then keeps results inline
+instead of offloading. CE's isolated `ctx_delegate` fallback loads CE with
+`ctx_read` only. Other CE/Fovea extension tools remain opt-in; explicit
+`extensions: false` and non-Pi runners are intentional opt-outs.
 
 ## Boundaries
 
-- **Not cross-session memory.** Handles die with the session; history lives in
-  the session/memory layer, not here.
-- **Not a search engine.** `query` is a text search over one handle;
-  corpus-wide search belongs to grep/memory.
-- **Not a gate to fight.** The boundary is advisory by default; results small
-  enough pass through untouched.
-- `ce_exec` runs the static boundary diagnostic on demand — rarely needed;
-  preflight is automatic.
+- **Not cross-session memory.** Handles expire with the store's retention
+  limits; history lives in the session/memory layer.
+- **Not a search engine.** `query` searches one handle; corpus-wide search
+  belongs to grep/Fovea.
+- **Not a gate to fight.** By default nothing is blocked: small results pass
+  through untouched and large ones are offloaded after they run. Static
+  preflight runs only with `strict` or `blockUnboundedReturns`; `ce_exec`
+  runs the same diagnostic on demand.
 
 ## Tools
 
 | Tool | Purpose |
 |---|---|
-| `ctx_read` | pull slices/fields from a handle (the workhorse) |
+| `ctx_read` | pull slices, sections, or JSON values from a handle (the workhorse) |
 | `ctx_offload` | manually park a large payload → handle |
 | `ctx_summarize` | deterministic (`structural`/`code`) or semantic (`model`) compression |
-| `ctx_remember` / `ctx_recall` | persistent lesson store across sessions |
-| `ctx_status` | store size/entries at a glance |
-| `ctx_forget` | drop a stored entry |
-| `ctx_delegate` | move separable work to an isolated context |
+| `ctx_remember` / `ctx_recall` / `ctx_forget` | persistent project facts: write, bounded recall, delete |
+| `ctx_status` | policy thresholds and observed context savings |
+| `ctx_delegate` | move separable work to an isolated child Pi |
 | `ce_exec` | explicit static boundary diagnostic |
 
 ## Configuration
 
-Defaults fit almost every workload (field data: zero config changes in five
-months of heavy use). `strict`, `blockUnboundedReturns` and `resultPolicy`
-exist for fail-closed preflight and explicit policy — see the package README.
+Defaults fit most workloads. `strict`, `blockUnboundedReturns` and
+`resultPolicy` exist for fail-closed preflight and explicit policy — see the
+package README.

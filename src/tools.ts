@@ -117,7 +117,8 @@ const ctxRead: ToolDef = {
   description:
     "Read a slice of or search within a previously offloaded tool result by its handle. " +
     "Keeps large data out of context — only the requested slice or matched lines return. " +
-    "Use offset/length for ranged reads, query for literal line matches, or jsonPath for structured JSON selection.",
+    "Use offset/length for ranged reads, query for literal line matches, section for a named part of a Fabric sectioned result, or jsonPath for JSON payloads only. " +
+    "Reading the handle is cheaper than re-running the call that produced it.",
   inputSchema: {
     type: "object",
     properties: {
@@ -127,7 +128,8 @@ const ctxRead: ToolDef = {
       query: { type: "string", description: "Substring or regex to search for. Literal by default; set regex:true for RegExp. Overrides offset/length." },
       regex: { type: "boolean", description: "Treat query as a JavaScript RegExp matched per line. Default false (literal)." },
       ignoreCase: { type: "boolean", description: "Case-insensitive query matching. Default false (case-sensitive)." },
-      jsonPath: { type: "string", description: "Dot/bracket JSON path for a stored JSON payload, e.g. $.results[0].name. Overrides query/offset/length." },
+      jsonPath: { type: "string", description: "Dot/bracket JSON path for a stored JSON payload, e.g. $.results[0].name; no wildcards or slices. Overrides section/query/offset/length." },
+      section: { type: "string", description: "Section name listed in a Fabric sectioned preview. Overrides query; offset/length page within the section." },
       contextLines: { type: "integer", description: "Lines of context around each query match. Default 2; clamped to 0-50." },
       maxMatches: { type: "integer", description: "Maximum matching windows to format while still reporting exact totalMatches. Default 100; maximum 500." },
     },
@@ -154,6 +156,19 @@ const ctxRead: ToolDef = {
         return { error: result.content, code: "stored_read_failed", isError: true as const };
       }
       return capContent(result, budget, "narrow the JSON path or select a smaller value");
+    }
+
+    if (args.section !== undefined) {
+      const requested = args.length as number | undefined;
+      const result = await ctx.store.read(id, {
+        section: String(args.section),
+        offset: args.offset as number | undefined,
+        length: Math.min(requested ?? budget, budget),
+      });
+      if (!result.ok) {
+        return { error: result.content, code: "stored_read_failed", isError: true as const };
+      }
+      return capContent(result, budget, "use offset to page through the section");
     }
 
     if (args.query) {

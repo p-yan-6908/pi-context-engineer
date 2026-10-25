@@ -891,8 +891,57 @@ async function testNativePiErrorSignal(): Promise<void> {
   }
 }
 
+async function testSectionReadsAndOffloadNotice(): Promise<void> {
+  const root = tempRoot("ce-remediation-section-");
+  const store = new ContextStore(root, ".store", { ttlMs: 0 });
+  const diff = "-old\n+new\n".repeat(2000);
+  const note = "note 😀 ok";
+  const sectioned = `ok: true\ndetails:\n  diff: "<multi-line string, see section: details.diff>"\n  note: "<multi-line string, see section: details.note>"\n\n--- details.diff (${diff.length} chars) ---\n${diff}\n\n--- details.note (${note.length} chars) ---\n${note}`;
+  const handle = store.write("sectioned", "fabric_exec", sectioned);
+
+  equal(store.read(handle.id, { section: "details.note" }).content, note, "section mode returns one named Fabric section");
+  const page = store.read(handle.id, { section: "details.diff", offset: 0, length: 100 });
+  check(page.ok && page.truncated && page.nextOffset === 100, "section reads page within the section");
+  equal(page.sectionBytes, Buffer.byteLength(diff.trim(), "utf8"), "section reads report the section size");
+  equal(store.read(handle.id, { section: "details.note", offset: 6, length: 1 }).content.split("\n")[0], "😀", "section ranges expand to complete code points");
+  const missing = store.read(handle.id, { section: "nope" });
+  check(!missing.ok && missing.content.includes('"details.diff"'), "a missing section lists the available names");
+  const plain = store.write("plain", "read", "just text");
+  check(!store.read(plain.id, { section: "x" }).ok, "section mode rejects payloads that are not sectioned");
+  const viaTool = await tool("ctx_read").handler({ id: handle.id, section: "details.note" }, makeToolContext(root, store)) as Record<string, any>;
+  equal(viaTool.content, note, "ctx_read exposes section mode");
+
+  // The boundary notice offers only access modes that fit the payload.
+  const handlers = new Map<string, Array<(event: any, ctx: any) => Promise<any>>>();
+  contextEngineer({
+    on: (name: string, handler: any) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
+    registerTool() {},
+    registerCommand() {},
+  } as any);
+  const run = async (name: string, event: any): Promise<any> => {
+    let last: any;
+    for (const handler of handlers.get(name) ?? []) last = (await handler(event, { cwd: root })) ?? last;
+    return last;
+  };
+  const notice = async (toolCallId: string, code: string, text: string): Promise<string> => {
+    await run("tool_call", { toolName: "fabric_exec", toolCallId, input: { code } });
+    const result = await run("tool_result", { toolName: "fabric_exec", toolCallId, input: { code }, details: {}, isError: false, content: [{ type: "text", text }] });
+    return result?.content?.[0]?.text ?? "";
+  };
+  const sectionNotice = await notice("notice-sectioned", "return await extensions.ctx_read({ id: 'h' })", sectioned);
+  check(sectionNotice.includes('extensions.ctx_read({ id: "') && sectionNotice.includes('section: "details.diff"'), "a sectioned notice offers a real section name");
+  check(!sectionNotice.includes("jsonPath"), "a sectioned text notice does not offer jsonPath");
+  check(sectionNotice.includes("read stored handles"), "an overflowing handle-reading program gets the narrowing hint");
+  const json = JSON.stringify({ items: Array.from({ length: 2000 }, (_, i) => ({ i, name: `item-${i}` })) });
+  const jsonNotice = await notice("notice-json", "return data", json);
+  check(jsonNotice.includes('jsonPath: "$.field"') && !jsonNotice.includes("section:"), "a JSON notice offers jsonPath and no section");
+  check(!jsonNotice.includes("read stored handles"), "programs that do not read handles get no narrowing hint");
+  check(jsonNotice.startsWith('[offloaded to handle "') && jsonNotice.includes("instead of re-running"), "the notice keeps its marker and discourages re-runs");
+}
+
 try {
   await testStoreAndToolReads();
+  await testSectionReadsAndOffloadNotice();
   await testModelSummaryBudgets();
   await testUsageAndTelemetry();
   await testBoundaryAndRegisteredTools();

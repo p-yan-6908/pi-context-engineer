@@ -15,7 +15,7 @@ import type { Usage } from "@earendil-works/pi-ai";
 import { mergeUsage, readUsage } from "./usage.js";
 import { Type } from "typebox";
 import { ContextStore, DEFAULT_CONTEXT_STORE_TTL_MS, MAX_CONTEXT_STORE_BYTES } from "./store.js";
-import { compactErrorOutput, isVerboseEditAcknowledgement, structuralPreview } from "./preview.js";
+import { compactErrorOutput, fabricSectionNames, isVerboseEditAcknowledgement, structuralPreview, type PreviewContentType } from "./preview.js";
 import { ceTools, isErrorResult, summarizeText, type ToolContext } from "./tools.js";
 import { evaluateProgram, runtimeAdvisoryLine, type WrapperOptions } from "./wrapper.js";
 import { CONTEXT_ENGINEER_CHILD_ENV, runChildPiResult } from "./child.js";
@@ -204,21 +204,28 @@ function formatHandleText(
   text: string,
   previewBytes: number,
   surface: ReadSurface = "model",
+  contentType: PreviewContentType = "unknown",
+  readsHandles = false,
 ): string {
   const preview = structuralPreview(text, previewBytes);
-  const truncated = Buffer.byteLength(text, "utf8") > previewBytes;
+  const complete = Buffer.byteLength(text, "utf8") <= previewBytes;
   const tool = surface === "fabric" ? "extensions.ctx_read" : "ctx_read";
-  const actions =
-    `  ${tool}({ id: "${id}", query: "field-or-term" })       // search inside the handle\n` +
-    `  ${tool}({ id: "${id}", offset: 0, length: 4096 })      // read a window\n` +
-    `  ${tool}({ id: "${id}", section: "name" })              // named section of a sectioned preview\n` +
-    `  ${tool}({ id: "${id}", jsonPath: "$.path.to.field" })  // JSON payloads only — not for text previews`;
-  const handle =
-    `[offloaded to handle "${id}" — ${bytes} bytes (~${estimatedTokens} tokens). The FULL result is stored; nothing is lost. Do not re-run the command — read the handle instead:]\n` +
-    actions +
-    `\nPreview (first ${previewBytes} bytes of the stored payload):\n${preview}` +
-    (truncated ? `\n[preview ends mid-payload; the handle holds the rest]` : ``);
-  return handle;
+  // Offer only the access modes this payload supports: jsonPath on text is
+  // the most common failed read.
+  const sections = fabricSectionNames(text);
+  const jsonExample = text.startsWith('{"textBlocks":') ? "$.textBlocks[0].text" : "$.field";
+  const actions = [
+    `  ${tool}({ id: "${id}", query: "term" })  // matching lines`,
+    `  ${tool}({ id: "${id}", offset: 0, length: 4096 })  // byte window; continue at nextOffset`,
+    ...(sections?.length ? [`  ${tool}({ id: "${id}", section: ${JSON.stringify(sections[0])} })  // one section listed in the preview`] : []),
+    ...(contentType === "json" ? [`  ${tool}({ id: "${id}", jsonPath: "${jsonExample}" })  // JSON value; no wildcards or slices`] : []),
+  ];
+  return `[offloaded to handle "${id}" — ${bytes} bytes (~${estimatedTokens} tokens). The full result is stored; read the handle instead of re-running the call:]\n` +
+    (readsHandles
+      ? "This program read stored handles and its return still exceeded the boundary. Narrow the selection (smaller length, tighter query, one section) or return a digest.\n"
+      : "") +
+    `${actions.join("\n")}\n` +
+    `Preview (structural selection${complete ? ", complete" : ", not a prefix"}; up to ${previewBytes} bytes):\n${preview}`;
 }
 
 // ---- Extension setup ----
@@ -264,6 +271,8 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   // can finish out of order without a shared depth counter misclassifying an
   // unrelated result.
   const fabricExecutions = new FabricExecutionScopes();
+  // fabric_exec calls whose program reads handles; see formatHandleText.
+  const handleReadingCalls = new Set<string>();
   const telemetry = new ContextTelemetry();
   const failedChildUsage = new Map<string, { usage?: Usage; complete: boolean }>();
   // execute must throw on failure. Restore measured usage through Pi's
@@ -343,7 +352,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
       startedAt: Date.now(),
     });
 
-    // WARN is annotated in the tool_result hook.
+    if (/\bctx_read\b/.test(program)) handleReadingCalls.add(event.toolCallId);
     return undefined;
   });
 
@@ -352,6 +361,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   pi.on("tool_execution_end", async (event) => {
     if (event.toolName !== "fabric_exec") return;
     fabricExecutions.finish(event.toolCallId);
+    handleReadingCalls.delete(event.toolCallId);
   });
 
   // ================================================================
@@ -376,6 +386,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   pi.on("tool_result", async (event, ctx) => {
     const nested = fabricExecutions.isNestedToolResult(event.toolCallId);
     if (event.toolName === "fabric_exec" && !nested) fabricExecutions.finish(event.toolCallId);
+    const readsHandles = event.toolName === "fabric_exec" && !nested && handleReadingCalls.delete(event.toolCallId);
     // Provider proxies are still program data, not model context. Replacing
     // details.result with a handle breaks callers that inspect that value.
     if (nested) return undefined;
@@ -454,7 +465,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
       const summary = JSON.stringify(summarizeText(payload, Math.floor(previewBytes / 4)));
       replacement = `Structural summary:\n${structuralPreview(summary, previewBytes)}\n${recovery}`;
     } else {
-      replacement = formatHandleText(offloaded.id, offloaded.bytes, offloaded.estimatedTokens, payload, previewBytes, surface);
+      replacement = formatHandleText(offloaded.id, offloaded.bytes, offloaded.estimatedTokens, payload, previewBytes, surface, offloaded.contentType, readsHandles);
     }
     // Preserve media positions and a bounded allowance of short independent
     // text notes. The handle retains ALL original text blocks with indices.
@@ -942,6 +953,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     failedChildUsage.clear();
     fabricExecutions.clear();
+    handleReadingCalls.clear();
     telemetry.setSessionId(ctx.sessionManager?.getSessionId?.());
     const cfg = configFor(ctx.cwd);
     if (cfg.enabled === false) return;

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Offload notices and ctx_read
+
+- The offload notice leads with copyable `ctx_read` calls, offers only the modes the payload supports (`section` with a real section name, `jsonPath` only for JSON), and tells the model to read the handle rather than re-run the call (based on #3 by @e4779).
+- A `fabric_exec` program that reads handles and still overflows gets a narrowing hint, detected from the program source (idea from #4 by @e4779).
+- `ctx_read` gained `section` mode for Fabric sectioned results; `offset`/`length` page within the section.
+- Rewrote the skill as an operational playbook (#1 by @e4779), correcting handle lifetime (workspace store, not session-scoped) and the jsonPath dialect (no wildcards or slices).
+
 ### Fabric child integration
 
 - Extension-enabled Fabric Pi children that load CE grant themselves `ctx_read` before Fabric's lazy provider initialization, at every depth. Like Fabric's `agents.childQuestionTools`, the grant is skipped for an explicit empty `tools` list and for `+name`/`-name` lists; a malformed allowlist fails closed.

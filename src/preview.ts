@@ -117,7 +117,7 @@ function jsonStructuralPreview(value: unknown): string {
   return lines.join("\n");
 }
 
-interface FabricSection { name: string; chars: number; text: string }
+export interface FabricSection { name: string; chars: number; text: string }
 
 /** Recognize Fabric's sectioned text format, not arbitrary YAML or execution metadata. */
 function fabricSections(data: string): { outline: string; sections: FabricSection[] } | undefined {
@@ -133,6 +133,16 @@ function fabricSections(data: string): { outline: string; sections: FabricSectio
     text: data.slice(header.index! + header[0].length, referenced[i + 1]?.index ?? data.length).trim(),
   }));
   return { outline, sections };
+}
+
+/** Section names of a Fabric sectioned result; undefined for any other payload. */
+export function fabricSectionNames(data: string): string[] | undefined {
+  return fabricSections(data)?.sections.map((section) => section.name);
+}
+
+/** One named section of a Fabric sectioned result. */
+export function fabricSection(data: string, name: string): FabricSection | undefined {
+  return fabricSections(data)?.sections.find((section) => section.name === name);
 }
 
 function fabricSectionPreview(data: string, limit: number): string | undefined {
@@ -152,7 +162,7 @@ function fabricSectionPreview(data: string, limit: number): string | undefined {
   for (const section of small.slice(0, 6)) {
     lines.push(`Section ${JSON.stringify(section.name)} (${section.chars} chars):\n${section.text}`);
   }
-  lines.push("Sections available through ctx_read query:");
+  lines.push("Sections (read one with ctx_read section):");
   for (const section of parsed.sections.slice(0, 24)) lines.push(`- ${JSON.stringify(section.name)}: ${section.chars} chars`);
   return fitUtf8(lines.join("\n"), limit);
 }
