@@ -1,6 +1,6 @@
 {
   "name": "pi-context-engineer",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "type": "module",
   "description": "Keeps large Pi and Fabric tool results out of model context: offloads them to a local store behind a readable handle, compacts oversized errors and edit diffs, and records what it saved.",
   "keywords": [
