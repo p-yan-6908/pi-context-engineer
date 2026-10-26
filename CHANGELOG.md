@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.8.0
+
+Changes below are based on 1,456 offloads across 56 of 295 recorded Pi sessions, all from before 0.7.0.
+
+### Previews work as an index
+
+- Headed output gets an outline: file separators such as `===== path =====`, markdown headings, `--- name ---` markers, `diff --git` headers, and grep output grouped by file. Each part is listed with its byte offset and size, followed by its first lines, filled in turn while the budget lasts. Earlier previews showed the first and last files and left the ones in between unnamed.
+- Fabric sectioned results show each section's first lines instead of the outline's `"<multi-line string, see section: …>"` pointer rows plus only the smallest section in full.
+- Head and tail previews state the byte ranges they show (`bytes 0-1214 and 30362-31105 of 31105`) and cut at line ends.
+- The suggested range read starts at the first byte the preview leaves out. Earlier notices suggested `offset: 0`, and about 60% of range reads started there, re-reading the head the preview had already shown. Sectioned notices suggest a section read instead of a payload range.
+
+### ctx_read
+
+- Inside a Fabric program a read is program data, so it is no longer held under the boundary offload threshold: one read returns up to 512 KB. Programs had looped over 15 KB windows to rebuild payloads before filtering them.
+- In a program, `.text` is the selected text, without the paging note, and `.details.result` holds the metadata without a second copy of it. Fabric's envelope previously carried the slice three times: twice as escaped JSON and once raw. Of 207 programs that returned a read directly, 36 were offloaded again.
+- At the model boundary a read shows the selected text under a one-line header such as `[ctx_read "id": bytes 4096-8192 of 20090]`, instead of a pretty-printed JSON envelope with escaped newlines. `details.result` is unchanged.
+- `query` accepts an array of terms and matches lines containing any of them, with per-term counts in `termMatches`. Ten of the 26 real query misses were keyword lists such as `"returnFlow metrics returnOperation"` matched as one literal string.
+- A query that matches nothing still says so first. It then reports any lines that match ignoring case, regex syntax in a literal query, and how many lines each word of a phrase matches, naming the call that would find them.
+- Queries run in one place in the store. Literal queries, including `ignoreCase` ones, scan the whole payload; regex queries still scan the first 512 KB and say so.
+
+### Telemetry
+
+- `ctx_read` events record their mode, the start of a range read and the match count of a query, never the query text. `/ce status` and `offloadFollowUp.reads` report reads by mode, range reads from offset 0, queries without matches, and reads inside programs.
+
 ## 0.7.0
 
 ### Removed

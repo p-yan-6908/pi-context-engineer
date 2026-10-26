@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { isVerboseEditAcknowledgement, structuralPreview } from "./preview.js";
+import { buildPreview, isVerboseEditAcknowledgement, structuralPreview } from "./preview.js";
 
 export const editAcknowledgement = {
   ok: true,
@@ -80,4 +80,36 @@ for (const text of [editJson, editYaml]) {
   check("edit preview retains success and file path", preview.includes("Successfully replaced 3 block(s)") && preview.includes("/project/src/example.ts"));
   check("edit preview retains first changed line", preview.includes("firstChangedLine") && preview.includes("7"));
 }
+
+// Headed output becomes an outline that names every part and its ctx_read offset.
+const dump = Array.from({ length: 6 }, (_, i) => `===== src/file${i}.ts =====\n` + `export const value${i} = ${i};\n`.repeat(120)).join("\n");
+const dumpPreview = buildPreview(dump, 2048);
+check("outline names every part of headed output", Array.from({ length: 6 }, (_, i) => `===== src/file${i}.ts =====  [offset `).every((label) => dumpPreview.text.includes(label)));
+check("outline offsets point at their headers", [...dumpPreview.text.matchAll(/^(===== .*? =====)  \[offset (\d+), \d+ bytes\]$/gm)]
+  .every(([, label, offset]) => Buffer.from(dump).subarray(Number(offset)).toString("utf8").startsWith(label)));
+check("outline shows first lines of every part", dumpPreview.text.includes("export const value5 = 5;"));
+check("outline readFrom resumes after the shown lines of the first part", (dumpPreview.readFrom ?? 0) > 30 && Buffer.from(dump)[dumpPreview.readFrom! - 1] === 0x0a);
+const grepOutput = Array.from({ length: 150 }, (_, i) => `src/module${Math.floor(i / 30)}.ts:${i + 1}:  const hit${i} = find("needle");`).join("\n");
+const grepPreview = buildPreview(grepOutput, 2048).text;
+check("grep output is outlined by file", Array.from({ length: 5 }, (_, i) => `src/module${i}.ts  [offset `).every((label) => grepPreview.includes(label)));
+const markdown = ["# Guide", "", "intro", ...["Install", "Usage", "Errors", "Release"].flatMap((name) => ["", `## ${name}`, "", `${name} details. `.repeat(60)])].join("\n");
+check("markdown headings become the outline", ["## Install", "## Usage", "## Errors", "## Release"].every((heading) => buildPreview(markdown, 2048).text.includes(`${heading}  [offset `)));
+const python = "import os\n" + "# step\nvalue = compute()\n".repeat(400);
+check("single-# comments in code are not headings", buildPreview(python, 2048).text.startsWith("Code preview, bytes 0-"));
+const lopsided = "=== a ===\nx\n=== b ===\n" + "body line\n".repeat(3000);
+check("one dominant part falls back to head and tail", buildPreview(lopsided, 2048).text.startsWith("Text preview, bytes 0-"));
+
+// Plain text shows both ends with the byte ranges a range read needs.
+const logText = Array.from({ length: 3000 }, (_, i) => `INFO worker ${i} ok`).join("\n") + "\nFAILED: 3 tests";
+const logPreview = buildPreview(logText, 2048);
+const headEnd = logPreview.readFrom ?? -1;
+check("head/tail preview states its byte ranges", logPreview.text.startsWith(`Text preview, bytes 0-${headEnd} and `) && logPreview.text.includes(`... [bytes ${headEnd}-`));
+check("head/tail preview cuts at line ends", logText[headEnd - 1] === "\n" && logPreview.text.includes(logText.slice(0, headEnd)));
+check("head/tail preview keeps the end of the payload", logPreview.text.endsWith("FAILED: 3 tests"));
+
+// Sectioned results show section heads, not pointer lines.
+check("sectioned preview drops pointer lines", !yamlPreview.includes("see section:") && !structuralPreview(editYaml).includes("see section:"));
+check("sectioned preview shows the first lines of each section", structuralPreview(editYaml).includes('Section "details.diff"') && structuralPreview(editYaml).includes("-old\n+new") && structuralPreview(editYaml).includes("@@ context @@"));
+check("sectioned and JSON previews offer no prefix offset", buildPreview(editYaml).readFrom === undefined && buildPreview(mixedJson).readFrom === undefined);
+
 console.log(`Preview UX: ${checks} checks passed`);

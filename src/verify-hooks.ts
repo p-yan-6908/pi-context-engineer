@@ -335,11 +335,15 @@ checkHook("ctx_read tool is registered", Boolean(ctxReadDef));
 
 if (ctxReadDef) {
   const out1 = await ctxReadDef.execute("t1", { id: capEntry.id }, undefined, undefined, { cwd: capCwd });
-  const p1 = JSON.parse(out1.content[0].text);
+  const p1 = out1.details.result;
   checkCtl(
     "default ranged read stays under the 16KB threshold",
     Buffer.byteLength(out1.content[0].text, "utf8") < 16_384 && p1.bytesRead < 16_384 && p1.offset === 0 && p1.nextOffset === p1.bytesRead && p1.truncated === true && p1.totalBytes === Buffer.byteLength(payload),
     `bytesRead=${p1.bytesRead}, totalBytes=${p1.totalBytes}`
+  );
+  checkCtl(
+    "a boundary read shows raw text under a header that locates it",
+    out1.content[0].text.startsWith(`[ctx_read "${capEntry.id}": bytes 0-${p1.bytesRead} of ${p1.totalBytes}]\nneedle line\nneedle line\n`),
   );
   const ctxReadMessage = {
     role: "toolResult",
@@ -358,14 +362,14 @@ if (ctxReadDef) {
     undefined,
     { cwd: capCwd },
   );
-  const pNext = JSON.parse(outNext.content[0].text);
+  const pNext = outNext.details.result;
   checkCtl(
     "nextOffset can be copied directly into the following page",
     pNext.offset === p1.nextOffset && pNext.nextOffset === p1.nextOffset + 256,
   );
 
   const out2 = await ctxReadDef.execute("t2", { id: capEntry.id, query: "needle" }, undefined, undefined, { cwd: capCwd });
-  const p2 = JSON.parse(out2.content[0].text);
+  const p2 = out2.details.result;
   checkCtl(
     "query-mode serialized envelope stays under the 16KB threshold",
     Buffer.byteLength(out2.content[0].text, "utf8") < 16_384 &&
@@ -382,15 +386,38 @@ if (ctxReadDef) {
     undefined,
     { cwd: capCwd },
   );
-  const pLimitedMatches = JSON.parse(outLimitedMatches.content[0].text);
+  const pLimitedMatches = outLimitedMatches.details.result;
   checkCtl(
     "maxMatches bounds formatted windows while preserving the exact total",
     pLimitedMatches.matchedLines?.length === 5 && pLimitedMatches.totalMatches === 4000,
   );
   const jsonForRead = capStore.write("json-cap-test", "read", JSON.stringify({ results: [{ id: 7 }, { id: 8 }] }));
   const jsonRead = await ctxReadDef.execute("json-read", { id: jsonForRead.id, jsonPath: "$.results[0].id" }, undefined, undefined, { cwd: capCwd });
-  const jsonReadRecord = JSON.parse(jsonRead.content[0].text);
+  const jsonReadRecord = jsonRead.details.result;
   checkCtl("ctx_read exposes JSON-path selection", jsonReadRecord.content === "7" && jsonReadRecord.jsonPath === "$.results[0].id" && jsonReadRecord.selectedType === "number");
+
+  // Inside a Fabric program a read is program data: the boundary cap does not apply.
+  const nestedWhole = await ctxReadDef.execute("fabric_nested_whole", { id: capEntry.id }, undefined, undefined, { cwd: capCwd });
+  checkCtl(
+    "a nested read without length returns the whole payload as text",
+    nestedWhole.content[0].text === payload && nestedWhole.details.result.truncated === false && nestedWhole.details.result.totalBytes === Buffer.byteLength(payload),
+  );
+  checkCtl("nested read details carry metadata without a second copy of the text", nestedWhole.details.result.content === undefined && nestedWhole.details.result.ok === true);
+  const nestedRange = await ctxReadDef.execute("fabric_nested_range", { id: capEntry.id, offset: 12, length: 100 }, undefined, undefined, { cwd: capCwd });
+  checkCtl(
+    "a nested ranged read returns exactly the selected bytes, without the paging note",
+    nestedRange.content[0].text === payload.slice(12, 112) && nestedRange.details.result.nextOffset === 112,
+  );
+  const hugePayload = "0123456789abcdef\n".repeat(40_000); // 680 KB
+  const hugeEntry = capStore.write("nested-huge", "read", hugePayload);
+  const nestedHuge = await ctxReadDef.execute("fabric_nested_huge", { id: hugeEntry.id }, undefined, undefined, { cwd: capCwd });
+  const hugeMeta = nestedHuge.details.result;
+  checkCtl(
+    "a nested read stops at the 512 KB program budget and pages from nextOffset",
+    hugeMeta.truncated === true && hugeMeta.bytesRead <= 512 * 1024 && hugeMeta.bytesRead > 400 * 1024 &&
+      hugeMeta.nextOffset === hugeMeta.bytesRead && nestedHuge.content[0].text === hugePayload.slice(0, hugeMeta.bytesRead),
+    `bytesRead=${hugeMeta.bytesRead}`,
+  );
 }
 
 // Project config lowers the threshold; the self-cap must follow it.
@@ -400,7 +427,7 @@ writeFileSync(join(tightCwd, ".pi", "context-engineer.json"), JSON.stringify({ r
 const tightEntry = new ContextStore(tightCwd).write("tight-test", "read", "y".repeat(20000));
 if (ctxReadDef) {
   const out3 = await ctxReadDef.execute("t3", { id: tightEntry.id }, undefined, undefined, { cwd: tightCwd });
-  const p3 = JSON.parse(out3.content[0].text);
+  const p3 = out3.details.result;
   checkCtl("configured readOffloadThreshold respected", p3.bytesRead <= 4096, `bytesRead=${p3.bytesRead}`);
 }
 

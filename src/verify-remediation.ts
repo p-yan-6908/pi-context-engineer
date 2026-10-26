@@ -146,6 +146,31 @@ async function testStoreAndToolReads(): Promise<void> {
   check(isErrorResult(invalidRegex), "invalid regex query is an explicit handler error");
   equal(invalidRegex.code, "invalid_regex", "invalid regex query has a stable error code");
 
+  const ctx = makeToolContext(root, store);
+  const anyOf = await readTool.handler({ id: handle.id, query: ["boot", "recovered"], contextLines: 0 }, ctx) as Record<string, any>;
+  equal(anyOf.matchedLines, [1, 3], "an array query matches lines with any of its terms");
+  equal(anyOf.termMatches, { boot: 1, recovered: 1 }, "an array query counts lines per term");
+  const caseMiss = await readTool.handler({ id: handle.id, query: "info boot" }, ctx) as Record<string, any>;
+  check(caseMiss.totalMatches === 0 && caseMiss.content.startsWith('No matches for "info boot"') && caseMiss.content.includes("1 line(s) match ignoring case"),
+    "a miss that differs only in case says so");
+  const phrase = await readTool.handler({ id: handle.id, query: "boot recovered absent" }, ctx) as Record<string, any>;
+  check(phrase.totalMatches === 0 && phrase.content.includes('query: ["boot","recovered"] matches lines with any of them'), "a phrase miss names the any-of query for words that occur");
+  equal(phrase.termMatches, { boot: 1, recovered: 1, absent: 0 }, "a phrase miss counts lines per word");
+  const regexSyntax = await readTool.handler({ id: handle.id, query: "first|second" }, ctx) as Record<string, any>;
+  check(regexSyntax.totalMatches === 0 && regexSyntax.content.includes("add regex: true"), "a literal miss with regex syntax suggests regex");
+  const negative = await readTool.handler({ id: handle.id, query: "[FAIL]" }, ctx) as Record<string, any>;
+  equal(negative.content, `No matches for "[FAIL]" in error-log (${Buffer.byteLength(logs, "utf8")} bytes).`, "a plain miss stays a plain negative");
+  const invalidTerm = await readTool.handler({ id: handle.id, query: ["boot", "("], regex: true }, ctx) as Record<string, any>;
+  equal(invalidTerm.code, "invalid_regex", "an invalid regex term in an array is rejected");
+  const late = store.write("late-match", "test", "filler line\n".repeat(50_000) + "Late Needle\n", { contentType: "text" });
+  const lateRegex = await readTool.handler({ id: late.id, query: "Late Needle", regex: true }, ctx) as Record<string, any>;
+  check(lateRegex.totalMatches === 0 && lateRegex.truncated === true && lateRegex.content.includes("first 524288 of"), "a regex query reports that it scanned a prefix");
+  const lateFolded = await readTool.handler({ id: late.id, query: "late needle", ignoreCase: true, contextLines: 0 }, ctx) as Record<string, any>;
+  equal(lateFolded.totalMatches, 1, "a case-insensitive literal query scans the whole payload");
+  const emptyTerms = await readTool.handler({ id: handle.id, query: [], length: 9 }, ctx) as Record<string, any>;
+  equal(emptyTerms.content.split("\n")[0], "INFO boot", "an empty term list reads a range instead");
+
+
   const json = store.write(
     "valid-json",
     "test",
@@ -284,6 +309,11 @@ async function testBoundaryAndRegisteredTools(): Promise<void> {
   async function successful(name: string, id: string, params: Record<string, unknown>): Promise<any> {
     const result = await execute(name, id, params);
     check(Array.isArray(result.content) && result.content[0]?.type === "text", `${name} returns text content`);
+    if (name === "ctx_read") {
+      const text: string = result.content[0].text;
+      check(text.startsWith('[ctx_read "') && text.endsWith(`]\n${result.details.result.content}`), "ctx_read shows its exact selection under a locating header");
+      return result;
+    }
     const parsed = JSON.parse(result.content[0].text);
     equal(result.details?.result, parsed, `${name} details.result exactly matches parsed content`);
     return result;
@@ -514,6 +544,13 @@ async function testSectionReadsAndOffloadNotice(): Promise<void> {
   const sectionNotice = await notice("notice-sectioned", "return await extensions.ctx_read({ id: 'h' })", sectioned);
   check(sectionNotice.includes('extensions.ctx_read({ id: "') && sectionNotice.includes('section: "details.diff"'), "a sectioned notice offers a real section name");
   check(!sectionNotice.includes("jsonPath"), "a sectioned text notice does not offer jsonPath");
+  check(!sectionNotice.includes("length: 4096"), "a sectioned notice pages by section, not by payload range");
+  check(sectionNotice.includes('(await extensions.ctx_read({ id: "') && sectionNotice.includes(").text"), "a Fabric notice offers a whole read to filter in the program");
+  const log = Array.from({ length: 2000 }, (_, i) => `log line ${i}`).join("\n");
+  const textNotice = await notice("notice-text", "return log", log);
+  const suggested = Number(/offset: (\d+), length: 4096/.exec(textNotice)?.[1]);
+  check(suggested > 0 && textNotice.includes(`bytes 0-${suggested} and `), "a text notice's range read starts at the first byte its preview leaves out");
+  check(log[suggested - 1] === "\n", "the suggested range starts at a line");
   check(sectionNotice.includes("read stored handles"), "an overflowing handle-reading program gets the narrowing hint");
   const json = JSON.stringify({ items: Array.from({ length: 2000 }, (_, i) => ({ i, name: `item-${i}` })) });
   const jsonNotice = await notice("notice-json", "return data", json);
@@ -542,14 +579,21 @@ async function testOffloadFollowUpTelemetry(): Promise<void> {
   const handle = offloaded?.details?.ce_handle as string;
   check(typeof handle === "string", "a large fabric_exec result is offloaded");
   const fresh = () => new ContextTelemetry().summary(root, true).offloadFollowUp;
-  equal(fresh(), { handles: 1, handlesRead: 0, repeatedCalls: 0 }, "an unread offload is counted");
+  const noReads = { inProgram: 0, range: 0, rangeFromStart: 0, query: 0, queryMisses: 0, section: 0, jsonPath: 0 };
+  equal(fresh(), { handles: 1, handlesRead: 0, repeatedCalls: 0, reads: noReads }, "an unread offload is counted");
 
   await run("tool_call", { toolName: "fabric_exec", toolCallId: "follow-2", input });
   await run("tool_call", { toolName: "fabric_exec", toolCallId: "follow-3", input: { code: "return 1" } });
   equal(fresh().repeatedCalls, 1, "only repeating the offloaded call is counted");
+  equal(tools.get("ctx_read").parameters.properties.query.anyOf?.map((member: any) => member.type), ["string", "array"], "ctx_read query accepts a string or an array of terms");
 
   await tools.get("ctx_read").execute("read-1", { id: handle, offset: 0, length: 64 }, undefined, undefined, { cwd: root });
-  equal(fresh(), { handles: 1, handlesRead: 1, repeatedCalls: 1 }, "ctx_read attributes its read to the handle");
+  equal(fresh(), { handles: 1, handlesRead: 1, repeatedCalls: 1, reads: { ...noReads, range: 1, rangeFromStart: 1 } }, "ctx_read attributes its read to the handle");
+
+  await tools.get("ctx_read").execute(`${FABRIC_NESTED_TOOL_CALL_ID_PREFIX}read-2`, { id: handle, query: ["absent-term", "missing-term"] }, undefined, undefined, { cwd: root });
+  await tools.get("ctx_read").execute("read-3", { id: handle, offset: 9, length: 64 }, undefined, undefined, { cwd: root });
+  equal(fresh().reads, { ...noReads, inProgram: 1, range: 2, rangeFromStart: 1, query: 1, queryMisses: 1 }, "read telemetry counts modes, misses, program reads and offset-0 ranges");
+  check(!JSON.stringify(readTelemetry(root)).includes("absent-term"), "read telemetry never records query terms");
 }
 
 try {

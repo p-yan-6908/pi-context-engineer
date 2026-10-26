@@ -25,6 +25,11 @@ about doing that well.
 - **Auto-offload is the main path.** When a `fabric_exec` / `pi.*` / `mcp.*`
   return is huge, expect preview + handle. That is the tool working, not an
   error. The notice lists the `ctx_read` calls that fit that payload.
+- **The preview is an index.** It names every part of headed output (files,
+  headings, `--- name ---` markers, grep results by file) with its byte
+  offset, every Fabric section with its first lines, or the byte ranges of
+  the head and tail it shows. Start a range read at an offset it gives; the
+  notice's suggested range starts where the preview stops, not at 0.
 - **Read the handle; do not re-run the call.** The full result is stored,
   including the middle of a `fabric_exec` output that Fabric itself
   truncated. Re-running pays for the same output again and may repeat side
@@ -40,14 +45,19 @@ about doing that well.
 
 1. **Is the preview enough?** Often it is. Don't read handles you don't need.
 2. **Need a field name or any text occurrence?** → `query` (literal line
-   search; `regex: true` for a pattern, `ignoreCase: true` to fold case).
-3. **Need a bounded window?** → `offset` + `length`; continue at `nextOffset`.
+   search; an array of terms matches lines with any of them; `regex: true`
+   for a pattern, `ignoreCase: true` to fold case).
+3. **Need a bounded window?** → `offset` + `length` from an offset in the
+   preview; continue at `nextOffset`.
 4. **Need a named part of a Fabric sectioned result?** → `section`, using a
    name from the preview's section list; `offset`/`length` page inside it.
 5. **Need precise JSON values?** → `jsonPath`, only when the payload is JSON
    (Rule #1).
 6. **Need a digest rather than a slice?** → `ctx_summarize`
    (`structural` / `code`).
+7. **Need to filter, count or join across the whole payload?** → inside
+   `fabric_exec`, `(await extensions.ctx_read({ id })).text` returns up to
+   512 KB. Filter with code and return only the result.
 
 ## Rule #1: payload type decides the access mode
 
@@ -65,14 +75,25 @@ preview first.
 ## ctx_read — the workhorse
 
 Inside `fabric_exec`, call `extensions.ctx_read(...)`; at the model boundary,
-call `ctx_read` directly.
+call `ctx_read` directly. At the boundary a result shows the selected text
+under a header such as `[ctx_read "id": bytes 4096-8192 of 20090]` and stays
+under the offload threshold. In a program the cap is 512 KB: `.text` is the
+selected text and `.details.result` holds `totalBytes`, `nextOffset`,
+`totalMatches` and the rest.
 
 ```ts
 // search: a field name or any occurrence inside the handle
 await extensions.ctx_read({ id, query: "perTool" });
 
-// byte range: bounded windows; continue at nextOffset
-await extensions.ctx_read({ id, offset: 0, length: 4000 });
+// any of several terms, with per-term counts in termMatches
+await extensions.ctx_read({ id, query: ["perTool", "returnFlow"] });
+
+// byte range: start at an offset from the preview; continue at nextOffset
+await extensions.ctx_read({ id, offset: 4351, length: 4000 });
+
+// whole payload, filtered in the program
+const lines = (await extensions.ctx_read({ id })).text.split("\n");
+return lines.filter((line) => line.includes("FAIL")).length;
 
 // one section of a Fabric sectioned result, paged inside the section
 await extensions.ctx_read({ id, section: "details.diff", offset: 0, length: 4000 });
@@ -92,17 +113,19 @@ you never store: project large structured input to a compact representation
 (counts, filtered rows, the fields you need) inside the guest and return it.
 Offload is the fallback, not step one.
 
-**R1 — auto-offloaded result → slice reads.** The preview is already in
-context; pull the rest on demand:
+**R1 — auto-offloaded result → targeted reads.** The preview is already in
+context; read what it leaves out, or filter the whole payload in a program:
 
 ```ts
-const slice = await extensions.ctx_read({ id, offset: 0, length: 4000 });
-const field = await extensions.ctx_read({ id, query: "perTool" });
+const part = (await extensions.ctx_read({ id, offset: 4351, length: 4000 })).text;
+const hits = (await extensions.ctx_read({ id, query: ["perTool", "returnFlow"] })).text;
+const all = (await extensions.ctx_read({ id })).text;
+return all.split("\n").filter((line) => line.startsWith("ERROR")).slice(0, 20);
 ```
 
-If a program that reads handles comes back as a handle itself, the selection
-was too big: shrink `length`, tighten `query`, read one `section`, or
-aggregate in-guest and return a digest.
+Return `.text` or a digest, never the whole read object: its envelope repeats
+the text. If a program that reads handles comes back as a handle itself, it
+returned too much: filter or aggregate in the program first.
 
 **R2 — heavy external JSON → `ctx_offload` + `jsonPath`:**
 
@@ -129,7 +152,9 @@ return s.text; // project to .text — don't re-serialize the envelope
 | `has no section "…"; available: …` | wrong section name | use a name from the error or the preview |
 | `is not a Fabric sectioned result` | `section` on a plain or JSON handle | `query` / `offset`+`length` / `jsonPath` |
 | `no stored result with id` / `has expired` | expired, evicted, or another working directory | re-run the source call |
-| result isn't a string (`.slice is not a function`) | the helper returned an envelope | take `.content` / `.text`, or use `offset`/`length` |
+| `No matches for "a b c"` with per-word counts | a phrase is one literal string | pass the suggested array, e.g. `query: ["a", "c"]` |
+| `No matches` with `match ignoring case` | case differs | add `ignoreCase: true` |
+| result isn't a string (`.slice is not a function`) | `extensions.ctx_read` returned its envelope | take `.text`; metadata is in `.details.result` |
 
 ## Fabric child agents
 

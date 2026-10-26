@@ -12,12 +12,12 @@ import { createHash } from "node:crypto";
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { Type, type TSchema } from "typebox";
 import { ContextStore, DEFAULT_CONTEXT_STORE_TTL_MS, MAX_CONTEXT_STORE_BYTES } from "./store.js";
-import { compactErrorOutput, fabricSectionNames, isVerboseEditAcknowledgement, structuralPreview, type PreviewContentType } from "./preview.js";
-import { ceTools, isErrorResult, type ToolContext } from "./tools.js";
+import { buildPreview, compactErrorOutput, fabricSectionNames, isVerboseEditAcknowledgement, type PreviewContentType } from "./preview.js";
+import { ceTools, isErrorResult, NESTED_READ_BUDGET_BYTES, type ToolContext } from "./tools.js";
 import { enableFabricContextReadForChild, FABRIC_CONTEXT_READ_TOOL, readFabricFullOutput } from "./compat/fabric.js";
-import { ContextTelemetry, REPEATED_OFFLOADED_CALL_NOTE } from "./telemetry.js";
+import { ContextTelemetry, REPEATED_OFFLOADED_CALL_NOTE, type ContextSummary, type ReadTelemetry } from "./telemetry.js";
 import { FabricExecutionScopes } from "./execution-scope.js";
 // ---- Config ----
 
@@ -136,6 +136,61 @@ function readRecipe(id: string, surface: ReadSurface): string {
   return `${tool}({ id: "${id}", offset: 0, length: 2048 })`;
 }
 
+/** TypeBox schema for one JSON-schema property of a CE tool definition. */
+function propertySchema(schema: Record<string, unknown>): TSchema {
+  const options = typeof schema.description === "string" ? { description: schema.description } : {};
+  if (Array.isArray(schema.anyOf)) return Type.Union(schema.anyOf.map((member) => propertySchema(member as Record<string, unknown>)), options);
+  switch (schema.type) {
+    case "string": return Type.String(options);
+    case "integer": return Type.Integer(options);
+    case "boolean": return Type.Boolean(options);
+    case "array": return Type.Array(propertySchema((schema.items ?? {}) as Record<string, unknown>), options);
+    default: return Type.Any(options);
+  }
+}
+
+/** Where a model-boundary ctx_read selection sits in its handle. */
+function readHeader(read: Record<string, unknown>): string {
+  const range = (total: unknown): string => `bytes ${read.offset}-${Number(read.offset) + Number(read.bytesRead)} of ${total}`;
+  const where = typeof read.jsonPath === "string" ? `${read.jsonPath} (${read.selectedType})`
+    : typeof read.section === "string" ? `section ${JSON.stringify(read.section)}, ${range(read.sectionBytes)}`
+    : typeof read.offset === "number" ? range(read.totalBytes)
+    : `searched ${read.totalBytes} bytes`;
+  return `[ctx_read "${read.id}": ${where}]`;
+}
+
+/** The selection alone, without the paging note a ranged read appends for the model. */
+function selectedText(read: Record<string, unknown>): string {
+  const content = String(read.content ?? "");
+  return typeof read.offset === "number" && typeof read.bytesRead === "number"
+    ? Buffer.from(content, "utf8").subarray(0, read.bytesRead).toString("utf8")
+    : content;
+}
+
+function withoutContent(read: Record<string, unknown>): Record<string, unknown> {
+  const { content: _content, ...metadata } = read;
+  return metadata;
+}
+
+/** The access mode, start and match count of a ctx_read, never its query. */
+function readRecord(read: Record<string, unknown>): ReadTelemetry {
+  const mode = typeof read.jsonPath === "string" ? "jsonPath"
+    : typeof read.section === "string" ? "section"
+    : typeof read.totalMatches === "number" ? "query"
+    : "range";
+  return {
+    mode,
+    ...(mode === "range" && typeof read.offset === "number" ? { offset: read.offset } : {}),
+    ...(mode === "query" ? { matches: read.totalMatches as number } : {}),
+  };
+}
+
+function formatReads(reads: ContextSummary["offloadFollowUp"]["reads"]): string {
+  const total = reads.range + reads.query + reads.section + reads.jsonPath;
+  return `ctx_read calls: ${total} (${reads.inProgram} in programs) — range ${reads.range} (${reads.rangeFromStart} from offset 0), ` +
+    `query ${reads.query} (${reads.queryMisses} without matches), section ${reads.section}, jsonPath ${reads.jsonPath}`;
+}
+
 function formatHandleText(
   id: string,
   bytes: number,
@@ -146,25 +201,29 @@ function formatHandleText(
   contentType: PreviewContentType = "unknown",
   readsHandles = false,
 ): string {
-  const preview = structuralPreview(text, previewBytes);
+  const preview = buildPreview(text, previewBytes);
   const complete = Buffer.byteLength(text, "utf8") <= previewBytes;
   const tool = surface === "fabric" ? "extensions.ctx_read" : "ctx_read";
+  const call = (args: string): string => `  ${tool}({ id: "${id}", ${args} })`;
   // Offer only the access modes this payload supports: jsonPath on text is
-  // the most common failed read.
+  // the most common failed read. A range starts where the preview's first
+  // part stops, since 60% of range reads used to re-read the shown head.
   const sections = fabricSectionNames(text);
   const jsonExample = text.startsWith('{"textBlocks":') ? "$.textBlocks[0].text" : "$.field";
   const actions = [
-    `  ${tool}({ id: "${id}", query: "term" })  // matching lines`,
-    `  ${tool}({ id: "${id}", offset: 0, length: 4096 })  // byte window; continue at nextOffset`,
-    ...(sections?.length ? [`  ${tool}({ id: "${id}", section: ${JSON.stringify(sections[0])} })  // one section listed in the preview`] : []),
-    ...(contentType === "json" ? [`  ${tool}({ id: "${id}", jsonPath: "${jsonExample}" })  // JSON value; no wildcards or slices`] : []),
+    `${call('query: "term"')}  // matching lines; an array of terms matches any of them`,
+    sections?.length
+      ? `${call(`section: ${JSON.stringify(sections[0])}`)}  // one section listed in the preview; offset/length page inside it`
+      : `${call(`offset: ${preview.readFrom ?? 0}, length: 4096`)}  // ${preview.readFrom !== undefined ? "from the first byte the preview leaves out" : "byte window"}; continue at nextOffset`,
+    ...(contentType === "json" ? [`${call(`jsonPath: "${jsonExample}"`)}  // JSON value; no wildcards or slices`] : []),
+    ...(surface === "fabric" ? [`  (await extensions.ctx_read({ id: "${id}" })).text  // in a program: the whole payload up to 512 KB, to filter in code`] : []),
   ];
   return `[offloaded to handle "${id}" — ${bytes} bytes (~${estimatedTokens} tokens). The full result is stored; read the handle instead of re-running the call:]\n` +
     (readsHandles
-      ? "This program read stored handles and its return still exceeded the boundary. Narrow the selection (smaller length, tighter query, one section) or return a digest.\n"
+      ? "This program read stored handles and its return still exceeded the boundary. Filter inside the program and return only the lines or values you need, not whole read results.\n"
       : "") +
     `${actions.join("\n")}\n` +
-    `Preview (structural selection${complete ? ", complete" : ", not a prefix"}; up to ${previewBytes} bytes):\n${preview}`;
+    `Preview (up to ${previewBytes} bytes${complete ? ", complete" : ""}):\n${preview.text}`;
 }
 
 // ---- Extension setup ----
@@ -425,14 +484,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
       parameters: Type.Object(
         Object.fromEntries(
           Object.entries(def.inputSchema.properties ?? {}).map(([k, v]) => {
-            const schema = v as { type?: string; description?: string };
-            const property = schema.type === "string"
-              ? Type.String({ description: schema.description })
-              : schema.type === "integer"
-                ? Type.Integer({ description: schema.description })
-                : schema.type === "boolean"
-                  ? Type.Boolean({ description: schema.description })
-                  : Type.Any({ description: schema.description });
+            const property = propertySchema(v as Record<string, unknown>);
             const required = (def.inputSchema.required as string[] | undefined)?.includes(k) ?? false;
             return [k, required ? property : Type.Optional(property)];
           })
@@ -444,14 +496,20 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         const toolCtx: ToolContext = {
           store: storeFor(execCtx.cwd, toolConfig),
           workspaceRoot: execCtx.cwd,
-          maxReturnBytes: effectiveOffloadThreshold(toolConfig),
+          // A nested result is program data; only the boundary cap prevents handle chains.
+          maxReturnBytes: nested ? NESTED_READ_BUDGET_BYTES : effectiveOffloadThreshold(toolConfig),
         };
 
         try {
           const result = await def.handler(params, toolCtx);
-          const serialized = typeof result === "string" ? result : JSON.stringify(result, null, 2);
-          if (isErrorResult(result)) throw new Error(serialized);
+          if (isErrorResult(result)) throw new Error(JSON.stringify(result, null, 2));
           const resultRecord = result && typeof result === "object" ? result as Record<string, unknown> : undefined;
+          // ctx_read returns its selection as text: bare inside a program, under
+          // a locating header at the model boundary. Other helpers return JSON.
+          const read = def.name === "ctx_read" ? resultRecord : undefined;
+          const serialized = read
+            ? nested ? selectedText(read) : `${readHeader(read)}\n${String(read.content)}`
+            : typeof result === "string" ? result : JSON.stringify(result, null, 2);
           const sourceTokens = [resultRecord?.originalTokens, resultRecord?.totalTokens, resultRecord?.resultTokens]
             .find((value): value is number => typeof value === "number" && Number.isFinite(value));
           telemetry.record(execCtx.cwd, {
@@ -465,6 +523,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
             mainTokensInjected: nested ? 0 : Math.ceil(Buffer.byteLength(serialized, "utf8") / 4),
             note: nested ? "internal CE helper result" : "CE helper result",
             ...(typeof (params as { id?: unknown }).id === "string" ? { handle: (params as { id: string }).id } : {}),
+            ...(read ? { read: readRecord(read) } : {}),
           });
           // Preserve exact structured helper values, including nested Fabric consumers.
           const maybeHandle = resultRecord as Record<string, unknown> | undefined;
@@ -473,15 +532,18 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           const isOffloadHandle = !!maybeHandle && typeof maybeHandle.id === "string" && (typeof handleBytes === "number" || typeof handleTokens === "number" || typeof maybeHandle.preview === "string");
           return {
             content: [{ type: "text" as const, text: serialized }],
-            details: isOffloadHandle
-              ? {
-                  tool: def.name,
-                  result,
-                  id: maybeHandle.id as string,
-                  ...(typeof handleBytes === "number" ? { bytes: handleBytes as number } : {}),
-                  ...(typeof handleTokens === "number" ? { estimatedTokens: handleTokens as number } : {}),
-                }
-              : { tool: def.name, result },
+            // The selected text is already .text inside a program; details carry the rest.
+            details: read && nested
+              ? { tool: def.name, result: withoutContent(read) }
+              : isOffloadHandle
+                ? {
+                    tool: def.name,
+                    result,
+                    id: maybeHandle.id as string,
+                    ...(typeof handleBytes === "number" ? { bytes: handleBytes as number } : {}),
+                    ...(typeof handleTokens === "number" ? { estimatedTokens: handleTokens as number } : {}),
+                  }
+                : { tool: def.name, result },
           };
         } catch (err) {
           throw new Error(`Tool ${def.name} failed: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
@@ -583,6 +645,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           `Main context reduction: ${summary.mainTokensPrevented.toLocaleString()} tokens (${reduction})`,
           `Events: ${summary.events}`,
           `Offloads read back: ${summary.offloadFollowUp.handlesRead}/${summary.offloadFollowUp.handles}; repeated offloaded calls: ${summary.offloadFollowUp.repeatedCalls}`,
+          formatReads(summary.offloadFollowUp.reads),
           ...(strategyLines.length > 0 ? ["", "By strategy:", ...strategyLines] : []),
           ...(summary.largest ? ["", `Largest Main-context prevention: ${summary.largest.tool} — ${summary.largest.mainTokensPrevented.toLocaleString()} tokens`] : []),
         ].join("\n");

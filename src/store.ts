@@ -88,8 +88,12 @@ export interface ReadOptions {
   offset?: number;
   /** Number of UTF-8 bytes to read. Ranges expand at most one code point at each boundary. */
   length?: number;
-  /** Literal substring to search for; returns matching lines with context. */
-  query?: string;
+  /** Text to find per line; an array matches lines containing any of its terms. */
+  query?: string | string[];
+  /** Treat each query term as a JavaScript RegExp; scans the first 512 KB. */
+  regex?: boolean;
+  /** Case-insensitive query matching. */
+  ignoreCase?: boolean;
   /** Dot/bracket JSON path, for example `$.results[0].name`. */
   jsonPath?: string;
   /** Fabric section name; offset/length then page within that section. */
@@ -124,6 +128,8 @@ export interface ReadResult {
   matchedLines?: number[];
   /** Total query matches when matchedLines is later metadata-capped. */
   totalMatches?: number;
+  /** Lines matching each term of a multi-term query, or each word of a phrase that matched nothing. */
+  termMatches?: Record<string, number>;
   truncated: boolean;
 }
 
@@ -146,6 +152,10 @@ interface StoreIndex {
 
 const DEFAULT_PREVIEW_BYTES = 2048;
 const DEFAULT_CONTEXT_LINES = 2;
+/** Regex queries scan this prefix; literal queries scan the whole payload. */
+const REGEX_SCAN_BYTES = 512 * 1024;
+/** Most terms in one query, and most words counted for a phrase that matched nothing. */
+const MAX_QUERY_TERMS = 16;
 const STORE_DIR_MODE = 0o700;
 const BLOB_MODE = 0o600;
 const LOCK_TIMEOUT_MS = 30_000;
@@ -163,6 +173,52 @@ function normalizeTtlMs(value: number | undefined): number {
 function normalizeMaxBytes(value: number | undefined): number {
   if (value === undefined || !Number.isFinite(value)) return MAX_CONTEXT_STORE_BYTES;
   return Math.max(0, Math.min(MAX_CONTEXT_STORE_BYTES, Math.floor(value)));
+}
+
+function lineMatcher(term: string, regex: boolean, ignoreCase: boolean): (line: string) => boolean {
+  if (regex) {
+    const pattern = new RegExp(term, ignoreCase ? "i" : "");
+    return (line) => pattern.test(line);
+  }
+  if (ignoreCase) {
+    const needle = term.toLowerCase();
+    return (line) => line.toLowerCase().includes(needle);
+  }
+  return (line) => line.includes(term);
+}
+
+/**
+ * Facts about a literal query that matched nothing, each naming the call that
+ * would match: lines that differ only in case, regex syntax in a literal query,
+ * and the words of a phrase that occur on separate lines. The miss itself is
+ * still reported first, so a true negative stays a negative.
+ */
+function queryMissHints(lines: string[], terms: string[], regex: boolean, ignoreCase: boolean): { text: string; termMatches?: Record<string, number> } {
+  if (regex) return { text: "" };
+  const linesWith = (term: string, fold: boolean): number => {
+    const match = lineMatcher(term, false, fold);
+    return lines.reduce((count, line) => count + (match(line) ? 1 : 0), 0);
+  };
+  const hints: string[] = [];
+  if (!ignoreCase) {
+    const fold = terms.map((term) => lineMatcher(term, false, true));
+    const folded = lines.filter((line) => fold.some((match) => match(line))).length;
+    if (folded > 0) hints.push(`${folded} line(s) match ignoring case; add ignoreCase: true.`);
+  }
+  if (terms.some((term) => /\||\.\*|\.\+|\\[dwsb]|^\^|\$$/.test(term))) {
+    hints.push("The query contains regex syntax; add regex: true to match it as a pattern.");
+  }
+  const words = terms.length === 1 ? [...new Set(terms[0].split(/\s+/).filter(Boolean))].slice(0, MAX_QUERY_TERMS) : [];
+  if (words.length < 2) return { text: hints.length ? ` ${hints.join(" ")}` : "" };
+  const termMatches = Object.fromEntries(words.map((word) => [word, linesWith(word, ignoreCase)]));
+  const found = words.filter((word) => termMatches[word] > 0);
+  const counts = words.map((word) => `${JSON.stringify(word)} ${termMatches[word]}`).join(", ");
+  hints.push(found.length > 1
+    ? `Its words match separately: ${counts} line(s); query: ${JSON.stringify(found)} matches lines with any of them.`
+    : found.length === 1
+      ? `Its words match separately: ${counts} line(s); query: ${JSON.stringify(found[0])} matches those lines.`
+      : "None of its words occur either.");
+  return { text: ` ${hints.join(" ")}`, termMatches };
 }
 
 function isContinuationByte(value: number | undefined): boolean {
@@ -239,7 +295,7 @@ export class ContextStore {
     });
   }
 
-  /** Read a UTF-8 byte range, literal line matches, or a focused JSON path. */
+  /** Read a UTF-8 byte range, matching lines, a Fabric section, or a focused JSON path. */
   read(id: string, opts: ReadOptions = {}): ReadResult {
     return this.withLock(() => {
       let entries = this.loadAll();
@@ -276,10 +332,7 @@ export class ContextStore {
         return this.readSection(entry, data, opts);
       }
 
-      if (opts.query !== undefined) {
-        const data = readFileSync(blob, "utf8");
-        return this.readQuery(entry, data, opts);
-      }
+      if (opts.query !== undefined) return this.readQuery(entry, blob, opts);
 
       return this.readRange(entry, blob, opts);
     });
@@ -620,15 +673,37 @@ export class ContextStore {
     };
   }
 
-  private readQuery(entry: StoreMetadata, data: string, opts: ReadOptions): ReadResult {
+  private readQuery(entry: StoreMetadata, blob: string, opts: ReadOptions): ReadResult {
+    const terms = [...new Set((Array.isArray(opts.query) ? opts.query : [opts.query]).map((term) => String(term ?? "")))]
+      .filter(Boolean).slice(0, MAX_QUERY_TERMS);
+    if (terms.length === 0) return this.errorResult(entry.id, "Error: query needs at least one non-empty term.");
+    const regex = opts.regex === true;
+    const ignoreCase = opts.ignoreCase === true;
+    let matchers: Array<(line: string) => boolean>;
+    try {
+      matchers = terms.map((term) => lineMatcher(term, regex, ignoreCase));
+    } catch {
+      return this.errorResult(entry.id, `Error: invalid regex in query ${JSON.stringify(opts.query)}.`);
+    }
+    const scanPrefix = regex && entry.bytes > REGEX_SCAN_BYTES;
+    const data = scanPrefix
+      ? this.readBlobBytes(blob, 0, this.alignUtf8Start(blob, REGEX_SCAN_BYTES)).toString("utf8")
+      : readFileSync(blob, "utf8");
     const contextLines = Math.max(0, opts.contextLines ?? DEFAULT_CONTEXT_LINES);
     const maxMatches = Math.max(1, opts.maxMatches ?? Number.MAX_SAFE_INTEGER);
     const lines = data.split("\n");
+    const perTerm = terms.map(() => 0);
     const matches: number[] = [];
     const result: string[] = [];
     let totalMatches = 0;
     for (let i = 0; i < lines.length; i++) {
-      if (!lines[i].includes(opts.query as string)) continue;
+      let hit = false;
+      for (let t = 0; t < matchers.length; t++) {
+        if (!matchers[t](lines[i])) continue;
+        perTerm[t]++;
+        hit = true;
+      }
+      if (!hit) continue;
       totalMatches++;
       if (matches.length >= maxMatches) continue;
       matches.push(i + 1);
@@ -637,18 +712,29 @@ export class ContextStore {
       for (let j = start; j <= end; j++) result.push(`${j === i ? ">>" : "  "} ${j + 1}: ${lines[j]}`);
       result.push("");
     }
+    const label = terms.length === 1 ? JSON.stringify(terms[0]) : `any of ${terms.map((term) => JSON.stringify(term)).join(", ")}`;
+    let termMatches = terms.length > 1 ? Object.fromEntries(terms.map((term, t) => [term, perTerm[t]])) : undefined;
     const omitted = Math.max(0, totalMatches - matches.length);
-    const content = totalMatches === 0
-      ? `No matches for "${opts.query}" in ${entry.key} (${entry.bytes} bytes).`
-      : `${totalMatches} match(es) for "${opts.query}":\n${result.join("\n")}` +
-        (omitted > 0 ? `\n... [${omitted} additional matches counted but not formatted]` : "");
+    const scanned = scanPrefix ? `first ${REGEX_SCAN_BYTES} of ${entry.bytes} bytes scanned` : `${entry.bytes} bytes`;
+    let content: string;
+    if (totalMatches === 0) {
+      const miss = queryMissHints(lines, terms, regex, ignoreCase);
+      termMatches = miss.termMatches ?? termMatches;
+      content = `No matches for ${label} in ${entry.key} (${scanned}).${miss.text}`;
+    } else {
+      const counts = termMatches ? ` (${terms.map((term, t) => `${JSON.stringify(term)}: ${perTerm[t]}`).join(", ")})` : "";
+      content = `${totalMatches} match(es) for ${label}${counts}:\n${result.join("\n")}` +
+        (omitted > 0 ? `\n... [${omitted} additional matches counted but not formatted]` : "") +
+        (scanPrefix ? `\n... [regex scanned the first ${REGEX_SCAN_BYTES} of ${entry.bytes} bytes; use offset reads for the rest]` : "");
+    }
     return {
       ...this.baseResult(entry),
       bytesRead: Buffer.byteLength(content, "utf8"),
       content,
       matchedLines: matches,
       totalMatches,
-      truncated: omitted > 0,
+      ...(termMatches ? { termMatches } : {}),
+      truncated: omitted > 0 || scanPrefix,
     };
   }
 

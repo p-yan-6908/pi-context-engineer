@@ -2,7 +2,8 @@
  * Small, deterministic previews for data that has been moved out of the
  * model context. These are deliberately shape-oriented: the complete payload
  * remains addressable in ContextStore, while the visible text preserves keys,
- * counts, useful scalar values, and both ends of text/code output.
+ * counts, useful scalar values, an outline of headed output, or both ends of
+ * text/code output, with the byte offsets a ctx_read range needs.
  *
  * All preview budgets are UTF-8 bytes (see structuralPreview/compactErrorOutput
  * maxBytes). Token estimates elsewhere are ~bytes/4 ASCII-biased; prefer byte
@@ -20,13 +21,6 @@ function utf8Prefix(data: string, maxBytes: number): string {
   let end = Math.max(0, Math.min(buffer.length, Math.floor(maxBytes)));
   while (end > 0 && isContinuationByte(buffer[end])) end--;
   return buffer.subarray(0, end).toString("utf8");
-}
-
-function utf8Suffix(data: string, maxBytes: number): string {
-  const buffer = Buffer.from(data, "utf8");
-  let start = Math.max(0, buffer.length - Math.floor(maxBytes));
-  while (start < buffer.length && isContinuationByte(buffer[start])) start++;
-  return buffer.subarray(start).toString("utf8");
 }
 
 function fitUtf8(data: string, maxBytes: number): string {
@@ -48,6 +42,68 @@ export function inferContentType(data: string): PreviewContentType {
       ? "code"
       : "text";
   }
+}
+
+/** A preview and, when it shows a prefix, the first payload byte it leaves out. */
+export interface Preview {
+  text: string;
+  /** UTF-8 offset where a ctx_read range continues past what the preview shows. */
+  readFrom?: number;
+}
+
+/** Longest line shown in an outline or section head. */
+const PREVIEW_LINE_CHARS = 160;
+/** Bytes scanned for part headers; a payload can be far larger than its preview. */
+const OUTLINE_SCAN_BYTES = 2 * 1024 * 1024;
+/** First lines considered per part or section. */
+const MAX_HEAD_LINES = 64;
+
+function clipLine(line: string, maxChars = PREVIEW_LINE_CHARS): string {
+  if (line.length <= maxChars) return line;
+  // Never split a surrogate pair; a lone surrogate encodes as U+FFFD.
+  const end = /[\ud800-\udbff]/.test(line[maxChars - 1]) ? maxChars - 1 : maxChars;
+  return `${line.slice(0, end)}…`;
+}
+
+/** UTF-8 bytes of lines joined with newlines. */
+function byteLines(lines: string[]): number {
+  return lines.reduce((bytes, line) => bytes + Buffer.byteLength(line, "utf8") + 1, 0) - (lines.length ? 1 : 0);
+}
+
+/**
+ * How many lines of each candidate list to show: one more line for each list
+ * in turn while the total fits, so every part gets its first lines before
+ * any part gets more.
+ */
+function fillRoundRobin(fixedBytes: number, candidates: string[][], limit: number): number[] {
+  const counts = candidates.map(() => 0);
+  const open = new Set(candidates.keys());
+  let used = fixedBytes;
+  while (open.size > 0) {
+    for (const i of [...open]) {
+      const line = candidates[i][counts[i]];
+      const cost = line === undefined ? Infinity : Buffer.byteLength(line, "utf8") + 1;
+      if (used + cost > limit) {
+        open.delete(i);
+        continue;
+      }
+      used += cost;
+      counts[i]++;
+    }
+  }
+  return counts;
+}
+
+/** The leading lines that fit in maxBytes, newlines included. */
+function linesWithin(lines: string[], maxBytes: number): string[] {
+  const kept: string[] = [];
+  let used = 0;
+  for (const line of lines) {
+    used += Buffer.byteLength(line, "utf8") + 1;
+    if (used > maxBytes) break;
+    kept.push(line);
+  }
+  return kept;
 }
 
 function shortString(value: string, maxChars = 240): string {
@@ -148,23 +204,170 @@ export function fabricSection(data: string, name: string): FabricSection | undef
 function fabricSectionPreview(data: string, limit: number): string | undefined {
   const parsed = fabricSections(data);
   if (!parsed) return undefined;
+  // Pointer lines only repeat section names, which the section heads carry.
   const candidates = parsed.outline.split(/\r?\n/).map((line, i) => ({ line, number: i + 1 }))
-    .filter(({ line }) => line.trim() && line.length <= 240);
+    .filter(({ line }) => line.trim() && line.length <= 240 && !line.includes('"<multi-line string, see section: '));
   const priority = (line: string): number => {
     const depth = line.length - line.trimStart().length;
     return /^(?:- )?(?:ok|success|status|exitCode|path|output|count|error):/.test(line.trimStart()) ? depth - 1000 : depth;
   };
   candidates.sort((a, b) => priority(a.line) - priority(b.line));
-  const small = parsed.sections.filter((section) => Buffer.byteLength(section.text, "utf8") <= Math.min(600, limit / 3));
-  const outlineBudget = Math.floor(limit * (small.length ? 0.4 : 0.65));
-  const lines = ["Fabric sectioned result — selected fields, not a complete value:"];
-  lines.push(fitUtf8(candidates.slice(0, 32).map(({ line, number }) => `${number}: ${line}`).join("\n"), outlineBudget));
-  for (const section of small.slice(0, 6)) {
-    lines.push(`Section ${JSON.stringify(section.name)} (${section.chars} chars):\n${section.text}`);
+  const count = parsed.sections.length;
+  const shown = parsed.sections.slice(0, 24);
+  const fixed = [
+    `Fabric sectioned result, ${count} section${count === 1 ? "" : "s"}; read one with ctx_read section:`,
+    ...linesWithin(candidates.slice(0, 32).map(({ line, number }) => `${number}: ${line}`), Math.floor(limit * 0.35)),
+  ];
+  const titles = shown.map((section) => `Section ${JSON.stringify(section.name)} (${section.chars} chars):`);
+  const more = count > shown.length ? [`... ${count - shown.length} more sections`] : [];
+  const heads = shown.map((section) => section.text.split(/\r?\n/, MAX_HEAD_LINES * 4)
+    .filter((line) => line.trim()).slice(0, MAX_HEAD_LINES).map((line) => clipLine(line)));
+  const counts = fillRoundRobin(byteLines([...fixed, ...titles, ...more]), heads, limit);
+  const text = [...fixed, ...shown.flatMap((_, i) => [titles[i], ...heads[i].slice(0, counts[i])]), ...more].join("\n");
+  return fitUtf8(text, limit);
+}
+
+interface OutlineRow { line: string; offset: number }
+
+interface OutlinePart {
+  label: string;
+  offset: number;
+  end: number;
+  /** Bytes of the header line that opens the part; 0 when the label is not a payload line. */
+  headerBytes: number;
+  rows: OutlineRow[];
+}
+
+/** The header family of a line that opens a part, such as "=====" for "===== src/a.ts =====". */
+function headerFamily(line: string, markdown: boolean): string | undefined {
+  if (line.length > 240) return undefined;
+  if (line.startsWith("diff --git ")) return "diff";
+  // Single-# lines are comments in shell and Python; deeper headings mark sections anywhere.
+  if (/^#{2,6}\s+\S/.test(line) || (markdown && /^#\s+\S/.test(line))) return "#";
+  const run = /^([=\-*~#])\1{2,}/.exec(line)?.[0];
+  return run && /^\s*[^=\-*~#\s]/.test(line.slice(run.length)) ? run : undefined;
+}
+
+/** A `path:line:` or `path:line-` row of grep -n output. */
+const GREP_ROW = /^([^\s:][^:]*?):\d+[:-]/;
+
+/**
+ * Split headed output into parts: runs of one file in grep output, or the
+ * spans between repeated header lines (file separators, markdown headings,
+ * `--- name ---` markers, diff headers). Families are taken in order of first
+ * appearance, so outer structure wins when inner headings would crowd it out.
+ */
+function outlineParts(data: string, totalBytes: number, contentType: PreviewContentType, maxParts: number): OutlinePart[] | undefined {
+  const scanned = totalBytes > OUTLINE_SCAN_BYTES ? utf8Prefix(data, OUTLINE_SCAN_BYTES) : data;
+  const rows: OutlineRow[] = [];
+  let offset = 0;
+  for (const line of scanned.split("\n")) {
+    rows.push({ line: line.endsWith("\r") ? line.slice(0, -1) : line, offset });
+    offset += Buffer.byteLength(line, "utf8") + 1;
   }
-  lines.push("Sections (read one with ctx_read section):");
-  for (const section of parsed.sections.slice(0, 24)) lines.push(`- ${JSON.stringify(section.name)}: ${section.chars} chars`);
-  return fitUtf8(lines.join("\n"), limit);
+  const filled = rows.filter((row) => row.line.trim()).length;
+  const parts: OutlinePart[] = [];
+  if (filled >= 4 && rows.filter((row) => GREP_ROW.test(row.line)).length >= filled * 0.6) {
+    for (const row of rows) {
+      const file = GREP_ROW.exec(row.line)?.[1];
+      const current = parts.at(-1);
+      if (file !== undefined && file !== current?.label) parts.push({ label: file, offset: row.offset, end: totalBytes, headerBytes: 0, rows: [row] });
+      else current?.rows.push(row);
+    }
+  } else {
+    const families = new Map<string, number[]>();
+    rows.forEach((row, index) => {
+      const family = headerFamily(row.line, contentType !== "code");
+      if (family) families.set(family, [...(families.get(family) ?? []), index]);
+    });
+    const headers: number[] = [];
+    for (const indices of [...families.values()].filter((indices) => indices.length >= 2).sort((a, b) => a[0] - b[0])) {
+      if (headers.length > 0 && headers.length + indices.length > maxParts) break;
+      headers.push(...indices);
+    }
+    headers.sort((a, b) => a - b);
+    if (headers.length > 0 && rows.slice(0, headers[0]).some((row) => row.line.trim())) {
+      parts.push({ label: "(before the first header)", offset: 0, end: totalBytes, headerBytes: 0, rows: rows.slice(0, headers[0]) });
+    }
+    headers.forEach((index, i) => parts.push({
+      label: rows[index].line.trim(),
+      offset: rows[index].offset,
+      end: totalBytes,
+      headerBytes: Buffer.byteLength(rows[index].line, "utf8") + 1,
+      rows: rows.slice(index + 1, headers[i + 1] ?? rows.length),
+    }));
+  }
+  for (let i = 0; i + 1 < parts.length; i++) parts[i].end = parts[i + 1].offset;
+  // One dominant part is better served by the payload's head and tail.
+  if (parts.length < 2 || parts.some((part) => part.end - part.offset > totalBytes * 0.9)) return undefined;
+  return parts;
+}
+
+/** Every part's label, offset and size, then first lines for each part in turn while they fit. */
+function outlinePreview(data: string, limit: number, contentType: PreviewContentType, totalBytes: number): Preview | undefined {
+  const parts = outlineParts(data, totalBytes, contentType, Math.max(4, Math.floor(limit / 64)));
+  if (!parts) return undefined;
+  const scanned = totalBytes > OUTLINE_SCAN_BYTES ? ` in the first ${OUTLINE_SCAN_BYTES} bytes` : "";
+  const title = `${contentType === "code" ? "Code" : "Text"} outline, ${parts.length} parts${scanned} of ${totalBytes} bytes; each offset starts a ctx_read range:`;
+  const labels = parts.map((part) => `${clipLine(part.label)}  [offset ${part.offset}, ${part.end - part.offset} bytes]`);
+  // Shown rows per part; a clipped row ends its part's list and is re-read in full.
+  const heads = parts.map((part) => {
+    const rows: Array<{ text: string; end: number }> = [];
+    for (const row of part.rows) {
+      if (rows.length >= MAX_HEAD_LINES) break;
+      if (!row.line.trim()) continue;
+      const text = clipLine(row.line);
+      rows.push({ text, end: text === row.line ? row.offset + Buffer.byteLength(row.line, "utf8") + 1 : row.offset });
+      if (text !== row.line) break;
+    }
+    return rows;
+  });
+  let shownParts = parts.length;
+  const moreLine = (shown: number): string[] =>
+    shown < parts.length ? [`... ${parts.length - shown} more parts, the next at offset ${parts[shown].offset}`] : [];
+  // When even the labels overflow, list as many as fit.
+  while (shownParts > 1 && byteLines([title, ...labels.slice(0, shownParts), ...moreLine(shownParts)]) > limit) shownParts--;
+  const counts = fillRoundRobin(
+    byteLines([title, ...labels.slice(0, shownParts), ...moreLine(shownParts)]),
+    heads.slice(0, shownParts).map((rows) => rows.map((row) => row.text)),
+    limit,
+  );
+  let readFrom: number | undefined;
+  for (let i = 0; i < shownParts && readFrom === undefined; i++) {
+    const shownEnd = Math.min(parts[i].end, counts[i] ? heads[i][counts[i] - 1].end : parts[i].offset + parts[i].headerBytes);
+    if (shownEnd < parts[i].end) readFrom = shownEnd;
+  }
+  const text = [
+    title,
+    ...labels.slice(0, shownParts).flatMap((label, i) => [label, ...heads[i].slice(0, counts[i]).map((row) => row.text)]),
+    ...moreLine(shownParts),
+  ].join("\n");
+  return { text: fitUtf8(text, limit), ...(readFrom !== undefined ? { readFrom } : {}) };
+}
+
+/** The payload's first and last lines, with the byte ranges shown and omitted. */
+function headTailPreview(data: string, limit: number, contentType: PreviewContentType, totalBytes: number): Preview {
+  const buffer = Buffer.from(data, "utf8");
+  const label = contentType === "code" ? "Code" : "Text";
+  const describe = (headEnd: number, tailStart: number): string =>
+    `${label} preview, bytes 0-${headEnd} and ${tailStart}-${totalBytes} of ${totalBytes}:\n`;
+  const marker = (headEnd: number, tailStart: number): string => `... [bytes ${headEnd}-${tailStart} omitted]\n`;
+  const available = Math.max(0, limit - Buffer.byteLength(describe(totalBytes, totalBytes) + "\n" + marker(totalBytes, totalBytes), "utf8"));
+  // Cut at line ends when one is near, so a range read resumes at a line start.
+  let headEnd = Math.floor(available * 0.62);
+  const lastBreak = buffer.lastIndexOf(0x0a, headEnd - 1);
+  if (lastBreak >= 0 && lastBreak + 1 >= headEnd * 0.7) headEnd = lastBreak + 1;
+  else while (headEnd > 0 && isContinuationByte(buffer[headEnd])) headEnd--;
+  const tailBudget = Math.max(0, available - headEnd);
+  let tailStart = totalBytes - tailBudget;
+  const firstBreak = buffer.indexOf(0x0a, tailStart);
+  if (firstBreak >= 0 && firstBreak + 1 - tailStart <= tailBudget * 0.3) tailStart = firstBreak + 1;
+  else while (tailStart < totalBytes && isContinuationByte(buffer[tailStart])) tailStart++;
+  tailStart = Math.max(headEnd, tailStart);
+  const head = buffer.subarray(0, headEnd).toString("utf8");
+  const text = describe(headEnd, tailStart) + head + (head.endsWith("\n") ? "" : "\n") +
+    marker(headEnd, tailStart) + buffer.subarray(tailStart).toString("utf8");
+  return { text: fitUtf8(text, limit), readFrom: headEnd };
 }
 
 /** Only successful edit envelopes qualify; arbitrary diffs and failed operations do not. */
@@ -189,34 +392,40 @@ export function isVerboseEditAcknowledgement(data: string): boolean {
   }
 }
 
-/** Build a bounded shape-oriented preview without exposing the full payload. */
-export function structuralPreview(
+/**
+ * Build a bounded shape-oriented preview without exposing the full payload.
+ * readFrom is set when the preview shows a prefix, so the notice can offer a
+ * range read that starts after it instead of re-reading it.
+ */
+export function buildPreview(
   data: string,
   maxBytes = 2048,
   contentType: PreviewContentType = inferContentType(data),
-): string {
+): Preview {
   const limit = Math.max(256, Math.floor(maxBytes));
   const trimmed = data.trim();
   const wantsJson = contentType === "json" || (contentType === "unknown" && inferContentType(trimmed) === "json");
   if (wantsJson) {
     try {
-      return fitUtf8(jsonStructuralPreview(JSON.parse(trimmed)), limit);
+      return { text: fitUtf8(jsonStructuralPreview(JSON.parse(trimmed)), limit) };
     } catch {
       // A stale content-type marker should not make the handle unreadable.
     }
   }
 
   const totalBytes = Buffer.byteLength(data, "utf8");
-  if (totalBytes <= limit) return data;
+  if (totalBytes <= limit) return { text: data };
   const sections = fabricSectionPreview(data, limit);
-  if (sections) return sections;
-  const label = contentType === "code" ? "Code" : "Text";
-  const suffix = `\n... [middle omitted; ${totalBytes} bytes total]\n`;
-  const available = Math.max(0, limit - Buffer.byteLength(`${label} preview:${suffix}`, "utf8"));
-  const headBytes = Math.floor(available * 0.62);
-  const tailBytes = Math.max(0, available - headBytes);
-  const preview = `${label} preview:\n${utf8Prefix(data, headBytes)}${suffix}${utf8Suffix(data, tailBytes)}`;
-  return fitUtf8(preview, limit);
+  if (sections) return { text: sections };
+  return outlinePreview(data, limit, contentType, totalBytes) ?? headTailPreview(data, limit, contentType, totalBytes);
+}
+
+export function structuralPreview(
+  data: string,
+  maxBytes = 2048,
+  contentType: PreviewContentType = inferContentType(data),
+): string {
+  return buildPreview(data, maxBytes, contentType).text;
 }
 
 /** Compact repetitive compiler/parser errors while retaining diagnostics and the tail. */

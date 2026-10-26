@@ -6,7 +6,7 @@ It works with ordinary Pi tools and with [Pi Fabric](https://github.com/monotyka
 
 ## What it does
 
-- **Offloads large results.** CE measures the sum of a result's text blocks. Over the threshold, the exact text is stored and replaced by a notice with copyable `ctx_read` calls and a structural preview: JSON keys and short fields, Fabric section names, or head and tail lines. Images keep their positions. If the store fails, the original result stays visible.
+- **Offloads large results.** CE measures the sum of a result's text blocks. Over the threshold, the exact text is stored and replaced by a notice with copyable `ctx_read` calls and a preview that works as an index: JSON keys and short fields; each Fabric section with its first lines; an outline of headed output (file separators, markdown headings, `--- name ---` markers, grep output by file) with each part's byte offset; or the first and last lines with the byte ranges they cover. The suggested range read starts where the preview stops. Images keep their positions. If the store fails, the original result stays visible.
 - **Compacts oversized errors.** An error result of 4 KB or more keeps its most useful diagnostic lines inline, plus a handle to the complete output.
 - **Compacts verbose edit results.** A successful edit whose result carries a diff or patch of 2 KB or more keeps its acknowledgment inline; the full diff stays readable.
 - **Completes Fabric-truncated output.** Fabric caps a `fabric_exec` result at 50,000 characters and saves the full text to a temporary file that it soon deletes. When a result arrives truncated like that, CE stores the full text from the file, so the handle also holds the part Fabric left out.
@@ -21,11 +21,13 @@ At the model boundary call `ctx_read`; inside a Fabric program call `extensions.
 | Mode | Parameters | Use for |
 | --- | --- | --- |
 | Byte range | `offset`, `length` | Paging through text. Results include `nextOffset`. |
-| Line search | `query`, optional `regex`, `ignoreCase`, `contextLines`, `maxMatches` | Finding lines. Literal and case-sensitive by default. |
+| Line search | `query` (a string, or an array of terms to match any of), optional `regex`, `ignoreCase`, `contextLines`, `maxMatches` | Finding lines. Literal and case-sensitive by default. |
 | Section | `section`, optional `offset`/`length` | One named part of a Fabric sectioned result. |
 | JSON path | `jsonPath`, for example `$.results[0].name` | One value from a JSON payload. No wildcards or slices. |
 
-The offload notice only offers the modes the payload supports. A `ctx_read` result is capped below the offload threshold so reading a handle never produces another handle. If a `fabric_exec` program that reads handles still returns too much, the notice says to narrow the read.
+The offload notice only offers the modes the payload supports. A query that finds nothing says so first, then whether lines match ignoring case, whether the query looks like a regex, and how many lines each word of a phrase matches, with the array query that would find them. Literal queries scan the whole payload; regex queries scan the first 512 KB.
+
+At the model boundary a `ctx_read` result shows the selected text under a one-line header that locates it, and stays below the offload threshold so reading a handle never produces another handle. Inside a Fabric program a read is program data, so that cap does not apply: a read returns up to 512 KB, with the selected text in `.text` and its metadata (`totalBytes`, `nextOffset`, `totalMatches`, ...) in `.details.result`. Filter with code and return only what you need. If a program that reads handles still returns too much, the notice says to filter before returning.
 
 A multi-block result is stored as `{ "textBlocks": [{ "index": 0, "text": "..." }, ...] }`, keeping each block's original position; read one with `jsonPath: "$.textBlocks[0].text"`.
 
@@ -41,7 +43,11 @@ All three are callable by the model directly and inside Fabric through `extensio
 // Inside fabric_exec: keep a large file out of context, then read what you need.
 const text = await pi.read({ path: "large.json" });
 const handle = await extensions.ctx_offload({ key: "large-json", source: "read", data: text });
-return await extensions.ctx_read({ id: handle.details.id, jsonPath: "$.items[0]" });
+return (await extensions.ctx_read({ id: handle.details.id, jsonPath: "$.items[0]" })).text;
+
+// Inside fabric_exec: filter a whole offloaded result in code.
+const log = (await extensions.ctx_read({ id: "<handle>" })).text;
+return log.split("\n").filter((line) => line.includes("FAIL")).slice(0, 20);
 ```
 
 ## Fabric child agents
@@ -58,7 +64,7 @@ When CE is enabled, each extension-enabled Fabric Pi child that loads CE adds `c
 /ce clear           clear telemetry
 ```
 
-`/ce status` also reports offload follow-up: how many offloaded handles were later read with `ctx_read` or `ctx_summarize`, and how many offloaded calls were run again anyway. A repeat suggests the notice did not make the handle usable and the same output was paid for twice.
+`/ce status` also reports offload follow-up: how many offloaded handles were later read with `ctx_read` or `ctx_summarize`, and how many offloaded calls were run again anyway. A repeat suggests the notice did not make the handle usable and the same output was paid for twice. It also counts `ctx_read` calls by mode and how many ran inside programs: range reads, with how many started at offset 0 (usually re-reading what a preview showed); queries, with how many matched nothing; sections; and JSON paths. Query text is never recorded.
 
 The figures are estimates at about 4 bytes per token, not billing data. Reading an existing handle does not count as a second saving.
 
@@ -117,7 +123,7 @@ npm ci
 npm test
 ```
 
-`npm test` builds the extension and runs deterministic, offline hook probes: offload of single and multi-block results, prefix stability, intermediate Fabric values, every `ctx_read` mode and its cap, summaries, error and edit compaction, the Fabric child grant, Pi's native tool error contract, and telemetry.
+`npm test` builds the extension and runs deterministic, offline hook probes: offload of single and multi-block results, preview outlines and byte ranges, prefix stability, intermediate Fabric values, every `ctx_read` mode with its boundary and program budgets, query hints, summaries, error and edit compaction, the Fabric child grant, Pi's native tool error contract, and telemetry.
 
 An opt-in smoke test launches the local `pi` CLI with CE and Fabric in a throwaway workspace. It needs a configured model and can incur provider usage:
 

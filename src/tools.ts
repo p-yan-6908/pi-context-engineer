@@ -17,6 +17,13 @@ import { ContextStore } from "./store.js";
 const RESULT_ENVELOPE_SLACK_BYTES = 1024;
 /** Default ceiling for one CE tool result; mirrors index.ts's offload threshold. */
 const DEFAULT_MAX_RETURN_BYTES = 16_384;
+/**
+ * Result budget for ctx_read inside a Fabric program, where a result is
+ * program data rather than model context. Fabric hands the program the
+ * selected text twice (content and text) beside its details, which keeps a
+ * 512 KB read well inside Fabric's default 2,000,000-character nested limit.
+ */
+export const NESTED_READ_BUDGET_BYTES = 512 * 1024;
 type SummaryMode = "structural" | "code";
 const DEFAULT_SUMMARY_TOKENS = 500;
 const MIN_SUMMARY_TOKENS = 64;
@@ -32,8 +39,6 @@ function normalizeSummaryTokens(value: unknown): number {
 }
 /** Bounded prefix for stored-payload summarization; avoids unbounded MAX_SAFE_INTEGER reads. */
 const SUMMARIZE_STORED_CAP_BYTES = 512 * 1024;
-/** Cap for regex/ignoreCase query scans; literal queries still use the store path. */
-const QUERY_SCAN_CAP_BYTES = 512 * 1024;
 /**
  * Detect handler error results. The Pi tool wrapper in index.ts uses this to
  * throw from execute (Pi ignores returned isError flags). Handler errors
@@ -50,7 +55,7 @@ export function isErrorResult(result: unknown): boolean {
 export interface ToolContext {
   store: ContextStore;
   workspaceRoot: string;
-  /** Approximate byte budget for one tool result; ctx_read self-caps under it. */
+  /** Byte budget for one ctx_read result: under the offload threshold at the model boundary, NESTED_READ_BUDGET_BYTES in a program. */
   maxReturnBytes?: number;
 }
 
@@ -66,18 +71,20 @@ export interface ToolDef {
 const ctxRead: ToolDef = {
   name: "ctx_read",
   description:
-    "Read a slice of or search within a previously offloaded tool result by its handle. " +
-    "Keeps large data out of context — only the requested slice or matched lines return. " +
-    "Use offset/length for ranged reads, query for literal line matches, section for a named part of a Fabric sectioned result, or jsonPath for JSON payloads only. " +
-    "Reading the handle is cheaper than re-running the call that produced it.",
+    "Read part of a previously offloaded tool result by its handle; cheaper than re-running the call that produced it. " +
+    "Use offset/length for a byte range, query for matching lines, section for a named part of a Fabric sectioned result, or jsonPath for JSON payloads only. " +
+    "At the model boundary a result stays under the offload threshold. Inside fabric_exec a read returns up to 512 KB, with the selected text in .text and metadata in .details.result, to filter in code.",
   inputSchema: {
     type: "object",
     properties: {
       id: { type: "string", description: "The handle returned when the data was offloaded." },
       offset: { type: "integer", description: "0-based byte offset for ranged read. Defaults to 0." },
-      length: { type: "integer", description: "Bytes to read. Defaults to the bounded read budget. Ranged results include a copyable nextOffset when more remains." },
-      query: { type: "string", description: "Substring or regex to search for. Literal by default; set regex:true for RegExp. Overrides offset/length." },
-      regex: { type: "boolean", description: "Treat query as a JavaScript RegExp matched per line. Default false (literal)." },
+      length: { type: "integer", description: "Bytes to read. Defaults to the most one result allows. Ranged results include a copyable nextOffset when more remains." },
+      query: {
+        anyOf: [{ type: "string" }, { type: "array", items: { type: "string" } }],
+        description: "Literal text to find per line, or an array of terms to match lines containing any of them. Overrides offset/length.",
+      },
+      regex: { type: "boolean", description: "Treat each query term as a JavaScript RegExp matched per line. Default false (literal)." },
       ignoreCase: { type: "boolean", description: "Case-insensitive query matching. Default false (case-sensitive)." },
       jsonPath: { type: "string", description: "Dot/bracket JSON path for a stored JSON payload, e.g. $.results[0].name; no wildcards or slices. Overrides section/query/offset/length." },
       section: { type: "string", description: "Section name listed in a Fabric sectioned preview. Overrides query; offset/length page within the section." },
@@ -87,9 +94,10 @@ const ctxRead: ToolDef = {
     required: ["id"],
   },
   async handler(args, ctx) {
-    // Self-cap output so a ctx_read result never reaches the auto-offload
-    // threshold — otherwise reading a handle would produce another handle
-    // (recursive offload), making the stored payload unreachable.
+    // At the model boundary, self-cap output so a ctx_read result never
+    // reaches the auto-offload threshold; otherwise reading a handle would
+    // produce another handle. Inside a program the caller passes the larger
+    // nested budget.
     const budget = Math.max(
       512,
       (ctx.maxReturnBytes ?? DEFAULT_MAX_RETURN_BYTES) - RESULT_ENVELOPE_SLACK_BYTES
@@ -122,26 +130,28 @@ const ctxRead: ToolDef = {
       return capContent(result, budget, "use offset to page through the section");
     }
 
-    if (args.query) {
-      const queryText = String(args.query);
-      const useRegex = args.regex === true;
-      const ignoreCase = args.ignoreCase === true;
+    const terms = (Array.isArray(args.query) ? args.query : args.query == null ? [] : [args.query])
+      .map((term) => String(term)).filter(Boolean);
+    if (terms.length > 0) {
+      const regex = args.regex === true;
+      if (regex) {
+        for (const term of terms) {
+          try {
+            new RegExp(term);
+          } catch {
+            return { error: `Invalid regex: ${term}`, code: "invalid_regex", isError: true as const };
+          }
+        }
+      }
       const requestedContextLines = Number(args.contextLines);
       const contextLines = Number.isFinite(requestedContextLines)
         ? Math.max(0, Math.min(50, Math.floor(requestedContextLines)))
         : undefined;
       const maxMatches = Math.max(1, Math.min(500, Math.floor(Number(args.maxMatches) || 100)));
-      if (useRegex || ignoreCase) {
-        return queryStoredPrefix(
-          ctx.store,
-          id,
-          queryText,
-          { regex: useRegex, ignoreCase, contextLines: contextLines ?? 2, maxMatches },
-          budget
-        );
-      }
       const result = await ctx.store.read(id, {
-        query: queryText,
+        query: terms.length === 1 ? terms[0] : terms,
+        regex,
+        ignoreCase: args.ignoreCase === true,
         contextLines,
         maxMatches,
       });
@@ -298,7 +308,7 @@ function isContinuationByte(value: number | undefined): boolean {
 }
 
 /**
- * Bounded prefix read for summarization/query paths. Probes totalBytes with a
+ * Bounded prefix read for summarization. Probes totalBytes with a
  * zero-length read, then reads at most capBytes and strips the store's paging
  * note via bytesRead so summaries never ingest an unbounded payload.
  */
@@ -317,83 +327,6 @@ function readStoredPrefix(
   const payloadBytes = result.truncated ? result.bytesRead : Buffer.byteLength(result.content, "utf8");
   const data = Buffer.from(result.content, "utf8").subarray(0, payloadBytes).toString("utf8");
   return { data, totalBytes, truncated: result.truncated };
-}
-
-/**
- * Bounded query scan implementing regex + ignoreCase without touching the
- * store's literal path. Default literal case-sensitive behavior is preserved
- * by the caller, which only routes here when either flag is set.
- */
-function queryStoredPrefix(
-  store: ContextStore,
-  id: string,
-  query: string,
-  opts: { regex: boolean; ignoreCase: boolean; contextLines: number; maxMatches: number },
-  budget: number
-): unknown {
-  let matcher: (line: string) => boolean;
-  let regex: RegExp | null = null;
-  if (opts.regex) {
-    try {
-      regex = new RegExp(query, opts.ignoreCase ? "i" : "");
-    } catch {
-      return { error: `Invalid regex: ${query}`, code: "invalid_regex", isError: true as const };
-    }
-    const active = regex;
-    matcher = (line) => {
-      active.lastIndex = 0;
-      return active.test(line);
-    };
-  } else if (opts.ignoreCase) {
-    const lowered = query.toLowerCase();
-    matcher = (line) => line.toLowerCase().includes(lowered);
-  } else {
-    matcher = (line) => line.includes(query);
-  }
-
-  const prefix = readStoredPrefix(store, id, QUERY_SCAN_CAP_BYTES);
-  if (prefix.error) return { error: prefix.error, code: "stored_read_failed", isError: true as const };
-
-  const lines = prefix.data.split("\n");
-  const matchedLines: number[] = [];
-  const formatted: string[] = [];
-  let totalMatches = 0;
-  for (let i = 0; i < lines.length; i++) {
-    let isMatch = false;
-    try {
-      isMatch = matcher(lines[i]);
-    } catch {
-      isMatch = false;
-    }
-    if (!isMatch) continue;
-    totalMatches++;
-    if (matchedLines.length >= opts.maxMatches) continue;
-    matchedLines.push(i + 1);
-    const start = Math.max(0, i - opts.contextLines);
-    const end = Math.min(lines.length - 1, i + opts.contextLines);
-    for (let j = start; j <= end; j++) formatted.push(`${j === i ? ">>" : "  "} ${j + 1}: ${lines[j]}`);
-    formatted.push("");
-  }
-  const scanTruncated = prefix.truncated;
-  const omitted = Math.max(0, totalMatches - matchedLines.length);
-  const baseContent =
-    totalMatches === 0
-      ? `No matches for "${query}" (${prefix.totalBytes} bytes${scanTruncated ? `, first ${QUERY_SCAN_CAP_BYTES} bytes scanned` : ""}).`
-      : `${totalMatches} match(es) for "${query}":\n${formatted.join("\n")}` +
-        (omitted > 0 ? `\n... [${omitted} additional matches counted but not formatted]` : "") +
-        (scanTruncated ? `\n... [payload truncated to first ${QUERY_SCAN_CAP_BYTES} bytes of ${prefix.totalBytes}; narrow query or use offset read]` : "");
-  const result = {
-    ok: true,
-    id,
-    totalBytes: prefix.totalBytes,
-    totalTokens: Math.ceil(prefix.totalBytes / 4),
-    bytesRead: Buffer.byteLength(baseContent, "utf8"),
-    content: baseContent,
-    matchedLines,
-    totalMatches,
-    truncated: omitted > 0 || scanTruncated,
-  };
-  return capContent(result, budget, "narrow the query or reduce contextLines");
 }
 
 // ---- Export all tools ----

@@ -18,6 +18,27 @@ import { resolve } from "node:path";
 export const REPEATED_OFFLOADED_CALL_NOTE = "repeated a call whose result is already offloaded";
 
 export type ContextStrategy = "PASS" | "WRITE" | "SELECT" | "COMPRESS";
+
+/** How a ctx_read selected from its handle; the query text is never recorded. */
+export interface ReadTelemetry {
+  mode: "range" | "query" | "section" | "jsonPath";
+  /** Start of a range read. */
+  offset?: number;
+  /** Matching lines of a query. */
+  matches?: number;
+}
+
+const READ_MODES: ReadonlyArray<ReadTelemetry["mode"]> = ["range", "query", "section", "jsonPath"];
+
+function normalizeRead(value: unknown): ReadTelemetry | undefined {
+  const raw = value && typeof value === "object" ? value as Record<string, unknown> : undefined;
+  if (!raw || !READ_MODES.includes(raw.mode as ReadTelemetry["mode"])) return undefined;
+  return {
+    mode: raw.mode as ReadTelemetry["mode"],
+    ...(typeof raw.offset === "number" && Number.isFinite(raw.offset) ? { offset: raw.offset } : {}),
+    ...(typeof raw.matches === "number" && Number.isFinite(raw.matches) ? { matches: raw.matches } : {}),
+  };
+}
 export type TelemetryScope = "session" | "lifetime";
 
 export interface ContextEvent {
@@ -39,6 +60,7 @@ export interface ContextEvent {
   provider?: string;
   handle?: string;
   note?: string;
+  read?: ReadTelemetry;
 }
 
 export interface StrategySummary {
@@ -67,8 +89,17 @@ export interface ContextSummary {
   reductionRatio: number;
   mainContextReductionRatio: number;
   byStrategy: Record<string, StrategySummary>;
-  /** Whether boundary offloads were used: distinct handles, handles later read, and repeated source calls. */
-  offloadFollowUp: { handles: number; handlesRead: number; repeatedCalls: number };
+  /**
+   * Whether boundary offloads were used: distinct handles, handles later read,
+   * repeated source calls, and ctx_read calls by mode. rangeFromStart counts
+   * range reads at offset 0, which mostly re-read a preview's head.
+   */
+  offloadFollowUp: {
+    handles: number;
+    handlesRead: number;
+    repeatedCalls: number;
+    reads: { inProgram: number; range: number; rangeFromStart: number; query: number; queryMisses: number; section: number; jsonPath: number };
+  };
   largest?: ContextEvent;
 }
 
@@ -128,6 +159,7 @@ export class ContextTelemetry {
       provider?: string;
       handle?: string;
       note?: string;
+      read?: ReadTelemetry;
     },
   ): void {
     try {
@@ -158,6 +190,7 @@ export class ContextTelemetry {
         ...(event.provider ? { provider: event.provider.slice(0, 80) } : {}),
         ...(event.handle ? { handle: event.handle.slice(0, 120) } : {}),
         ...(event.note ? { note: event.note.replace(/[\r\n]+/g, " ").slice(0, 240) } : {}),
+        ...(normalizeRead(event.read) ? { read: normalizeRead(event.read) } : {}),
       };
       const path = this.path(workspaceRoot);
       appendFileSync(path, JSON.stringify(item) + "\n", "utf8");
@@ -233,10 +266,20 @@ export class ContextTelemetry {
     // ctx_* helpers carry the handle they were given, not a new boundary offload.
     const offloadHandles = new Set(events.filter(event => event.handle && (event.strategy === "WRITE" || event.strategy === "COMPRESS") && !event.tool.startsWith("ctx_")).map(event => event.handle!));
     const readHandles = new Set(events.filter(event => event.handle && (event.tool === "ctx_read" || event.tool === "ctx_summarize")).map(event => event.handle!));
+    const reads = events.filter(event => event.tool === "ctx_read" && event.read).map(event => ({ ...event.read!, inProgram: event.note === "internal CE helper result" }));
     const offloadFollowUp = {
       handles: offloadHandles.size,
       handlesRead: [...offloadHandles].filter(handle => readHandles.has(handle)).length,
       repeatedCalls: events.filter(event => event.note === REPEATED_OFFLOADED_CALL_NOTE).length,
+      reads: {
+        inProgram: reads.filter(read => read.inProgram).length,
+        range: reads.filter(read => read.mode === "range").length,
+        rangeFromStart: reads.filter(read => read.mode === "range" && read.offset === 0).length,
+        query: reads.filter(read => read.mode === "query").length,
+        queryMisses: reads.filter(read => read.mode === "query" && read.matches === 0).length,
+        section: reads.filter(read => read.mode === "section").length,
+        jsonPath: reads.filter(read => read.mode === "jsonPath").length,
+      },
     };
     const potentialMainTokens = mainTokensPrevented + mainTokensInjected;
     const mainContextReductionRatio = potentialMainTokens > 0 ? mainTokensPrevented / potentialMainTokens : 0;
@@ -333,6 +376,7 @@ export class ContextTelemetry {
       ...(typeof raw.provider === "string" ? { provider: raw.provider } : {}),
       ...(typeof raw.handle === "string" ? { handle: raw.handle } : {}),
       ...(typeof raw.note === "string" ? { note: raw.note } : {}),
+      ...(normalizeRead(raw.read) ? { read: normalizeRead(raw.read) } : {}),
     };
   }
 
