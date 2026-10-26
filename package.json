@@ -1,10 +1,11 @@
 {
   "name": "pi-context-engineer",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "type": "module",
   "description": "Keeps large Pi and Fabric tool results out of model context: offloads them to a local store behind a readable handle, compacts oversized errors and edit diffs, and records what it saved.",
   "keywords": [
     "pi-package",
+    "pi-extension",
     "pi",
     "pi-fabric",
     "context-engineering",
@@ -30,10 +31,6 @@
     "e2e": "npm run build && node .tmp/pi-ce-build/e2e.js",
     "test": "npm run verify"
   },
-  "types": [
-    "extension",
-    "skill"
-  ],
   "main": "src/index.ts",
   "files": [
     "src",
@@ -43,8 +40,8 @@
     "LICENSE"
   ],
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.80.0",
-    "@earendil-works/pi-coding-agent": ">=0.80.0",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
     "pi-fabric": "*",
     "typebox": "*"
   },
@@ -63,11 +60,7 @@
     "skills": [
       "./skills"
     ],
-    "providesTools": [
-      "ctx_read",
-      "ctx_summarize",
-      "ctx_offload"
-    ]
+    "image": "https://raw.githubusercontent.com/p-yan-6908/pi-context-engineer/main/media/cover.svg"
   },
   "devDependencies": {
     "typescript": "^5.9.3"

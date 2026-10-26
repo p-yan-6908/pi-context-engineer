@@ -1,5 +1,7 @@
 # pi-context-engineer
 
+![pi-context-engineer: large tool results go to a local store; the model gets a handle and an outline](media/cover.svg)
+
 A [Pi](https://github.com/badlogic/pi-mono) extension that keeps large tool results out of the model's context. When a result reaching the model is over 16 KB, Context Engineer (CE) stores the full text in a local store and shows the model a short preview and a handle instead. `ctx_read` reads any part of it back on demand.
 
 It works with ordinary Pi tools and with [Pi Fabric](https://github.com/monotykamary/pi-fabric)'s `fabric_exec`, and leaves [Pi Fovea](https://github.com/monotykamary/pi-fovea) results alone when they fit the budget the call asked for.

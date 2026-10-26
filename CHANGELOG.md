@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.1
+
+### Packaging
+
+- Follows the Pi package conventions for the [pi.dev](https://pi.dev/packages) gallery: a cover image through `pi.image`, the `pi-extension` keyword, and `"*"` ranges for the host-provided peers `@earendil-works/pi-ai` and `@earendil-works/pi-coding-agent`, as the package docs ask.
+- Drops the `types` and `pi.providesTools` fields. Neither Pi, Fabric nor the gallery reads them, and `types` is TypeScript's declaration-entry field.
+
 ## 0.8.0
 
 Changes below are based on 1,456 offloads across 56 of 295 recorded Pi sessions, all from before 0.7.0.

@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="330" viewBox="0 0 1100 330" role="img" aria-labelledby="title desc">
+  <title id="title">pi-context-engineer cover</title>
+  <desc id="desc">A large tool result flows into a local store. The model sees only a short notice with a handle and an outline of the result, and reads back the part it needs.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b0f14"/>
+      <stop offset="1" stop-color="#121b26"/>
+    </linearGradient>
+    <pattern id="grid" width="22" height="22" patternUnits="userSpaceOnUse">
+      <path d="M22 0H0V22" fill="none" stroke="#ffffff" stroke-opacity="0.035"/>
+    </pattern>
+    <linearGradient id="fadeDown" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0.55" stop-color="#0f141b" stop-opacity="0"/>
+      <stop offset="1" stop-color="#0f141b" stop-opacity="1"/>
+    </linearGradient>
+    <linearGradient id="flow" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#3fb6a8" stop-opacity="0.15"/>
+      <stop offset="1" stop-color="#3fb6a8" stop-opacity="0.95"/>
+    </linearGradient>
+    <clipPath id="resultClip">
+      <rect x="40" y="112" width="300" height="190" rx="10"/>
+    </clipPath>
+  </defs>
+
+  <rect width="1100" height="330" fill="url(#bg)"/>
+  <rect width="1100" height="330" fill="url(#grid)"/>
+
+  <g font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <text x="40" y="58" font-size="32" font-weight="700" fill="#e6edf3">pi-context-engineer</text>
+    <text x="40" y="88" font-size="16" fill="#8b949e">Large tool results stay out of context. The model gets a handle and an index, and reads back only what it needs.</text>
+  </g>
+
+  <!-- The full tool result -->
+  <g clip-path="url(#resultClip)">
+    <rect x="40" y="112" width="300" height="190" fill="#0f141b"/>
+    <g fill="#6e7681" fill-opacity="0.55">
+      <rect x="58" y="150" width="212" height="5" rx="2.5"/>
+      <rect x="58" y="162" width="148" height="5" rx="2.5"/>
+      <rect x="74" y="174" width="236" height="5" rx="2.5"/>
+      <rect x="74" y="186" width="170" height="5" rx="2.5"/>
+      <rect x="58" y="210" width="196" height="5" rx="2.5"/>
+      <rect x="74" y="222" width="120" height="5" rx="2.5"/>
+      <rect x="74" y="234" width="222" height="5" rx="2.5"/>
+      <rect x="58" y="258" width="176" height="5" rx="2.5"/>
+      <rect x="74" y="270" width="240" height="5" rx="2.5"/>
+      <rect x="74" y="282" width="132" height="5" rx="2.5"/>
+      <rect x="58" y="294" width="204" height="5" rx="2.5"/>
+    </g>
+    <g fill="#e3b341" fill-opacity="0.85">
+      <rect x="58" y="138" width="120" height="5" rx="2.5"/>
+      <rect x="58" y="198" width="104" height="5" rx="2.5"/>
+      <rect x="58" y="246" width="132" height="5" rx="2.5"/>
+    </g>
+    <rect x="40" y="112" width="300" height="190" fill="url(#fadeDown)"/>
+  </g>
+  <rect x="40.5" y="112.5" width="299" height="189" rx="10" fill="none" stroke="#30363d"/>
+  <text x="58" y="128" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#8b949e">fabric_exec result · 99,197 bytes</text>
+
+  <!-- Into the store -->
+  <path d="M352 207 H430" stroke="url(#flow)" stroke-width="3" stroke-linecap="round" stroke-dasharray="8 7">
+    <animate attributeName="stroke-dashoffset" from="30" to="0" dur="1.6s" repeatCount="indefinite"/>
+  </path>
+  <path d="M424 200 L432 207 L424 214" fill="none" stroke="#3fb6a8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <g stroke="#3fb6a8" stroke-width="2" fill="#0f1a1c">
+    <path d="M446 172 v70 a46 13 0 0 0 92 0 v-70"/>
+    <ellipse cx="492" cy="172" rx="46" ry="13"/>
+    <path d="M446 196 a46 13 0 0 0 92 0" fill="none" stroke-opacity="0.6"/>
+    <path d="M446 220 a46 13 0 0 0 92 0" fill="none" stroke-opacity="0.6"/>
+  </g>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle">
+    <text x="492" y="278" font-size="11" fill="#8b949e">.pi/context-store</text>
+    <text x="492" y="298" font-size="12" fill="#3fb6a8">~24,800 → ~680 tokens</text>
+  </g>
+
+  <!-- What the model sees -->
+  <path d="M552 207 H596" stroke="url(#flow)" stroke-width="3" stroke-linecap="round" stroke-dasharray="8 7">
+    <animate attributeName="stroke-dashoffset" from="30" to="0" dur="1.6s" repeatCount="indefinite"/>
+  </path>
+  <path d="M590 200 L598 207 L590 214" fill="none" stroke="#3fb6a8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="610.5" y="112.5" width="449" height="189" rx="10" fill="#0f141b" stroke="#3fb6a8" stroke-opacity="0.7"/>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5">
+    <text x="628" y="139" fill="#e6edf3">[offloaded to handle "…-d2518y" — 99,197 bytes]</text>
+    <text x="628" y="162" fill="#79c0ff">ctx_read({ id, query: ["FAIL", "error"] })</text>
+    <text x="628" y="183" fill="#79c0ff">ctx_read({ id, offset: 416, length: 4096 })</text>
+    <text x="628" y="211" fill="#8b949e">Code outline, 5 parts of 99,197 bytes:</text>
+    <text x="628" y="233" fill="#e3b341">===== src/index.ts =====  <tspan fill="#8b949e">[offset 5821]</tspan></text>
+    <text x="628" y="255" fill="#e3b341">===== src/preview.ts =====  <tspan fill="#8b949e">[offset 43319]</tspan></text>
+    <text x="628" y="277" fill="#e3b341">===== src/store.ts =====  <tspan fill="#8b949e">[offset 65326]</tspan></text>
+  </g>
+</svg>
