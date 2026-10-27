@@ -56,13 +56,13 @@ try {
   writeFileSync(artifact, full);
   const notice = (path: string, chars = full.length) => `\n\n[Full output (${chars} chars) saved to: ${path}]`;
   const visible = `${full.slice(0, 20_000)}\n…\n${full.slice(-20_000)}${notice(artifact)}`;
-  const boundary = async (text: string) => {
+  const boundary = async (text: string, isError = false, content: any[] = [{ type: "text", text }]) => {
     const handlers = new Map<string, Array<(event: any, ctx: any) => Promise<any>>>();
     contextEngineer({ on: (name: string, handler: any) => handlers.set(name, [...(handlers.get(name) ?? []), handler]), registerTool() {}, registerCommand() {} } as any);
     let result: any;
     for (const [name, event] of [
       ["tool_call", { toolName: "fabric_exec", toolCallId: "capped", input: { code: "return big" } }],
-      ["tool_result", { toolName: "fabric_exec", toolCallId: "capped", input: { code: "return big" }, details: {}, isError: false, content: [{ type: "text", text }] }],
+      ["tool_result", { toolName: "fabric_exec", toolCallId: "capped", input: { code: "return big" }, details: {}, isError, content }],
     ] as const) for (const handler of handlers.get(name) ?? []) result = (await handler(event, { cwd: root })) ?? result;
     const stored = new ContextStore(root).read(result.details.ce_handle, { length: Number.MAX_SAFE_INTEGER }).content;
     return { result, stored };
@@ -75,7 +75,26 @@ try {
   checks += 4;
   const mismatched = await boundary(`${full.slice(0, 20_000)}${notice(artifact, full.length + 1)}`);
   assert.ok(mismatched.stored.endsWith(notice(artifact, full.length + 1)) && mismatched.result.details.ce_fabric_full_output === undefined);
-  checks++;
+  assert.equal(mismatched.result.details.ce_fabric_output_incomplete, true);
+  assert.match(mismatched.result.content[0].text, /only Fabric's truncated output was stored/);
+  assert.ok(!mismatched.result.content[0].text.includes("full result stored"));
+  const missingVisible = `${full.slice(0, 20_000)}${notice(join(scratch, "missing", "output.txt"))}`;
+  const missing = await boundary(missingVisible);
+  assert.equal(missing.stored, missingVisible);
+  assert.equal(missing.result.details.ce_fabric_output_incomplete, true);
+  assert.match(missing.result.content[0].text, /full output artifact unavailable or rejected/);
+  const error = await boundary(missingVisible, true);
+  assert.equal(error.stored, missingVisible);
+  assert.equal(error.result.details.ce_fabric_output_incomplete, true);
+  assert.match(error.result.content[0].text, /Only Fabric's truncated output was stored/);
+  assert.ok(!error.result.content[0].text.includes("Full original text"));
+  const image = { type: "image", data: "abc", mimeType: "image/png" };
+  const multi = await boundary(missingVisible, false, [{ type: "text", text: "short note" }, image, { type: "text", text: missingVisible }]);
+  assert.equal(multi.result.details.ce_fabric_output_incomplete, true);
+  assert.deepEqual(multi.result.content[1], image);
+  assert.match(multi.result.content[2].text, /only Fabric's truncated output was stored/);
+  assert.deepEqual(JSON.parse(multi.stored).textBlocks, [{ index: 0, text: "short note" }, { index: 2, text: missingVisible }]);
+  checks += 15;
   // Only a Fabric output scratch file directly under the temp root qualifies.
   const elsewhere = join(root, "output.txt");
   writeFileSync(elsewhere, full);

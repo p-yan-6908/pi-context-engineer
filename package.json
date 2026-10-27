@@ -1,6 +1,6 @@
 {
   "name": "pi-context-engineer",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "type": "module",
   "description": "Keeps large Pi and Fabric tool results out of model context: offloads them to a local store behind a readable handle, compacts oversized errors and edit diffs, and records what it saved.",
   "keywords": [
@@ -27,14 +27,16 @@
   "scripts": {
     "typecheck": "tsc --noEmit --noUnusedLocals --noUnusedParameters --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck src/*.ts",
     "build": "rm -rf .tmp/pi-ce-build && tsc --outDir .tmp/pi-ce-build --rootDir src --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck src/*.ts",
-    "verify": "npm run build && node .tmp/pi-ce-build/verify.js && node .tmp/pi-ce-build/verify-hooks.js && node .tmp/pi-ce-build/verify-runtime.js && node .tmp/pi-ce-build/verify-fabric-child.js && node .tmp/pi-ce-build/verify-remediation.js",
+    "verify": "npm run build && node .tmp/pi-ce-build/verify.js && node .tmp/pi-ce-build/verify-hooks.js && node .tmp/pi-ce-build/verify-runtime.js && node .tmp/pi-ce-build/verify-fabric-child.js && node .tmp/pi-ce-build/verify-remediation.js && node .tmp/pi-ce-build/verify-efficiency.js",
     "e2e": "npm run build && node .tmp/pi-ce-build/e2e.js",
+    "benchmark": "npm run build && node .tmp/pi-ce-build/benchmark.js",
     "test": "npm run verify"
   },
   "main": "src/index.ts",
   "files": [
     "src",
     "skills",
+    "media",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
@@ -62,7 +64,13 @@
     ],
     "image": "https://raw.githubusercontent.com/p-yan-6908/pi-context-engineer/main/media/cover.svg"
   },
+  "overrides": {
+    "bowser": "2.11.0",
+    "undici": "8.12.2"
+  },
   "devDependencies": {
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
     "typescript": "^5.9.3"
   }
 }

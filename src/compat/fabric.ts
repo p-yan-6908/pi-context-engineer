@@ -94,6 +94,11 @@ const FABRIC_FULL_OUTPUT_NOTICE = /\n\n\[Full output \((\d+) chars\) saved to: (
 const FABRIC_OUTPUT_SCRATCH_PREFIX = "pi-fabric-output-";
 const MAX_FABRIC_FULL_OUTPUT_BYTES = 64 * 1024 * 1024;
 
+/** The visible Fabric result claims a complete output exists in a scratch artifact. */
+export function hasFabricFullOutputNotice(text: string): boolean {
+  return FABRIC_FULL_OUTPUT_NOTICE.test(text);
+}
+
 /**
  * The complete text behind a fabric_exec result that Fabric truncated, read
  * from its output artifact. Fabric marks that scratch directory for cleanup

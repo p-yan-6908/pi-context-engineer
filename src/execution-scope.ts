@@ -1,12 +1,4 @@
-/**
- * Execution-scoped tracking for Fabric programs.
- *
- * Pi exposes a stable toolCallId for each tool execution. Fabric prefixes the
- * host-side IDs it creates for nested tool calls with `fabric_`; use that
- * documented marker instead of treating every tool result as belonging to one
- * global depth counter.
- */
-
+/** Per-call execution lineage. No process-wide "a program is running" heuristic. */
 import { FABRIC_NESTED_TOOL_CALL_ID_PREFIX } from "./compat/fabric.js";
 export { FABRIC_NESTED_TOOL_CALL_ID_PREFIX };
 
@@ -18,31 +10,55 @@ export interface FabricExecutionScope {
 
 export class FabricExecutionScopes {
   private readonly active = new Map<string, FabricExecutionScope>();
+  private readonly parents = new Map<string, string>();
+  private readonly reads = new Map<string, Set<string>>();
+
+  /** Pi's native executeTool assigns arbitrary IDs and supplies explicit parent metadata. */
+  observeCall(toolCallId: string, parentToolCallId?: string): void {
+    if (parentToolCallId && parentToolCallId !== toolCallId) this.parents.set(toolCallId, parentToolCallId);
+  }
 
   start(scope: FabricExecutionScope): void {
     this.active.set(scope.toolCallId, scope);
   }
 
   finish(toolCallId: string): boolean {
+    this.parents.delete(toolCallId);
+    this.reads.delete(toolCallId);
     return this.active.delete(toolCallId);
   }
 
-  /** True when at least one Fabric execution is still awaiting its result. */
-  get size(): number {
-    return this.active.size;
+  get size(): number { return this.active.size; }
+
+  isNestedToolResult(toolCallId: string, parentToolCallId?: string): boolean {
+    return !!parentToolCallId || this.parents.has(toolCallId) ||
+      toolCallId.startsWith(FABRIC_NESTED_TOOL_CALL_ID_PREFIX);
   }
 
-  /**
-   * Nested Fabric tool IDs are safe to preserve even when lifecycle events
-   * arrive out of order or the parent has already finished. The documented
-   * prefix is the durable boundary marker; non-prefixed IDs remain ordinary
-   * model-boundary calls.
-   */
-  isNestedToolResult(toolCallId: string): boolean {
-    return toolCallId.startsWith(FABRIC_NESTED_TOOL_CALL_ID_PREFIX);
+  /** Associate a handle read with its outermost calling tool, across arbitrary nesting. */
+  noteHandleRead(toolCallId: string, handle: string): void {
+    const visited = new Set<string>();
+    let root = toolCallId;
+    while (this.parents.has(root) && !visited.has(root)) {
+      visited.add(root);
+      root = this.parents.get(root)!;
+    }
+    if (root === toolCallId) return;
+    const handles = this.reads.get(root) ?? new Set<string>();
+    // Bound metadata without guessing ownership of concurrent executions.
+    if (handles.size < 64) handles.add(handle);
+    this.reads.set(root, handles);
+  }
+
+  takeReadHandles(toolCallId: string): string[] {
+    const handles = [...(this.reads.get(toolCallId) ?? [])];
+    this.reads.delete(toolCallId);
+    return handles;
   }
 
   clear(): void {
     this.active.clear();
+    this.parents.clear();
+    this.reads.clear();
   }
 }

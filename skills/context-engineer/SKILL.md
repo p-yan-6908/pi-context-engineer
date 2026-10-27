@@ -37,6 +37,9 @@ about doing that well.
 - **Handles live in the workspace store** (`.pi/context-store/`, one week and
   500 MB by default). `no stored result with id` means the handle expired, was
   evicted, or belongs to another working directory; only then re-run the source.
+- **Notices stay cheap.** A notice gives one payload-specific recovery example;
+  a handle already introduced in the session omits its preview. Automatic
+  replacements must save bytes rather than expand output.
 - **Handles nest.** If a program that reads handles returns too much, its
   return is offloaded again and the notice says so. Narrow the selection
   instead of reading the new handle back whole.
@@ -55,9 +58,9 @@ about doing that well.
    (Rule #1).
 6. **Need a digest rather than a slice?** → `ctx_summarize`
    (`structural` / `code`).
-7. **Need to filter, count or join across the whole payload?** → inside
-   `fabric_exec`, `(await extensions.ctx_read({ id })).text` returns up to
-   512 KB. Filter with code and return only the result.
+7. **Need to filter, count or join across the whole payload?** → use a
+   whole-payload literal `query` for line counts, or page inside `fabric_exec`
+   using `nextOffset` and aggregate in code. One read returns at most 512 KB.
 
 ## Rule #1: payload type decides the access mode
 
@@ -79,7 +82,16 @@ call `ctx_read` directly. At the boundary a result shows the selected text
 under a header such as `[ctx_read "id": bytes 4096-8192 of 20090]` and stays
 under the offload threshold. In a program the cap is 512 KB: `.text` is the
 selected text and `.details.result` holds `totalBytes`, `nextOffset`,
-`totalMatches` and the rest.
+`totalMatches`, `nextCursor` and the rest. Program `.text` does not include a
+paging note: check `nextOffset` / `truncated` before treating it as complete.
+
+Query context windows are merged instead of repeating overlapping lines.
+`maxMatches` limits matching lines per page; `totalMatches` counts the scanned
+payload. When `nextCursor` is present, continue only if needed with the same
+`id`, `query`, `regex`, `ignoreCase` and `contextLines`, plus `cursor: nextCursor`.
+You may change page size. Cursors page long UTF-8 lines too; do not replace them
+with byte offsets. Regex totals cover only the first 512 KB when
+`scanTruncated` is true.
 
 ```ts
 // search: a field name or any occurrence inside the handle
@@ -91,9 +103,9 @@ await extensions.ctx_read({ id, query: ["perTool", "returnFlow"] });
 // byte range: start at an offset from the preview; continue at nextOffset
 await extensions.ctx_read({ id, offset: 4351, length: 4000 });
 
-// whole payload, filtered in the program
-const lines = (await extensions.ctx_read({ id })).text.split("\n");
-return lines.filter((line) => line.includes("FAIL")).length;
+// Count matching lines over the whole payload without returning all matches.
+const count = await extensions.ctx_read({ id, query: "FAIL", contextLines: 0, maxMatches: 1 });
+return count.details.result.totalMatches;
 
 // one section of a Fabric sectioned result, paged inside the section
 await extensions.ctx_read({ id, section: "details.diff", offset: 0, length: 4000 });
@@ -114,13 +126,31 @@ you never store: project large structured input to a compact representation
 Offload is the fallback, not step one.
 
 **R1 — auto-offloaded result → targeted reads.** The preview is already in
-context; read what it leaves out, or filter the whole payload in a program:
+context; read what it leaves out, or search the whole payload for matching lines:
 
 ```ts
-const part = (await extensions.ctx_read({ id, offset: 4351, length: 4000 })).text;
-const hits = (await extensions.ctx_read({ id, query: ["perTool", "returnFlow"] })).text;
-const all = (await extensions.ctx_read({ id })).text;
-return all.split("\n").filter((line) => line.startsWith("ERROR")).slice(0, 20);
+const hits = await extensions.ctx_read({ id, query: "ERROR", contextLines: 0, maxMatches: 20 });
+return hits.text;
+```
+
+For operations that cannot use a literal query, page through the complete
+payload. Keep a partial line between pages; `.text` alone does not show that
+more bytes remain:
+
+```ts
+let offset = 0, carry = "", errors = 0;
+for (;;) {
+  const page = await extensions.ctx_read({ id, offset });
+  const lines = (carry + page.text).split("\n");
+  carry = lines.pop() ?? "";
+  errors += lines.filter((line) => line.startsWith("ERROR")).length;
+  const next = page.details.result.nextOffset;
+  if (next === undefined) break;
+  if (next <= offset) throw new Error("ctx_read did not advance");
+  offset = next;
+}
+if (carry.startsWith("ERROR")) errors++;
+return errors;
 ```
 
 Return `.text` or a digest, never the whole read object: its envelope repeats
@@ -150,7 +180,8 @@ return s.text; // project to .text — don't re-serialize the envelope
 | `JSON path ... was not found` | structure differs from expectation | read a small window first, then re-path |
 | `invalid bracket segment "0:5"` or `"*"` | slices and wildcards are unsupported | `$.a[0].b` per index, or `query` |
 | `has no section "…"; available: …` | wrong section name | use a name from the error or the preview |
-| `is not a Fabric sectioned result` | `section` on a plain or JSON handle | `query` / `offset`+`length` / `jsonPath` |
+| `is not a Fabric sectioned result` / `ambiguous section boundaries` | `section` on a plain, JSON, or ambiguously formatted handle | `query` / `offset`+`length`; use `jsonPath` only for JSON |
+| `invalid query cursor` | handle or query options changed, or cursor is malformed | reuse `nextCursor` with the same handle and query options |
 | `no stored result with id` / `has expired` | expired, evicted, or another working directory | re-run the source call |
 | `No matches for "a b c"` with per-word counts | a phrase is one literal string | pass the suggested array, e.g. `query: ["a", "c"]` |
 | `No matches` with `match ignoring case` | case differs | add `ignoreCase: true` |
@@ -171,8 +202,10 @@ instead of offloading. Other CE/Fovea extension tools remain opt-in; explicit
   limits; history lives in the session/memory layer.
 - **Not a search engine.** `query` searches one handle; corpus-wide search
   belongs to grep/Fovea.
-- **Not a gate to fight.** Nothing is blocked: small results pass through
-  untouched and large ones are offloaded after they run.
+- **Not a gate to fight.** Nothing is blocked. Small results usually pass
+  through; an optional soft `turnBudgetBytes` can offload later results in the
+  same turn even below the per-result threshold. Exact recovery and minimum
+  savings take priority over that soft limit. Exposed history never changes.
 
 ## Tools
 

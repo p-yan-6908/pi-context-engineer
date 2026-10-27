@@ -1,8 +1,9 @@
 /**
  * Lightweight context telemetry.
  *
- * Events intentionally contain sizes, strategies, tool names, and handles only;
+ * New events contain sizes, strategies, tool names, and handle fingerprints;
  * they never contain prompts, source text, command arguments, or tool payloads.
+ * Older event files can contain raw handle labels and are normalized on read.
  *
  * The accounting domains are deliberately separate:
  *   - mainTokensPrevented: potential Main-bound tokens withheld by CE;
@@ -10,9 +11,10 @@
  *   - storeTokensWritten: payload tokens persisted for later retrieval.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { constants as osConstants } from "node:os";
 
 /** Note on a call repeated after its result was offloaded; see offloadFollowUp. */
 export const REPEATED_OFFLOADED_CALL_NOTE = "repeated a call whose result is already offloaded";
@@ -29,6 +31,7 @@ export interface ReadTelemetry {
 }
 
 const READ_MODES: ReadonlyArray<ReadTelemetry["mode"]> = ["range", "query", "section", "jsonPath"];
+const SAFE_ERROR_CODES = new Set(Object.keys(osConstants.errno));
 
 function normalizeRead(value: unknown): ReadTelemetry | undefined {
   const raw = value && typeof value === "object" ? value as Record<string, unknown> : undefined;
@@ -39,10 +42,20 @@ function normalizeRead(value: unknown): ReadTelemetry | undefined {
     ...(typeof raw.matches === "number" && Number.isFinite(raw.matches) ? { matches: raw.matches } : {}),
   };
 }
+function fingerprintHandle(value: string): string {
+  const handle = value.slice(0, 120);
+  if (/^sha256:[a-f0-9]{64}$/.test(handle)) return handle;
+  return `sha256:${createHash("sha256").update(handle, "utf8").digest("hex")}`;
+}
+function normalizeHandles(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const handles = [...new Set(value.filter((h): h is string => typeof h === "string" && h.length > 0).map(fingerprintHandle))].slice(0, 64);
+  return handles.length ? handles : undefined;
+}
 export type TelemetryScope = "session" | "lifetime";
 
 export interface ContextEvent {
-  version: 2;
+  version: 3;
   timestamp: string;
   sessionId: string;
   strategy: ContextStrategy;
@@ -61,10 +74,14 @@ export interface ContextEvent {
   handle?: string;
   note?: string;
   read?: ReadTelemetry;
+  /** Handles consumed inside this tool's program; never their contents. */
+  derivedFrom?: string[];
 }
 
 export interface StrategySummary {
   events: number;
+  readbackTokens: number;
+  netTokensSaved: number;
   sourceTokens: number;
   visibleTokens: number;
   savedTokens: number;
@@ -81,6 +98,10 @@ export interface ContextSummary {
   sourceTokens: number;
   visibleTokens: number;
   savedTokens: number;
+  /** Model-visible handle retrievals and handle-derived final outputs. */
+  readbackTokens: number;
+  /** Gross prevention minus readback exposure, without crediting derived offloads again. */
+  netTokensSaved: number;
   /** Explicit accounting domains. */
   mainTokensPrevented: number;
   mainTokensInjected: number;
@@ -160,11 +181,12 @@ export class ContextTelemetry {
       handle?: string;
       note?: string;
       read?: ReadTelemetry;
+      derivedFrom?: string[];
     },
   ): void {
     try {
       const directory = resolve(workspaceRoot, ".pi/context-store");
-      if (!existsSync(directory)) mkdirSync(directory, { recursive: true });
+      if (!existsSync(directory)) mkdirSync(directory, { recursive: true, mode: 0o700 });
       const sourceBytes = safeNumber(event.sourceBytes);
       const visibleBytes = safeNumber(event.visibleBytes);
       const sourceTokens = event.sourceTokens === undefined ? estimateTokens(sourceBytes) : safeNumber(event.sourceTokens);
@@ -174,7 +196,7 @@ export class ContextTelemetry {
         ? Math.max(0, sourceTokens - visibleTokens)
         : safeNumber(event.mainTokensPrevented);
       const item: ContextEvent = {
-        version: 2,
+        version: 3,
         timestamp: new Date().toISOString(),
         sessionId: this.sessionId,
         strategy: event.strategy,
@@ -188,12 +210,13 @@ export class ContextTelemetry {
         mainTokensInjected,
         storeTokensWritten: safeNumber(event.storeTokensWritten),
         ...(event.provider ? { provider: event.provider.slice(0, 80) } : {}),
-        ...(event.handle ? { handle: event.handle.slice(0, 120) } : {}),
+        ...(event.handle ? { handle: fingerprintHandle(event.handle) } : {}),
         ...(event.note ? { note: event.note.replace(/[\r\n]+/g, " ").slice(0, 240) } : {}),
         ...(normalizeRead(event.read) ? { read: normalizeRead(event.read) } : {}),
+        ...(normalizeHandles(event.derivedFrom) ? { derivedFrom: normalizeHandles(event.derivedFrom) } : {}),
       };
       const path = this.path(workspaceRoot);
-      appendFileSync(path, JSON.stringify(item) + "\n", "utf8");
+      appendFileSync(path, JSON.stringify(item) + "\n", { encoding: "utf8", mode: 0o600 });
       this.trimIfNeeded(path);
     } catch {
       // Telemetry must never interfere with tool execution.
@@ -208,7 +231,9 @@ export class ContextTelemetry {
    */
   recordStorageFailure(workspaceRoot: string, tool: string, detail?: unknown): void {
     try {
-      const message = detail instanceof Error ? detail.message : typeof detail === "string" ? detail : "store unavailable";
+      // Error messages can contain paths or user input; record only a safe code.
+      const rawCode = detail && typeof detail === "object" ? (detail as { code?: unknown }).code : undefined;
+      const message = typeof rawCode === "string" && SAFE_ERROR_CODES.has(rawCode) ? rawCode : "unknown";
       this.record(workspaceRoot, {
         strategy: "WRITE",
         tool,
@@ -227,7 +252,17 @@ export class ContextTelemetry {
   }
 
   private summarizeScope(workspaceRoot: string, scope: TelemetryScope): ContextSummary {
-    const events = this.read(workspaceRoot).filter((event) => scope === "lifetime" || event.sessionId === this.sessionId);
+    const history = this.read(workspaceRoot);
+    const boundaryHandles = new Set<string>();
+    const readbacks = new Set<ContextEvent>();
+    // Resolve provenance chronologically before selecting a session: a read in
+    // this session can consume a handle introduced in a previous one.
+    for (const event of history) {
+      if (event.derivedFrom?.some(handle => boundaryHandles.has(handle)) ||
+        ((event.tool === "ctx_read" || event.tool === "ctx_summarize") && !!event.handle && boundaryHandles.has(event.handle))) readbacks.add(event);
+      if (event.handle && (event.strategy === "WRITE" || event.strategy === "COMPRESS") && !event.tool.startsWith("ctx_")) boundaryHandles.add(event.handle);
+    }
+    const events = history.filter((event) => scope === "lifetime" || event.sessionId === this.sessionId);
     const byStrategy: Record<string, StrategySummary> = {};
     let sourceTokens = 0;
     let visibleTokens = 0;
@@ -235,9 +270,15 @@ export class ContextTelemetry {
     let mainTokensPrevented = 0;
     let mainTokensInjected = 0;
     let storeTokensWritten = 0;
+    let readbackTokens = 0;
+    let netTokensSaved = 0;
     let largest: ContextEvent | undefined;
 
     for (const event of events) {
+      const isReadback = readbacks.has(event);
+      const readback = isReadback ? event.mainTokensInjected : 0;
+      const net = isReadback ? -readback : event.mainTokensPrevented;
+      readbackTokens += readback; netTokensSaved += net;
       sourceTokens += event.sourceTokens;
       visibleTokens += event.visibleTokens;
       savedTokens += event.savedTokens;
@@ -245,7 +286,7 @@ export class ContextTelemetry {
       mainTokensInjected += event.mainTokensInjected;
       storeTokensWritten += event.storeTokensWritten;
       const bucket = byStrategy[event.strategy] ??= {
-        events: 0,
+        events: 0, readbackTokens: 0, netTokensSaved: 0,
         sourceTokens: 0,
         visibleTokens: 0,
         savedTokens: 0,
@@ -254,6 +295,7 @@ export class ContextTelemetry {
         storeTokensWritten: 0,
       };
       bucket.events++;
+      bucket.readbackTokens += readback; bucket.netTokensSaved += net;
       bucket.sourceTokens += event.sourceTokens;
       bucket.visibleTokens += event.visibleTokens;
       bucket.savedTokens += event.savedTokens;
@@ -287,6 +329,7 @@ export class ContextTelemetry {
       scope,
       ...(scope !== "lifetime" ? { sessionId: this.sessionId } : {}),
       events: events.length,
+      readbackTokens, netTokensSaved,
       sourceTokens,
       visibleTokens,
       savedTokens,
@@ -360,7 +403,7 @@ export class ContextTelemetry {
     const legacySaved = raw.savedTokens === undefined ? Math.max(0, sourceTokens - visibleTokens) : safeNumber(raw.savedTokens);
     const mainTokensPrevented = raw.mainTokensPrevented === undefined ? legacySaved : safeNumber(raw.mainTokensPrevented);
     return {
-      version: 2,
+      version: 3,
       timestamp: typeof raw.timestamp === "string" ? raw.timestamp : new Date(0).toISOString(),
       sessionId: raw.sessionId,
       strategy: raw.strategy,
@@ -374,9 +417,10 @@ export class ContextTelemetry {
       mainTokensInjected: raw.mainTokensInjected === undefined ? visibleTokens : safeNumber(raw.mainTokensInjected),
       storeTokensWritten: safeNumber(raw.storeTokensWritten),
       ...(typeof raw.provider === "string" ? { provider: raw.provider } : {}),
-      ...(typeof raw.handle === "string" ? { handle: raw.handle } : {}),
+      ...(typeof raw.handle === "string" && raw.handle ? { handle: fingerprintHandle(raw.handle) } : {}),
       ...(typeof raw.note === "string" ? { note: raw.note } : {}),
       ...(normalizeRead(raw.read) ? { read: normalizeRead(raw.read) } : {}),
+      ...(normalizeHandles(raw.derivedFrom) ? { derivedFrom: normalizeHandles(raw.derivedFrom) } : {}),
     };
   }
 

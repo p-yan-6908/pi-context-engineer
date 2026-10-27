@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.9.0
+
+- Admit automatic offloads before committing or evicting stored handles; rejected candidates leave the store unchanged.
+- Resolve nested Fabric section headers using declared lengths and fall back to exact byte ranges when shortened boundaries are ambiguous.
+- Fingerprint telemetry handle references, omit untrusted storage-error messages, and preserve cross-session accounting for legacy events. Existing telemetry is not deleted.
+- Clarify the Pi TypeScript-loader requirement for the projection export, include the README cover in packages, and typecheck in the publish workflow.
+- Preserve whitespace in Fabric section reads, and warn when Fabric's full-output artifact is unavailable instead of claiming a truncated fragment is complete.
+- Document safe paged program reads and whole-payload literal query counts. Require complete per-request benchmark usage and report incomplete arm totals as unknown.
+
+- Preserve native Pi `executeTool` intermediates using explicit parent-call lineage, with legacy Fabric IDs as a fallback. Native program reads keep their 512 KB budget and bare text without misclassifying concurrent model calls.
+- Merge overlapping query context and return query-bound `nextCursor` continuations. Page matches, context and oversized UTF-8 lines without skipping text; expose regex prefix scan limits explicitly.
+- Report `readbackTokens` and signed `netTokensSaved` alongside gross prevention. Attribute program-derived outputs and cross-session readbacks without crediting offload chains twice.
+- Use one payload-specific recovery example, omit repeated previews, and require `minimumSavingsBytes` (default 256) before automatic replacement. Export the non-mutating, opt-in `projectToolResult` utility.
+- Add optional soft `turnBudgetBytes` for cumulative new text without rewriting exposed history.
+- Add real native-Pi faux-provider regressions and an opt-in task-level CE-on/off benchmark with quality, input/cache usage, calls, latency and cost estimates. Resolve current Fabric bootstrap paths for CLI probes.
+- Test against Pi 1.4. Development resolution pins an available bowser tarball and patched undici; host-provided peer ranges remain unchanged.
+
 ## 0.8.1
 
 ### Packaging

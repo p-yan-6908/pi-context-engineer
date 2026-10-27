@@ -22,6 +22,7 @@ ${editAcknowledgement.details.patch}`;
 
 const huge = "工具📚".repeat(7000);
 const mixedJson = JSON.stringify({ catalog: Array.from({ length: 2000 }, (_, i) => ({ name: `tool_${i}`, schema: huge.slice(0, 50) })), check: { ok: true, path: "/project/library.blend", count: 4 } });
+const envText = "Blender 5.2\n/project/library.blend";
 const mixedYaml = `catalog: "<multi-line string, see section: catalog>"
 check:
   ok: true
@@ -31,8 +32,8 @@ env: "<multi-line string, see section: env>"
 --- catalog (${huge.length} chars) ---
 ${huge}
 
---- env (35 chars) ---
-Blender 5.2\n/project/library.blend`;
+--- env (${envText.length} chars) ---
+${envText}`;
 let checks = 0;
 function check(name: string, condition: boolean): void {
   assert.ok(condition, name);checks++;

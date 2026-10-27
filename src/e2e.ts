@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { resolveFabricExtension } from "./benchmark.js";
 
 export interface SmokeScenario {
   name: string;
@@ -40,9 +41,8 @@ export function runSmokeTests(): void {
   }
   if (!process.env.PI_MODEL) throw new Error("Set PI_MODEL explicitly before opting into provider-backed smoke tests.");
   const extension = resolve(".tmp/pi-ce-build/index.js");
-  const fabricExtension = resolve("node_modules/pi-fabric/dist/index.js");
+  const fabricExtension = resolveFabricExtension();
   if (!existsSync(extension)) throw new Error("Build CE first: .tmp/pi-ce-build/index.js is missing.");
-  if (!existsSync(fabricExtension)) throw new Error("Install the optional pi-fabric peer before running E2E smoke tests.");
   let failures = 0;
   for (const scenario of smokeScenarios) {
     const workspace = mkdtempSync(join(tmpdir(), "ce-smoke-"));

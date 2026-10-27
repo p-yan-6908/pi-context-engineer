@@ -89,7 +89,8 @@ const ctxRead: ToolDef = {
       jsonPath: { type: "string", description: "Dot/bracket JSON path for a stored JSON payload, e.g. $.results[0].name; no wildcards or slices. Overrides section/query/offset/length." },
       section: { type: "string", description: "Section name listed in a Fabric sectioned preview. Overrides query; offset/length page within the section." },
       contextLines: { type: "integer", description: "Lines of context around each query match. Default 2; clamped to 0-50." },
-      maxMatches: { type: "integer", description: "Maximum matching windows to format while still reporting exact totalMatches. Default 100; maximum 500." },
+      maxMatches: { type: "integer", description: "Maximum matching lines per query page; totalMatches counts the scanned payload. Default 100; maximum 500." },
+      cursor: { type: "string", description: "Query continuation from nextCursor. Keep the same id, query, regex, ignoreCase and contextLines; page size may change." },
     },
     required: ["id"],
   },
@@ -154,13 +155,18 @@ const ctxRead: ToolDef = {
         ignoreCase: args.ignoreCase === true,
         contextLines,
         maxMatches,
+        cursor: args.cursor as string | undefined,
+        maxBytes: budget,
       });
       if (!result.ok) {
         return { error: result.content, code: "stored_read_failed", isError: true as const };
       }
-      return capContent(result, budget, "narrow the query or reduce contextLines");
+      // Query pages are budgeted before formatting and carry a lossless cursor.
+      // Miss hints have no cursor and can still use the general content cap.
+      return result.totalMatches ? result : capContent(result, budget, "narrow the query or reduce contextLines");
     }
 
+    if (args.cursor !== undefined) return { error: "cursor requires a query.", code: "invalid_cursor", isError: true as const };
     const requested = args.length as number | undefined;
     const result = await ctx.store.read(id, {
       offset: args.offset as number | undefined,

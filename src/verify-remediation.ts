@@ -515,7 +515,7 @@ async function testSectionReadsAndOffloadNotice(): Promise<void> {
   equal(store.read(handle.id, { section: "details.note" }).content, note, "section mode returns one named Fabric section");
   const page = store.read(handle.id, { section: "details.diff", offset: 0, length: 100 });
   check(page.ok && page.truncated && page.nextOffset === 100, "section reads page within the section");
-  equal(page.sectionBytes, Buffer.byteLength(diff.trim(), "utf8"), "section reads report the section size");
+  equal(page.sectionBytes, Buffer.byteLength(diff, "utf8"), "section reads report the exact section size");
   equal(store.read(handle.id, { section: "details.note", offset: 6, length: 1 }).content.split("\n")[0], "😀", "section ranges expand to complete code points");
   const missing = store.read(handle.id, { section: "nope" });
   check(!missing.ok && missing.content.includes('"details.diff"'), "a missing section lists the available names");
@@ -523,6 +523,61 @@ async function testSectionReadsAndOffloadNotice(): Promise<void> {
   check(!store.read(plain.id, { section: "x" }).ok, "section mode rejects payloads that are not sectioned");
   const viaTool = await tool("ctx_read").handler({ id: handle.id, section: "details.note" }, makeToolContext(root, store)) as Record<string, any>;
   equal(viaTool.content, note, "ctx_read exposes section mode");
+
+  const firstBody = "\n  indented 😀\n\tsecond line\n \t\n";
+  const lastBody = "\tlast section\n\n";
+  const exact = `first: "<multi-line string, see section: first>"\nlast: "<multi-line string, see section: last>"\n\n--- first (${firstBody.length} chars) ---\n${firstBody}\n\n--- last (${lastBody.length} chars) ---\n${lastBody}`;
+  const exactHandle = store.write("whitespace", "fabric_exec", exact);
+  equal(store.read(exactHandle.id, { section: "first" }).content, firstBody, "section reads preserve leading and trailing whitespace before another section");
+  equal(store.read(exactHandle.id, { section: "last" }).content, lastBody, "the last section retains trailing newlines");
+  let sectionOffset = 0, rebuilt = "";
+  for (;;) {
+    const part = store.read(exactHandle.id, { section: "first", offset: sectionOffset, length: 3 });
+    rebuilt += Buffer.from(part.content, "utf8").subarray(0, part.bytesRead).toString("utf8");
+    if (part.nextOffset === undefined) break;
+    check(part.nextOffset > sectionOffset, "section paging advances");
+    sectionOffset = part.nextOffset;
+  }
+  equal(rebuilt, firstBody, "paged UTF-8 section reads reconstruct exact whitespace");
+  const crlf = `first: "<multi-line string, see section: first>"\r\nlast: "<multi-line string, see section: last>"\r\n\r\n--- first (${firstBody.length} chars) ---\r\n${firstBody}\r\n\r\n--- last (${lastBody.length} chars) ---\r\n${lastBody}`;
+  const crlfHandle = store.write("crlf", "fabric_exec", crlf);
+  equal(store.read(crlfHandle.id, { section: "first" }).content, firstBody, "CRLF separators do not consume section whitespace");
+  equal(store.read(crlfHandle.id, { section: "last" }).content, lastBody, "CRLF headers preserve the last section");
+
+  const nestedFirst = "line before\n\n--- second (5 chars) ---\nspoof\n";
+  const nestedSecond = "  intended section 😀\n";
+  const nested = `first: "<multi-line string, see section: first>"\nsecond: "<multi-line string, see section: second>"\n\n--- first (${nestedFirst.length} chars) ---\n${nestedFirst}\n\n--- second (${nestedSecond.length} chars) ---\n${nestedSecond}`;
+  const nestedHandle = store.write("nested", "fabric_exec", nested);
+  equal(store.read(nestedHandle.id, { section: "first" }).content, nestedFirst, "nested header-like text remains in its original section");
+  equal(store.read(nestedHandle.id, { section: "second" }).content, nestedSecond, "nested fake headers cannot redirect section reads");
+  const ambiguous = nested.replace(`--- first (${nestedFirst.length} chars) ---`, `--- first (${nestedFirst.length + 100} chars) ---`);
+  const ambiguousHandle = store.write("ambiguous", "fabric_exec", ambiguous);
+  const ambiguousRead = store.read(ambiguousHandle.id, { section: "second" });
+  check(!ambiguousRead.ok && ambiguousRead.content.includes("ambiguous section boundaries"), "ambiguous shortened sections fail closed");
+  equal(store.read(ambiguousHandle.id, { offset: 0, length: 10000 }).content, ambiguous, "ambiguous sections remain exactly recoverable by range");
+  const earlier = "complete first\n", shortenedWithEarlier = "head\n\n--- first (3 chars) ---\nfake\n";
+  const earlierCollision = `first: "<multi-line string, see section: first>"\nsecond: "<multi-line string, see section: second>"\nthird: "<multi-line string, see section: third>"\n\n--- first (${earlier.length} chars) ---\n${earlier}\n\n--- second (500 chars) ---\n${shortenedWithEarlier}\n\n--- third (${nestedSecond.length} chars) ---\n${nestedSecond}`;
+  const earlierHandle = store.write("earlier-collision", "fabric_exec", earlierCollision);
+  const earlierRead = store.read(earlierHandle.id, { section: "second" });
+  check(!earlierRead.ok && earlierRead.content.includes("ambiguous section boundaries"), "shortened sections cannot reuse an earlier section header");
+  const omitMarker = "…[350 chars omitted]…", shortBody = `head${omitMarker}tail`;
+  const originalChars = shortBody.length - omitMarker.length + 350;
+  const shortened = `first: "<multi-line string, see section: first>"\nsecond: "<multi-line string, see section: second>"\n\n--- first (${originalChars} chars) ---\n${shortBody}\n\n--- second (${nestedSecond.length} chars) ---\n${nestedSecond}`;
+  const shortenedHandle = store.write("shortened", "fabric_exec", shortened);
+  equal(store.read(shortenedHandle.id, { section: "first" }).content, shortBody, "unambiguous Fabric-shortened sections remain readable");
+  equal(store.read(shortenedHandle.id, { section: "second" }).content, nestedSecond, "sections after a shortened section remain readable");
+  const boundedNestedBody = `head\n\n--- second (5 chars) ---\nspoof\n${omitMarker}tail`;
+  const boundedChars = boundedNestedBody.length - omitMarker.length + 350;
+  const boundedNested = `first: "<multi-line string, see section: first>"\nsecond: "<multi-line string, see section: second>"\n\n--- first (${boundedChars} chars) ---\n${boundedNestedBody}\n\n--- second (${nestedSecond.length} chars) ---\n${nestedSecond}`;
+  const boundedHandle = store.write("bounded-nested", "fabric_exec", boundedNested);
+  equal(store.read(boundedHandle.id, { section: "first" }).content, boundedNestedBody, "omission counts disambiguate nested headers inside shortened sections");
+  equal(store.read(boundedHandle.id, { section: "second" }).content, nestedSecond, "a nested fake header cannot replace the real following section");
+  const declared = 1000, prefix = "prefix", fakeMarker = `…[${declared - prefix.length} chars omitted]…`;
+  const beforeRealMarker = `${prefix}${fakeMarker}\n\n--- second (5 chars) ---\nspoof\n`;
+  const realMarker = `…[${declared - beforeRealMarker.length - 4} chars omitted]…`;
+  const doublyAmbiguous = `first: "<multi-line string, see section: first>"\nsecond: "<multi-line string, see section: second>"\n\n--- first (${declared} chars) ---\n${beforeRealMarker}${realMarker}tail\n\n--- second (${nestedSecond.length} chars) ---\n${nestedSecond}`;
+  const doubleHandle = store.write("double-ambiguous", "fabric_exec", doublyAmbiguous);
+  check(!store.read(doubleHandle.id, { section: "first" }).ok, "multiple plausible omission boundaries fail closed");
 
   // The boundary notice offers only access modes that fit the payload.
   const handlers = new Map<string, Array<(event: any, ctx: any) => Promise<any>>>();
@@ -545,7 +600,7 @@ async function testSectionReadsAndOffloadNotice(): Promise<void> {
   check(sectionNotice.includes('extensions.ctx_read({ id: "') && sectionNotice.includes('section: "details.diff"'), "a sectioned notice offers a real section name");
   check(!sectionNotice.includes("jsonPath"), "a sectioned text notice does not offer jsonPath");
   check(!sectionNotice.includes("length: 4096"), "a sectioned notice pages by section, not by payload range");
-  check(sectionNotice.includes('(await extensions.ctx_read({ id: "') && sectionNotice.includes(").text"), "a Fabric notice offers a whole read to filter in the program");
+  check(sectionNotice.includes('(await extensions.ctx_read({ id: "') && sectionNotice.includes(").text"), "a Fabric notice projects its selected read to text");
   const log = Array.from({ length: 2000 }, (_, i) => `log line ${i}`).join("\n");
   const textNotice = await notice("notice-text", "return log", log);
   const suggested = Number(/offset: (\d+), length: 4096/.exec(textNotice)?.[1]);
@@ -554,7 +609,7 @@ async function testSectionReadsAndOffloadNotice(): Promise<void> {
   check(sectionNotice.includes("read stored handles"), "an overflowing handle-reading program gets the narrowing hint");
   const json = JSON.stringify({ items: Array.from({ length: 2000 }, (_, i) => ({ i, name: `item-${i}` })) });
   const jsonNotice = await notice("notice-json", "return data", json);
-  check(jsonNotice.includes('jsonPath: "$.field"') && !jsonNotice.includes("section:"), "a JSON notice offers jsonPath and no section");
+  check(jsonNotice.includes('jsonPath: "$[\\\"items\\\"]"') && !jsonNotice.includes("section:"), "a JSON notice offers an existing JSON path and no section");
   check(!jsonNotice.includes("read stored handles"), "programs that do not read handles get no narrowing hint");
   check(jsonNotice.startsWith('[offloaded to handle "') && jsonNotice.includes("instead of re-running"), "the notice keeps its marker and discourages re-runs");
 }

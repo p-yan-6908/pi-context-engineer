@@ -100,8 +100,12 @@ export interface ReadOptions {
   section?: string;
   /** Lines of context around each query match. */
   contextLines?: number;
-  /** Maximum matching windows to format while still counting every match. */
+  /** Maximum matching source lines per page, while counting every match. */
   maxMatches?: number;
+  /** Opaque continuation from nextCursor; tied to this handle and query options. */
+  cursor?: string;
+  /** Internal serialized-result budget for query paging. */
+  maxBytes?: number;
 }
 
 export interface ReadResult {
@@ -128,6 +132,10 @@ export interface ReadResult {
   matchedLines?: number[];
   /** Total query matches when matchedLines is later metadata-capped. */
   totalMatches?: number;
+  /** Continue a query with the same options and this cursor. */
+  nextCursor?: string;
+  /** Regex totals cover only the scanned prefix when true. */
+  scanTruncated?: boolean;
   /** Lines matching each term of a multi-term query, or each word of a phrase that matched nothing. */
   termMatches?: Record<string, number>;
   truncated: boolean;
@@ -251,24 +259,25 @@ export class ContextStore {
     data: string,
     writeOptions: StoreWriteOptions = {},
   ): StoreHandle {
+    return this.writeIf(key, source, data, () => true, writeOptions)!;
+  }
+
+  /** Decide with the exact handle before writing, refreshing, or evicting anything. */
+  writeIf(
+    key: string,
+    source: string,
+    data: string,
+    admit: (handle: StoreHandle) => boolean,
+    writeOptions: StoreWriteOptions = {},
+  ): StoreHandle | undefined {
     const bytes = Buffer.byteLength(data, "utf8");
     const contentHash = this.hash(data);
 
     return this.withLock(() => {
       let entries = this.loadAll();
-      entries = this.cleanEntries(entries);
-
       const now = new Date().toISOString();
-      const existingByHash = entries.find((entry) => entry.contentHash === contentHash && !this.isExpired(entry));
-      if (existingByHash) {
-        existingByHash.lastAccessed = now;
-        existingByHash.updatedAt = now;
-        this.writeIndex(entries);
-        this.gcLocked(existingByHash.id);
-        return this.handleResult(existingByHash, data);
-      }
-
-      const entry: StoreMetadata = {
+      const existingByHash = entries.find((entry) => entry.contentHash === contentHash && !this.isExpired(entry) && this.hasUsableBlob(entry));
+      const entry: StoreMetadata = existingByHash ?? {
         id: this.makeId(key, contentHash),
         key,
         created: now,
@@ -287,11 +296,19 @@ export class ContextStore {
             : {}),
       };
 
-      this.writeBlob(entry.blobPath, data);
-      entries.push(entry);
+      const handle = this.handleResult(entry, data);
+      if (!admit(handle)) return undefined;
+      entries = this.cleanEntries(entries);
+      if (existingByHash) {
+        existingByHash.lastAccessed = now;
+        existingByHash.updatedAt = now;
+      } else {
+        this.writeBlob(entry.blobPath, data);
+        entries.push(entry);
+      }
       this.writeIndex(entries);
       this.gcLocked(entry.id);
-      return this.handleResult(entry, data);
+      return handle;
     });
   }
 
@@ -642,7 +659,7 @@ export class ContextStore {
         ok: false,
         content: names
           ? `Error: stored result "${entry.id}" has no section ${JSON.stringify(section)}; available: ${names.slice(0, 24).map((name) => JSON.stringify(name)).join(", ")}.`
-          : `Error: stored result "${entry.id}" is not a Fabric sectioned result; use query or offset/length.`,
+          : `Error: stored result "${entry.id}" is not a Fabric sectioned result or has ambiguous section boundaries; use query or offset/length.`,
         bytesRead: 0,
         truncated: false,
       };
@@ -680,62 +697,118 @@ export class ContextStore {
     const regex = opts.regex === true;
     const ignoreCase = opts.ignoreCase === true;
     let matchers: Array<(line: string) => boolean>;
-    try {
-      matchers = terms.map((term) => lineMatcher(term, regex, ignoreCase));
-    } catch {
-      return this.errorResult(entry.id, `Error: invalid regex in query ${JSON.stringify(opts.query)}.`);
-    }
+    try { matchers = terms.map((term) => lineMatcher(term, regex, ignoreCase)); }
+    catch { return this.errorResult(entry.id, `Error: invalid regex in query ${JSON.stringify(opts.query)}.`); }
     const scanPrefix = regex && entry.bytes > REGEX_SCAN_BYTES;
     const data = scanPrefix
       ? this.readBlobBytes(blob, 0, this.alignUtf8Start(blob, REGEX_SCAN_BYTES)).toString("utf8")
       : readFileSync(blob, "utf8");
-    const contextLines = Math.max(0, opts.contextLines ?? DEFAULT_CONTEXT_LINES);
-    const maxMatches = Math.max(1, opts.maxMatches ?? Number.MAX_SAFE_INTEGER);
     const lines = data.split("\n");
+    const contextLines = Math.max(0, Math.min(50, Math.floor(opts.contextLines ?? DEFAULT_CONTEXT_LINES)));
+    const maxMatches = Math.max(1, Math.floor(opts.maxMatches ?? Number.MAX_SAFE_INTEGER));
+    const fingerprint = createHash("sha256").update(JSON.stringify([entry.id, entry.contentHash, terms, regex, ignoreCase, contextLines])).digest("hex").slice(0, 16);
+    const cursorFor = (line: number, byte = 0): string => Buffer.from(JSON.stringify([1, fingerprint, line, byte])).toString("base64url");
+    let firstLine = 0, firstByte = 0;
+    if (opts.cursor !== undefined) {
+      try {
+        if (typeof opts.cursor !== "string" || opts.cursor.length > 256) throw new Error();
+        const [version, signature, line, byte] = JSON.parse(Buffer.from(opts.cursor, "base64url").toString("utf8"));
+        if (version !== 1 || signature !== fingerprint || !Number.isInteger(line) || line < 0 || line >= lines.length ||
+          !Number.isInteger(byte) || byte < 0 || byte > Buffer.byteLength(lines[line], "utf8") ||
+          (byte > 0 && (Buffer.from(lines[line])[byte] & 0xc0) === 0x80)) throw new Error();
+        firstLine = line; firstByte = byte;
+      } catch { return this.errorResult(entry.id, "Error: invalid query cursor; use nextCursor with the same handle and query options."); }
+    }
     const perTerm = terms.map(() => 0);
     const matches: number[] = [];
-    const result: string[] = [];
     let totalMatches = 0;
+    // Count the entire scan, but retain only the page's nearby hits plus a
+    // lookahead. Dense queries must not allocate a second full-payload index.
+    const collectLimit = maxMatches + contextLines * 2 + 1;
     for (let i = 0; i < lines.length; i++) {
       let hit = false;
       for (let t = 0; t < matchers.length; t++) {
         if (!matchers[t](lines[i])) continue;
-        perTerm[t]++;
-        hit = true;
+        perTerm[t]++; hit = true;
       }
-      if (!hit) continue;
-      totalMatches++;
-      if (matches.length >= maxMatches) continue;
-      matches.push(i + 1);
-      const start = Math.max(0, i - contextLines);
-      const end = Math.min(lines.length - 1, i + contextLines);
-      for (let j = start; j <= end; j++) result.push(`${j === i ? ">>" : "  "} ${j + 1}: ${lines[j]}`);
-      result.push("");
+      if (hit) {
+        totalMatches++;
+        if (i + contextLines >= firstLine && matches.length < collectLimit) matches.push(i);
+      }
     }
     const label = terms.length === 1 ? JSON.stringify(terms[0]) : `any of ${terms.map((term) => JSON.stringify(term)).join(", ")}`;
     let termMatches = terms.length > 1 ? Object.fromEntries(terms.map((term, t) => [term, perTerm[t]])) : undefined;
-    const omitted = Math.max(0, totalMatches - matches.length);
-    const scanned = scanPrefix ? `first ${REGEX_SCAN_BYTES} of ${entry.bytes} bytes scanned` : `${entry.bytes} bytes`;
-    let content: string;
-    if (totalMatches === 0) {
+    const scannedNote = scanPrefix ? `\n... [regex scanned the first ${REGEX_SCAN_BYTES} of ${entry.bytes} bytes; use offset reads for the rest]` : "";
+    if (!totalMatches) {
       const miss = queryMissHints(lines, terms, regex, ignoreCase);
       termMatches = miss.termMatches ?? termMatches;
-      content = `No matches for ${label} in ${entry.key} (${scanned}).${miss.text}`;
-    } else {
-      const counts = termMatches ? ` (${terms.map((term, t) => `${JSON.stringify(term)}: ${perTerm[t]}`).join(", ")})` : "";
-      content = `${totalMatches} match(es) for ${label}${counts}:\n${result.join("\n")}` +
-        (omitted > 0 ? `\n... [${omitted} additional matches counted but not formatted]` : "") +
-        (scanPrefix ? `\n... [regex scanned the first ${REGEX_SCAN_BYTES} of ${entry.bytes} bytes; use offset reads for the rest]` : "");
+      const scanned = scanPrefix ? `first ${REGEX_SCAN_BYTES} of ${entry.bytes} bytes scanned` : `${entry.bytes} bytes`;
+      const content = `No matches for ${label} in ${entry.key} (${scanned}).${miss.text}`;
+      return { ...this.baseResult(entry), content, bytesRead: Buffer.byteLength(content), matchedLines: [], totalMatches,
+        ...(termMatches ? { termMatches } : {}), ...(scanPrefix ? { scanTruncated: true } : {}), truncated: scanPrefix };
     }
-    return {
-      ...this.baseResult(entry),
-      bytesRead: Buffer.byteLength(content, "utf8"),
-      content,
-      matchedLines: matches,
-      totalMatches,
-      ...(termMatches ? { termMatches } : {}),
-      truncated: omitted > 0 || scanPrefix,
+    // Union the page's context intervals first: each physical source line appears once,
+    // even when every adjacent line matches. Cursors advance through that union.
+    const windows: Array<[number, number]> = [];
+    for (const line of matches) {
+      const start = Math.max(0, line - contextLines), end = Math.min(lines.length - 1, line + contextLines);
+      const previous = windows[windows.length - 1];
+      if (previous && start <= previous[1] + 1) previous[1] = Math.max(previous[1], end);
+      else windows.push([start, end]);
+    }
+    const hitLines = new Set(matches);
+    const counts = termMatches ? ` (${terms.map((term, t) => `${JSON.stringify(term)}: ${perTerm[t]}`).join(", ")})` : "";
+    const header = `${totalMatches} match(es) for ${label}${counts}:\n`;
+    const budget = opts.maxBytes ?? Infinity;
+    const sampleSize = Number.isFinite(budget) ? Math.max(1, Math.min(64, Math.floor(budget / 32))) : Infinity;
+    const makeResult = (rows: string[], pageMatches: number[], nextCursor?: string): ReadResult => {
+      const content = header + rows.join("\n") +
+        (nextCursor ? `\n... [more matches/context; continue with cursor ${JSON.stringify(nextCursor)}]` : "") + scannedNote;
+      return { ...this.baseResult(entry), content, bytesRead: Buffer.byteLength(content),
+        matchedLines: pageMatches.slice(0, sampleSize), totalMatches,
+        ...(termMatches ? { termMatches } : {}), ...(nextCursor ? { nextCursor } : {}),
+        ...(scanPrefix ? { scanTruncated: true } : {}), truncated: !!nextCursor || scanPrefix };
     };
+    const size = (value: unknown): number => Buffer.byteLength(JSON.stringify(value));
+    const reserve = Number.isFinite(budget) ? size(makeResult([], Array(Math.min(maxMatches, sampleSize)).fill(lines.length), cursorFor(lines.length, entry.bytes))) + 32 : 0;
+    let rowBytes = 0, nextCursor: string | undefined;
+    const rows: string[] = [], pageMatches: number[] = [];
+    outer: for (const [start, end] of windows) {
+      for (let line = Math.max(start, firstLine); line <= end; line++) {
+        const byte = line === firstLine ? firstByte : 0;
+        const hit = hitLines.has(line);
+        if (hit && pageMatches.length >= maxMatches) { nextCursor = cursorFor(line, byte); break outer; }
+        const source = Buffer.from(lines[line]);
+        const prefix = `${hit ? ">>" : "  "} ${line + 1}: ${byte ? `[continued at byte ${byte}] ` : ""}`;
+        const row = prefix + source.subarray(byte).toString("utf8");
+        const encoded = size(row) - 2 + (rows.length ? 2 : 0);
+        if (rowBytes + encoded + reserve > budget) {
+          if (rows.length) { nextCursor = cursorFor(line, byte); break outer; }
+          // The conservative reserve may exceed a tiny page even though one
+          // complete row fits. In particular an empty context line has no byte
+          // prefix for the binary search below, but must still make progress.
+          const afterLine = line < end || windows.some(([s]) => s > end) ? cursorFor(line + 1) : undefined;
+          const whole = makeResult([row], hit ? [line + 1] : [], afterLine);
+          if (size(whole) <= budget) return whole;
+          // A single long line can exceed a page. Page its UTF-8 bytes without
+          // advancing past unseen text, rather than slicing away later matches.
+          let low = byte + 1, high = source.length, best: ReadResult | undefined;
+          while (low <= high) {
+            const middle = Math.floor((low + high) / 2);
+            let stop = middle;
+            while (stop < source.length && (source[stop] & 0xc0) === 0x80) stop++;
+            const next = stop < source.length ? cursorFor(line, stop) : afterLine;
+            const candidate = makeResult([prefix + source.subarray(byte, stop).toString("utf8")], hit ? [line + 1] : [], next);
+            if (stop > byte && size(candidate) <= budget) { best = candidate; low = middle + 1; }
+            else high = middle - 1;
+          }
+          return best ?? this.errorResult(entry.id, "Error: query metadata exceeds the read budget; narrow the query.");
+        }
+        rows.push(row); rowBytes += encoded;
+        if (hit) pageMatches.push(line + 1);
+      }
+    }
+    return makeResult(rows, pageMatches, nextCursor);
   }
 
   private cleanEntries(entries: StoreMetadata[], options = this.options): StoreMetadata[] {

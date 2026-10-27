@@ -183,11 +183,50 @@ function fabricSections(data: string): { outline: string; sections: FabricSectio
   if (!outline.includes('"<multi-line string, see section: ')) return undefined;
   const referenced = headers.filter((header) => outline.includes(JSON.stringify(`<multi-line string, see section: ${header[1]}>`)));
   if (referenced.length === 0) return undefined;
-  const sections = referenced.map((header, i) => ({
-    name: header[1],
-    chars: Number(header[2]),
-    text: data.slice(header.index! + header[0].length, referenced[i + 1]?.index ?? data.length).trim(),
-  }));
+  const sections: FabricSection[] = [];
+  const headerAt = new Map(referenced.map((header, i) => [header.index!, i]));
+  for (let i = 0; i < referenced.length;) {
+    const header = referenced[i];
+    // Fabric writes one newline after a header and two between sections.
+    const afterHeader = header.index! + header[0].length;
+    const start = data[afterHeader] === "\n" ? afterHeader + 1 : afterHeader;
+    const chars = Number(header[2]); // Fabric counts UTF-16 code units.
+    if (!Number.isSafeInteger(chars)) return undefined;
+    const boundaryAt = (end: number): number | undefined => {
+      if (end === data.length) return referenced.length;
+      if (end > data.length) return undefined;
+      const separator = data.slice(end, end + 4) === "\r\n\r\n" ? 4
+        : data.slice(end, end + 2) === "\n\n" ? 2 : 0;
+      const following = separator ? headerAt.get(end + separator) : undefined;
+      return following !== undefined && following > i ? following : undefined;
+    };
+    let end = start + chars, nextIndex = boundaryAt(end);
+    if (nextIndex === undefined) {
+      // Fabric may shorten a section but retain its original length in the
+      // header. Its omission marker gives the exact rendered length. Never
+      // guess a boundary from the next header-looking line inside the body.
+      const candidates = new Map<number, number>();
+      const marker = /…\[(\d+) chars omitted\]…/g;
+      marker.lastIndex = start;
+      const limit = Math.min(data.length, start + chars);
+      for (let match = marker.exec(data); match && match.index < limit; match = marker.exec(data)) {
+        const omitted = Number(match[1]);
+        if (!Number.isSafeInteger(omitted) || omitted <= 0 || omitted > chars) continue;
+        const candidate = start + chars - omitted + match[0].length;
+        if (candidate < match.index + match[0].length || candidate > limit) continue;
+        const following = boundaryAt(candidate);
+        if (following !== undefined) candidates.set(candidate, following);
+        if (candidates.size > 1) return undefined;
+      }
+      if (candidates.size !== 1) return undefined;
+      [end, nextIndex] = [...candidates][0];
+    }
+    sections.push({ name: header[1], chars, text: data.slice(start, end) });
+    i = nextIndex;
+  }
+  // A missing advertised section or duplicate selected name is ambiguous.
+  const advertised = outline.split("<multi-line string, see section: ").length - 1;
+  if (sections.length !== advertised || new Set(sections.map((section) => section.name)).size !== sections.length) return undefined;
   return { outline, sections };
 }
 
