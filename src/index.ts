@@ -16,8 +16,8 @@ import { Type, type TSchema } from "typebox";
 import { ContextStore, DEFAULT_CONTEXT_STORE_TTL_MS, MAX_CONTEXT_STORE_BYTES } from "./store.js";
 import { buildPreview, compactErrorOutput, fabricSectionNames, isVerboseEditAcknowledgement, type PreviewContentType } from "./preview.js";
 import { ceTools, isErrorResult, NESTED_READ_BUDGET_BYTES, type ToolContext } from "./tools.js";
-import { enableFabricContextReadForChild, FABRIC_CONTEXT_READ_TOOL, hasFabricFullOutputNotice, readFabricFullOutput } from "./compat/fabric.js";
-import { ContextTelemetry, REPEATED_OFFLOADED_CALL_NOTE, type ContextSummary, type ReadTelemetry } from "./telemetry.js";
+import { enableFabricContextReadForChild, FABRIC_CONTEXT_READ_TOOL, FABRIC_DEFAULT_MAX_OUTPUT_CHARS, fabricOutputBudgetTokens, hasFabricFullOutputNotice, readFabricFullOutput } from "./compat/fabric.js";
+import { ContextTelemetry, REPEATED_OFFLOADED_CALL_NOTE, type ContextSummary, type NextCallFollowUp, type ReadTelemetry } from "./telemetry.js";
 import { FabricExecutionScopes } from "./execution-scope.js";
 export { projectToolResult } from "./projection.js";
 // ---- Config ----
@@ -126,12 +126,10 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" ? value as Record<string, unknown> : undefined;
 }
 
-function isProviderBounded(toolName: string, input: Record<string, unknown>, textLength: number): boolean {
-  if (/^(?:fovea_|extensions\.fovea_)/.test(toolName)) {
-    const maxTokens = typeof input.maxTokens === "number" ? input.maxTokens : undefined;
-    if (maxTokens !== undefined && textLength <= maxTokens * 4) return true;
-  }
-  return false;
+/** The output budget a call set itself, in tokens of four bytes: Fovea's maxTokens or fabric_exec's maxOutputTokens. */
+function callOutputBudget(toolName: string, input: Record<string, unknown>): number | undefined {
+  if (/^(?:fovea_|extensions\.fovea_)/.test(toolName)) return typeof input.maxTokens === "number" ? input.maxTokens : undefined;
+  return toolName === "fabric_exec" ? fabricOutputBudgetTokens(input) : undefined;
 }
 
 function inputHint(input: Record<string, unknown>): string {
@@ -215,7 +213,7 @@ function formatHandleText(
   previewBytes: number,
   surface: ReadSurface = "model",
   contentType: PreviewContentType = "unknown",
-  readsHandles = false,
+  readsHandles: false | { keepInlineTokens?: number } = false,
   repeated = false,
   incompleteFabricOutput = false,
 ): string {
@@ -240,7 +238,8 @@ function formatHandleText(
     : repeated ? "; already introduced this session" : "; full result stored; read instead of re-running";
   return `[offloaded to handle "${id}" — ${bytes} bytes (~${estimatedTokens} tokens)${status}.]\n` +
     `Read: ${surface === "fabric" ? `(await ${call}).text` : call}\n` +
-    (readsHandles ? "This program read stored handles; filter inside the program and return only the selection or a digest.\n" : "") +
+    (readsHandles ? "This program read stored handles: filter inside the program and return only the selection or a digest" +
+      (readsHandles.keepInlineTokens ? `, or set maxOutputTokens: ${readsHandles.keepInlineTokens} to keep a result this size inline` : "") + ".\n" : "") +
     (repeated ? "" : `Preview (up to ${previewBytes} bytes):\n${preview.text}`);
 }
 
@@ -305,6 +304,20 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     if (offloadedCalls.size > 256) offloadedCalls.delete(offloadedCalls.keys().next().value!);
   };
   const telemetry = new ContextTelemetry();
+  // Boundary offloads whose next model call is still to come, by workspace,
+  // with the tool that produced each. Whether that call reads the handle is
+  // what offloadFollowUp.nextCall reports.
+  const awaitingNextCall = new Map<string, Map<string, string>>();
+  const settleNextCall = (cwd: string, handle: string, followUp: NextCallFollowUp): void => {
+    const awaiting = awaitingNextCall.get(cwd);
+    const tool = awaiting?.get(handle);
+    if (tool === undefined) return;
+    awaiting!.delete(handle);
+    telemetry.record(cwd, {
+      strategy: "PASS", tool, handle, mainTokensPrevented: 0, mainTokensInjected: 0, followUp,
+      note: followUp === "read" ? "next call read the offloaded handle" : "next call did not read the offloaded handle",
+    });
+  };
   const storeFor = (cwd: string, cfg: CeConfig): ContextStore => new ContextStore(
     cwd,
     ".pi/context-store",
@@ -323,6 +336,11 @@ export default function contextEngineer(pi: ExtensionAPI): void {
   pi.on("tool_call", async (event, ctx) => {
     fabricExecutions.observeCall(event.toolCallId, eventParent(event));
     if (fabricExecutions.isNestedToolResult(event.toolCallId, eventParent(event))) return undefined;
+    const awaiting = awaitingNextCall.get(ctx.cwd);
+    if (awaiting?.size) {
+      const called = JSON.stringify(event.input ?? {});
+      for (const pending of [...awaiting.keys()]) settleNextCall(ctx.cwd, pending, called.includes(pending) ? "read" : "other");
+    }
     const handle = offloadedCalls.get(callKey(event.toolName, event.input));
     if (handle && configFor(ctx.cwd).enabled !== false) {
       telemetry.record(ctx.cwd, {
@@ -411,14 +429,20 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     const previewBytes = Math.min(boundedNumber(cfg.offloadPreviewBytes, PREVIEW_BYTES, 256, 4096), Math.max(256, remaining - 512));
     const alreadyOffloaded = existingDetails.ce_offloaded === true ||
       (textBlocks.length === 1 && /^\[offloaded to handle "[^"]+"/.test(textBlocks[0].text));
-    const providerBounded = isProviderBounded(event.toolName, input, textBytes);
+    // A result that fits the output budget its own call set is what the
+    // caller asked to see: offloading it would only force a read back.
+    // Fabric's truncation notice means the whole output did not fit.
+    const callBudget = callOutputBudget(event.toolName, input);
+    const withinCallBudget = callBudget !== undefined && textBytes <= callBudget * 4 &&
+      !textBlocks.some((block) => hasFabricFullOutputNotice(block.text));
     const compactEditAck = cfg.compactEditResults !== false && textBytes >= 2048 &&
       textBlocks.some((block) => isVerboseEditAcknowledgement(block.text));
 
     if (event.isError ? textBytes < errorThreshold && !overTurnBudget :
-      alreadyOffloaded || event.toolName === "ctx_read" || (providerBounded && !overTurnBudget) ||
+      alreadyOffloaded || event.toolName === "ctx_read" || (withinCallBudget && !overTurnBudget) ||
       (!compactEditAck && textBytes < threshold && !overTurnBudget)) {
-      recordPass("final result kept inline");
+      recordPass(!event.isError && withinCallBudget && !overTurnBudget && (compactEditAck || textBytes >= threshold)
+        ? "kept inline: fits the output budget its call set" : "final result kept inline");
       return undefined;
     }
 
@@ -454,6 +478,12 @@ export default function contextEngineer(pi: ExtensionAPI): void {
         keptBytes -= Buffer.byteLength(textBlocks[0].text, "utf8");
       }
     }
+    // A handle-reading program that still overflows asked for this text:
+    // name the budget that keeps a result this size inline, where Fabric's
+    // own cap and the turn budget allow it.
+    const handleReads = readsHandles && (event.toolName === "fabric_exec" && fabricFullOutput === undefined &&
+      !incompleteFabricOutput && !overTurnBudget && textBytes <= FABRIC_DEFAULT_MAX_OUTPUT_CHARS
+      ? { keepInlineTokens: Math.ceil(textBytes / 4) } : {});
     let replacement = "", visibleBytes = 0;
     let offloaded: ReturnType<ContextStore["writeIf"]>;
     try {
@@ -467,7 +497,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           const room = errorBudget - Buffer.byteLength(recovery, "utf8") - 1;
           replacement = `${room > 0 ? compactErrorOutput(diagnosticText, room) + "\n" : ""}${recovery}`;
         } else {
-          replacement = formatHandleText(candidate.id, candidate.bytes, candidate.estimatedTokens, payload, previewBytes, surface, candidate.contentType, readsHandles, seenNotices.has(noticeKey(ctx.cwd, candidate.id)), incompleteFabricOutput);
+          replacement = formatHandleText(candidate.id, candidate.bytes, candidate.estimatedTokens, payload, previewBytes, surface, candidate.contentType, handleReads, seenNotices.has(noticeKey(ctx.cwd, candidate.id)), incompleteFabricOutput);
         }
         visibleBytes = Buffer.byteLength(replacement, "utf8") + keptBytes;
         return textBytes - visibleBytes >= boundedNumber(cfg.minimumSavingsBytes, 256, 1);
@@ -499,6 +529,9 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           ? "Fabric-truncated result offloaded with its full output" : "large final text result offloaded",
     });
     if (!event.isError) rememberOffloadedCall(event.toolName, input, offloaded.id);
+    if (!event.isError && !compactEditAck) {
+      awaitingNextCall.set(ctx.cwd, (awaitingNextCall.get(ctx.cwd) ?? new Map<string, string>()).set(offloaded.id, event.toolName));
+    }
     // Details are rendering/state data in native Pi and program data in Fabric.
     // Only content crosses the native model boundary; do not destroy details.
     return {
@@ -547,6 +580,10 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           // A nested result is program data; only the boundary cap prevents handle chains.
           maxReturnBytes: nested ? NESTED_READ_BUDGET_BYTES : Math.min(effectiveOffloadThreshold(toolConfig), Math.max(256, remainingTurnBytes(execCtx.cwd, toolConfig))),
         };
+        // A read can reach a handle without a tool_call naming it: a direct
+        // call through a host that runs tools itself, or a program's own read.
+        const requestedId = (params as { id?: unknown }).id;
+        if (typeof requestedId === "string") settleNextCall(execCtx.cwd, requestedId, "read");
 
         try {
           const result = await def.handler(params, toolCtx);
@@ -702,6 +739,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
           `Main context reduction: ${summary.mainTokensPrevented.toLocaleString()} tokens (${reduction})`,
           `Events: ${summary.events}`,
           `Offloads read back: ${summary.offloadFollowUp.handlesRead}/${summary.offloadFollowUp.handles}; repeated offloaded calls: ${summary.offloadFollowUp.repeatedCalls}`,
+          `Next call after an offload read its handle: ${summary.offloadFollowUp.nextCall.read}/${summary.offloadFollowUp.nextCall.read + summary.offloadFollowUp.nextCall.other}`,
           formatReads(summary.offloadFollowUp.reads),
           ...(strategyLines.length > 0 ? ["", "By strategy:", ...strategyLines] : []),
           ...(summary.largest ? ["", `Largest Main-context prevention: ${summary.largest.tool} — ${summary.largest.mainTokensPrevented.toLocaleString()} tokens`] : []),
@@ -744,7 +782,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", async () => {
     fabricExecutions.clear(); handleReadingCalls.clear(); offloadedCalls.clear();
-    seenNotices.clear(); turnExposure.clear();
+    seenNotices.clear(); turnExposure.clear(); awaitingNextCall.clear();
   });
 
   pi.on("session_start", async (_event, ctx) => {
@@ -753,6 +791,7 @@ export default function contextEngineer(pi: ExtensionAPI): void {
     offloadedCalls.clear();
     seenNotices.clear();
     turnExposure.clear();
+    awaitingNextCall.clear();
     telemetry.setSessionId(ctx.sessionManager?.getSessionId?.());
     const cfg = configFor(ctx.cwd);
     if (cfg.enabled === false) return;

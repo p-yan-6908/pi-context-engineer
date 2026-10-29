@@ -89,6 +89,20 @@ export function enableFabricContextReadForChild(enabled: boolean): boolean {
   return true;
 }
 
+/** Fabric's default cap on one fabric_exec result (executor.maxOutputChars); no call budget raises a result past it. */
+export const FABRIC_DEFAULT_MAX_OUTPUT_CHARS = 50_000;
+
+/**
+ * The output budget a fabric_exec call set itself, in Fabric's tokens of four
+ * characters. Fabric folds `max_output_tokens` and an `// @options:` header
+ * into `maxOutputTokens` before Pi validates the call; the alias is still
+ * read for hosts that hand over raw arguments.
+ */
+export function fabricOutputBudgetTokens(input: Record<string, unknown>): number | undefined {
+  const value = input.maxOutputTokens ?? input.max_output_tokens;
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
 /** Fabric's notice after a final output it truncated: the artifact holds every character. */
 const FABRIC_FULL_OUTPUT_NOTICE = /\n\n\[Full output \((\d+) chars\) saved to: ([^\n\]]+)\]$/;
 const FABRIC_OUTPUT_SCRATCH_PREFIX = "pi-fabric-output-";

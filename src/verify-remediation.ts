@@ -635,7 +635,8 @@ async function testOffloadFollowUpTelemetry(): Promise<void> {
   check(typeof handle === "string", "a large fabric_exec result is offloaded");
   const fresh = () => new ContextTelemetry().summary(root, true).offloadFollowUp;
   const noReads = { inProgram: 0, range: 0, rangeFromStart: 0, query: 0, queryMisses: 0, section: 0, jsonPath: 0 };
-  equal(fresh(), { handles: 1, handlesRead: 0, repeatedCalls: 0, reads: noReads }, "an unread offload is counted");
+  const noNextCall = { read: 0, other: 0 };
+  equal(fresh(), { handles: 1, handlesRead: 0, repeatedCalls: 0, reads: noReads, nextCall: noNextCall }, "an unread offload is counted");
 
   await run("tool_call", { toolName: "fabric_exec", toolCallId: "follow-2", input });
   await run("tool_call", { toolName: "fabric_exec", toolCallId: "follow-3", input: { code: "return 1" } });
@@ -643,12 +644,33 @@ async function testOffloadFollowUpTelemetry(): Promise<void> {
   equal(tools.get("ctx_read").parameters.properties.query.anyOf?.map((member: any) => member.type), ["string", "array"], "ctx_read query accepts a string or an array of terms");
 
   await tools.get("ctx_read").execute("read-1", { id: handle, offset: 0, length: 64 }, undefined, undefined, { cwd: root });
-  equal(fresh(), { handles: 1, handlesRead: 1, repeatedCalls: 1, reads: { ...noReads, range: 1, rangeFromStart: 1 } }, "ctx_read attributes its read to the handle");
+  equal(fresh(), { handles: 1, handlesRead: 1, repeatedCalls: 1, reads: { ...noReads, range: 1, rangeFromStart: 1 }, nextCall: { read: 0, other: 1 } }, "ctx_read attributes its read to the handle");
 
   await tools.get("ctx_read").execute(`${FABRIC_NESTED_TOOL_CALL_ID_PREFIX}read-2`, { id: handle, query: ["absent-term", "missing-term"] }, undefined, undefined, { cwd: root });
   await tools.get("ctx_read").execute("read-3", { id: handle, offset: 9, length: 64 }, undefined, undefined, { cwd: root });
   equal(fresh().reads, { ...noReads, inProgram: 1, range: 2, rangeFromStart: 1, query: 1, queryMisses: 1 }, "read telemetry counts modes, misses, program reads and offset-0 ranges");
   check(!JSON.stringify(readTelemetry(root)).includes("absent-term"), "read telemetry never records query terms");
+
+  // The next call after an offload settles it once: as a read when it names
+  // the handle or reads it directly, otherwise as not reading it.
+  const offload = async (toolCallId: string, line: string): Promise<string> => {
+    const call = { toolName: "fabric_exec", toolCallId, input: { code: "return big" } };
+    await run("tool_call", call);
+    const result = await run("tool_result", { ...call, details: {}, isError: false, content: [{ type: "text", text: line.repeat(4000) }] });
+    return result?.details?.ce_handle as string;
+  };
+  const named = await offload("follow-4", "named line\n");
+  await run("tool_call", { toolName: "fabric_exec", toolCallId: "follow-5", input: { code: `return (await extensions.ctx_read({ id: "${named}", query: "named" })).text` } });
+  equal(fresh().nextCall, { read: 1, other: 1 }, "a next call that names the handle reads it");
+  const direct = await offload("follow-6", "direct line\n");
+  await tools.get("ctx_read").execute("read-4", { id: direct, offset: 0, length: 64 }, undefined, undefined, { cwd: root });
+  await run("tool_call", { toolName: "fabric_exec", toolCallId: "follow-7", input: { code: "return 2" } });
+  equal(fresh().nextCall, { read: 2, other: 1 }, "a direct read settles the offload, and later calls do not count again");
+  const errorCall = { toolName: "fabric_exec", toolCallId: "follow-8", input: { code: "throw" } };
+  await run("tool_call", errorCall);
+  await run("tool_result", { ...errorCall, details: {}, isError: true, content: [{ type: "text", text: "error: failed\n".repeat(2000) }] });
+  await run("tool_call", { toolName: "fabric_exec", toolCallId: "follow-9", input: { code: "return 3" } });
+  equal(fresh().nextCall, { read: 2, other: 1 }, "compacted errors are not awaited as offloads");
 }
 
 try {

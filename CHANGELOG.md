@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+Based on 62 recorded Pi sessions with Context Engineer active (12,476 model requests, 1.28 billion input tokens). Tool results make up about half of that input. An inline result is sent again with about 85 later requests before compaction, and each request carries about 103,000 tokens of context, so a needless request costs about as much as keeping 5 KB of result through those 85 requests.
+
+- A `fabric_exec` result that fits the call's own `maxOutputTokens` (or `max_output_tokens`) stays inline, as a Fovea result within its `maxTokens` already did and as Fabric's Claude Code host already decides. 37 offloaded results fit the budget their call had set, and the next call read 23 of them back. A result Fabric truncated did not fit, so it is still offloaded with its full output; the turn budget still applies.
+- A program that reads handles and overflows again is told the `maxOutputTokens` that keeps a result that size inline, when Fabric's 50,000-character cap allows it. Since 0.8.0 let a program read 512 KB at once, 16 of 67 offloads were such re-offloads, against about 6% before, and the notice said to filter without naming a size.
+- Telemetry records whether the model's next call read an offloaded handle, by naming it or with `ctx_read`, and `/ce status` reports the rate. A lower threshold or a smaller preview pays only while that rate stays low. Since 0.8.0 the next call read 36 of 67 offloads, 32 of them through a section the preview listed.
+
 ## 0.9.0
 
 - Admit automatic offloads before committing or evicting stored handles; rejected candidates leave the store unchanged.

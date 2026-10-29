@@ -19,6 +19,13 @@ import { constants as osConstants } from "node:os";
 /** Note on a call repeated after its result was offloaded; see offloadFollowUp. */
 export const REPEATED_OFFLOADED_CALL_NOTE = "repeated a call whose result is already offloaded";
 
+/** Whether the model's next call after a boundary offload read that handle; see offloadFollowUp.nextCall. */
+export type NextCallFollowUp = "read" | "other";
+
+function isNextCallFollowUp(value: unknown): value is NextCallFollowUp {
+  return value === "read" || value === "other";
+}
+
 export type ContextStrategy = "PASS" | "WRITE" | "SELECT" | "COMPRESS";
 
 /** How a ctx_read selected from its handle; the query text is never recorded. */
@@ -76,6 +83,8 @@ export interface ContextEvent {
   read?: ReadTelemetry;
   /** Handles consumed inside this tool's program; never their contents. */
   derivedFrom?: string[];
+  /** Set on the event that closes a boundary offload: whether the next call read its handle. */
+  followUp?: NextCallFollowUp;
 }
 
 export interface StrategySummary {
@@ -112,14 +121,16 @@ export interface ContextSummary {
   byStrategy: Record<string, StrategySummary>;
   /**
    * Whether boundary offloads were used: distinct handles, handles later read,
-   * repeated source calls, and ctx_read calls by mode. rangeFromStart counts
-   * range reads at offset 0, which mostly re-read a preview's head.
+   * repeated source calls, ctx_read calls by mode, and whether the model's
+   * next call read the handle. rangeFromStart counts range reads at offset 0,
+   * which mostly re-read a preview's head.
    */
   offloadFollowUp: {
     handles: number;
     handlesRead: number;
     repeatedCalls: number;
     reads: { inProgram: number; range: number; rangeFromStart: number; query: number; queryMisses: number; section: number; jsonPath: number };
+    nextCall: { read: number; other: number };
   };
   largest?: ContextEvent;
 }
@@ -182,6 +193,7 @@ export class ContextTelemetry {
       note?: string;
       read?: ReadTelemetry;
       derivedFrom?: string[];
+      followUp?: NextCallFollowUp;
     },
   ): void {
     try {
@@ -214,6 +226,7 @@ export class ContextTelemetry {
         ...(event.note ? { note: event.note.replace(/[\r\n]+/g, " ").slice(0, 240) } : {}),
         ...(normalizeRead(event.read) ? { read: normalizeRead(event.read) } : {}),
         ...(normalizeHandles(event.derivedFrom) ? { derivedFrom: normalizeHandles(event.derivedFrom) } : {}),
+        ...(isNextCallFollowUp(event.followUp) ? { followUp: event.followUp } : {}),
       };
       const path = this.path(workspaceRoot);
       appendFileSync(path, JSON.stringify(item) + "\n", { encoding: "utf8", mode: 0o600 });
@@ -322,6 +335,10 @@ export class ContextTelemetry {
         section: reads.filter(read => read.mode === "section").length,
         jsonPath: reads.filter(read => read.mode === "jsonPath").length,
       },
+      nextCall: {
+        read: events.filter(event => event.followUp === "read").length,
+        other: events.filter(event => event.followUp === "other").length,
+      },
     };
     const potentialMainTokens = mainTokensPrevented + mainTokensInjected;
     const mainContextReductionRatio = potentialMainTokens > 0 ? mainTokensPrevented / potentialMainTokens : 0;
@@ -421,6 +438,7 @@ export class ContextTelemetry {
       ...(typeof raw.note === "string" ? { note: raw.note } : {}),
       ...(normalizeRead(raw.read) ? { read: normalizeRead(raw.read) } : {}),
       ...(normalizeHandles(raw.derivedFrom) ? { derivedFrom: normalizeHandles(raw.derivedFrom) } : {}),
+      ...(isNextCallFollowUp(raw.followUp) ? { followUp: raw.followUp } : {}),
     };
   }
 

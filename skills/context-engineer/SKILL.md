@@ -34,6 +34,9 @@ about doing that well.
   including the middle of a `fabric_exec` output that Fabric itself
   truncated. Re-running pays for the same output again and may repeat side
   effects.
+- **A budget you set is honored.** A `fabric_exec` result that fits the call's
+  own `maxOutputTokens` stays inline. Set one only when you will use the whole
+  output now: an inline result is sent again with every later request.
 - **Handles live in the workspace store** (`.pi/context-store/`, one week and
   500 MB by default). `no stored result with id` means the handle expired, was
   evicted, or belongs to another working directory; only then re-run the source.
@@ -42,7 +45,8 @@ about doing that well.
   replacements must save bytes rather than expand output.
 - **Handles nest.** If a program that reads handles returns too much, its
   return is offloaded again and the notice says so. Narrow the selection
-  instead of reading the new handle back whole.
+  instead of reading the new handle back whole; when you need all of it,
+  re-run with the `maxOutputTokens` the notice names.
 
 ## Decision tree: a big result came back as a handle
 

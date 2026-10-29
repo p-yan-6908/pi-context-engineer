@@ -252,6 +252,34 @@ async function boundaryChecks(): Promise<void> {
   console.log("[ok] negative net readback savings, cross-session and derived-offload attribution, shorter repeats, minimum savings, and turn budgets");
 }
 
+async function callBudgetChecks(): Promise<void> {
+  const h = harness();
+  const tokens = Math.ceil(bytes(source) / 4);
+  const call = (extra: Record<string, unknown>) => ({ input: { code: "return data", ...extra } });
+  assert.equal(await h.boundary(source, "fits", call({ maxOutputTokens: tokens })), undefined);
+  assert.equal(await h.boundary(source, "fits-alias", call({ max_output_tokens: tokens })), undefined);
+  const events = readFileSync(join(h.cwd, ".pi/context-store/context-events.jsonl"), "utf8");
+  assert.equal(events.split("kept inline: fits the output budget its call set").length - 1, 2);
+  assert((await h.boundary(source, "over", call({ maxOutputTokens: tokens - 1 })))?.details.ce_offloaded);
+  // Fabric's truncation notice means the whole output did not fit the budget.
+  const truncated = `${source}\n\n[Full output (${source.length * 3} chars) saved to: /nonexistent/pi-fabric-output-x/output.txt]`;
+  const cut = await h.boundary(truncated, "truncated", call({ maxOutputTokens: tokens * 2 }));
+  assert(cut?.details.ce_offloaded && cut.details.ce_fabric_output_incomplete);
+  const turn = harness({ turnBudgetBytes: 10_000 });
+  assert((await turn.boundary(source, "turn", call({ maxOutputTokens: tokens })))?.details.ce_offloaded);
+  // A handle-reading program that overflows is told the budget that keeps it inline.
+  const reader = { code: "return (await extensions.ctx_read({ id: 'h', section: 'a' })).text" };
+  const derived = text(await h.boundary(source, "derived", { input: reader }));
+  assert(derived.includes(`This program read stored handles: filter inside the program and return only the selection or a digest, or set maxOutputTokens: ${tokens} to keep a result this size inline.`));
+  assert.equal(await h.boundary(source, "derived-budget", { input: { ...reader, maxOutputTokens: tokens } }), undefined);
+  const huge = Array.from({ length: 2000 }, (_, i) => `row ${String(i).padStart(5, "0")} ordinary output detail\n`).join("");
+  const past = text(await h.boundary(huge, "derived-huge", { input: reader }));
+  assert(bytes(huge) > 50_000 && past.includes("read stored handles") && !past.includes("maxOutputTokens"));
+  assert(!text(await turn.boundary(source, "derived-turn", { input: reader })).includes("maxOutputTokens"));
+  assert(!text(await h.boundary(source, "plain")).includes("maxOutputTokens"));
+  console.log("[ok] results that fit their call's maxOutputTokens stay inline; truncation and turn budgets still offload; handle-reading overflows name the budget");
+}
+
 async function nativeChecks(): Promise<void> {
   const cwd = root(); mkdirSync(join(cwd, "agent"));
   const handle = new ContextStore(cwd).write("native", "fixture", source);
@@ -385,6 +413,6 @@ function projectionAndBenchmarkChecks(): void {
 }
 
 try {
-  await queryChecks(); await boundaryChecks(); await nativeChecks(); await pagedProgramReadChecks(); projectionAndBenchmarkChecks();
+  await queryChecks(); await boundaryChecks(); await callBudgetChecks(); await nativeChecks(); await pagedProgramReadChecks(); projectionAndBenchmarkChecks();
   console.log("Efficiency regressions passed");
 } finally { for (const cwd of roots) rmSync(cwd, { recursive: true, force: true }); }
