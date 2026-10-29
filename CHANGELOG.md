@@ -8,6 +8,11 @@ Based on 62 recorded Pi sessions with Context Engineer active (12,476 model requ
 - A program that reads handles and overflows again is told the `maxOutputTokens` that keeps a result that size inline, when Fabric's 50,000-character cap allows it. Since 0.8.0 let a program read 512 KB at once, 16 of 67 offloads were such re-offloads, against about 6% before, and the notice said to filter without naming a size.
 - Telemetry records whether the model's next call read an offloaded handle, by naming it or with `ctx_read`, and `/ce status` reports the rate. A lower threshold or a smaller preview pays only while that rate stays low. Since 0.8.0 the next call read 36 of 67 offloads, 32 of them through a section the preview listed.
 
+### Claude Code
+
+- The package ships its Claude Code host in `claude-code/`: the shim of Pi's extension API that runs this extension, the per-session daemon and its client, and the guide the model reads there. The `ce` Claude Code mod carried its own copies, so a change here reached Claude Code only once the mod was edited to match. It now loads them from the package it resolves, and `npm test` drives the host against the built extension.
+- In Claude Code each model request starts a turn, as in Pi, rather than each prompt, so `turnBudgetBytes` counts the same in both hosts. Fabric there hands CE every result with the call's `maxOutputTokens` instead of keeping budgeted ones back, so the budget rule above decides in both hosts and every result reaches telemetry: 49 of the 89 results since the mod landed had set a budget and never reached CE.
+
 ## 0.9.0
 
 - Admit automatic offloads before committing or evicting stored handles; rejected candidates leave the store unchanged.

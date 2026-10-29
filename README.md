@@ -137,6 +137,10 @@ pi --extension /path/to/pi-context-engineer/src/index.ts   # from a checkout
 
 The package also ships a skill that teaches the model how to read handles.
 
+## Claude Code
+
+`claude-code/` is the Claude Code host that the `ce` Claude Code mod loads from this package. `host.mjs` runs the extension behind a small shim of Pi's extension API, `daemon.mjs` serves it to one session, `client.mjs` starts the daemon and restarts it when `package.json`, `src/` or `claude-code/` changes, and `guide.md` is the section the model reads in Claude Code's system prompt. The mod finds the package as Pi does, a local checkout named in `~/.pi/agent/settings.json` first, and takes all of these from it, so an update here updates Claude Code too. There Fabric hands each program's whole result over with the call's `maxOutputTokens`, and each model request emits `turn_start`, as in Pi.
+
 ## Verification
 
 Development tests use Pi 1.4 and require Node 22.19+ (CI uses Node 24). Host peer ranges remain unrestricted for compatibility with older Pi installations.
@@ -146,7 +150,7 @@ npm ci
 npm test
 ```
 
-`npm test` builds the extension and runs deterministic, offline hook probes: offload of single and multi-block results, preview outlines and byte ranges, prefix stability, intermediate Fabric values, every `ctx_read` mode with its boundary and program budgets, query hints, summaries, error and edit compaction, the Fabric child grant, Pi's native tool error contract, and telemetry. New efficiency regressions exercise real Pi native `executeTool` with a deterministic faux provider, merged query cursors, negative net savings, compact notices, projection and turn budgets. No network model calls occur in `npm test`.
+`npm test` builds the extension and runs deterministic, offline hook probes: offload of single and multi-block results, preview outlines and byte ranges, prefix stability, intermediate Fabric values, every `ctx_read` mode with its boundary and program budgets, query hints, summaries, error and edit compaction, the Fabric child grant, Pi's native tool error contract, telemetry, and the Claude Code host's operations. New efficiency regressions exercise real Pi native `executeTool` with a deterministic faux provider, merged query cursors, negative net savings, compact notices, projection and turn budgets. No network model calls occur in `npm test`.
 
 An opt-in smoke test launches the local `pi` CLI with CE and Fabric in a throwaway workspace. It needs a configured model and can incur provider usage:
 

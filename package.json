@@ -27,7 +27,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit --noUnusedLocals --noUnusedParameters --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck src/*.ts",
     "build": "rm -rf .tmp/pi-ce-build && tsc --outDir .tmp/pi-ce-build --rootDir src --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck src/*.ts",
-    "verify": "npm run build && node .tmp/pi-ce-build/verify.js && node .tmp/pi-ce-build/verify-hooks.js && node .tmp/pi-ce-build/verify-runtime.js && node .tmp/pi-ce-build/verify-fabric-child.js && node .tmp/pi-ce-build/verify-remediation.js && node .tmp/pi-ce-build/verify-efficiency.js",
+    "verify": "npm run build && node .tmp/pi-ce-build/verify.js && node .tmp/pi-ce-build/verify-hooks.js && node .tmp/pi-ce-build/verify-runtime.js && node .tmp/pi-ce-build/verify-fabric-child.js && node .tmp/pi-ce-build/verify-remediation.js && node .tmp/pi-ce-build/verify-efficiency.js && node .tmp/pi-ce-build/verify-claude-host.js",
     "e2e": "npm run build && node .tmp/pi-ce-build/e2e.js",
     "benchmark": "npm run build && node .tmp/pi-ce-build/benchmark.js",
     "test": "npm run verify"
@@ -35,6 +35,7 @@
   "main": "src/index.ts",
   "files": [
     "src",
+    "claude-code",
     "skills",
     "media",
     "README.md",
